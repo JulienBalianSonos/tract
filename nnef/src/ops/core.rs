@@ -1,6 +1,7 @@
 use crate::internal::*;
 use tract_core::ops;
 
+mod bitpacking;
 mod broadcast;
 mod cast;
 #[cfg(feature = "complex")]
@@ -67,4 +68,5 @@ pub fn register(registry: &mut Registry) {
     range::register(registry);
     topk::register(registry);
     trilu::register(registry);
+    bitpacking::register(registry);
 }

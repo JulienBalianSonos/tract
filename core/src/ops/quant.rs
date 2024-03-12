@@ -3,6 +3,7 @@
 use crate::internal::*;
 use crate::ops::element_wise::ElementWiseOp;
 use crate::ops::math::QScale;
+use ndarray::s;
 use num_traits::AsPrimitive;
 use tract_linalg::lut::Lut;
 use tract_linalg::mmm::RoundingPolicy;
@@ -467,6 +468,108 @@ impl ElementWiseMiniOp for OffsetU8asI8 {
 }
 pub fn offset_u8_as_i8() -> ElementWiseOp {
     ElementWiseOp(Box::new(OffsetU8asI8 {}), None)
+}
+
+/// BitUnpack implementation is tiled
+/// based on matrix 1st dim
+/// This is not an implementation of Lemire
+#[derive(Debug, Clone)]
+pub struct BitUnpack {
+    pub bit_width: usize,
+}
+impl BitUnpack {
+    const N_BIT_PER_PACKED_TENSOR_ELM: usize = 8;
+
+    fn output_shape(&self, input_shape: Vec<usize>) -> Vec<usize> {
+        let mut out_shape = input_shape.clone();
+        out_shape[0] = out_shape[0] * BitUnpack::N_BIT_PER_PACKED_TENSOR_ELM;
+        out_shape
+    }
+
+    fn eval_t<T: Datum + AsPrimitive<u8>>(&self, input: &Tensor) -> TractResult<Tensor> {
+        let mut output = unsafe {
+            Tensor::uninitialized::<u8>(self.output_shape(input.shape().to_vec()).as_slice())?
+        };
+        // input
+        //     .as_slice::<T>()?
+        //     .iter()
+        //     .zip(output.as_slice_mut::<f32>()?.iter_mut())
+        //     .for_each(|(x, y)| *y = (x.as_() - self.zero_point) as f32 * self.scale);
+        //  TODO: implement for each bit width expected unpack
+        match self.bit_width {
+            4 => self.unpack_4bit(input, &mut output)?,
+            _ => bail!("not implemented for bit_width={:?}", self.bit_width),
+        }
+        Ok(output)
+    }
+
+    fn unpack_4bit(&self, input: &Tensor, output: &mut Tensor) -> TractResult<()> {
+        let mut out_arr_view = output.to_array_view_mut::<u8>()?;
+        let inp_arr_view = input.to_array_view::<u8>()?;
+        let step = *input.shape().first().unwrap();
+
+        out_arr_view
+            .slice_mut(s![..step])
+            .iter_mut()
+            .zip(&inp_arr_view)
+            .for_each(|(o, i)| *o = i & 0b11110000 as u8 >> 4u8);
+
+        out_arr_view
+            .slice_mut(s![step..])
+            .iter_mut()
+            .zip(&inp_arr_view)
+            .for_each(|(o, i)| *o = i & 0b00001111 as u8);
+        Ok(())
+    }
+}
+
+impl Op for BitUnpack {
+    fn name(&self) -> Cow<str> {
+        "BitUnpack".into()
+    }
+
+    fn info(&self) -> TractResult<Vec<String>> {
+        Ok(vec![format!("bit_width: {:?}", self.bit_width)])
+    }
+
+    op_as_typed_op!();
+}
+impl EvalOp for BitUnpack {
+    fn is_stateless(&self) -> bool {
+        true
+    }
+
+    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+        let mut tensor = args_1!(inputs).into_tensor();
+        Ok(tvec!(match tensor.datum_type() {
+            DatumType::U8 => {
+                self.eval_t::<u8>(&mut tensor)?.into_tvalue()
+            }
+            _ => bail!("BitUnpack not implemented for type {:?}", tensor.datum_type()),
+        }))
+    }
+}
+
+impl TypedOp for BitUnpack {
+    fn output_facts(&self, inputs: &[&TypedFact]) -> TractResult<TVec<TypedFact>> {
+        let divisor =
+            (BitUnpack::N_BIT_PER_PACKED_TENSOR_ELM as f32 / self.bit_width as f32).ceil() as i64;
+        let first_dim = inputs[0].shape.first().unwrap().to_i64()?;
+        anyhow::ensure!(
+            first_dim % divisor == 0,
+            format!("tensor must have shape[0] divisible by {divisor} to use bit packing but got {first_dim}")
+        );
+        Ok(tvec!(TypedFact {
+            datum_type: DatumType::U8,
+            shape: ShapeFact::from(
+                self.output_shape(inputs[0].shape.as_concrete().unwrap().to_vec())
+            ),
+            konst: None,
+            uniform: None
+        }))
+    }
+
+    as_op!();
 }
 
 #[cfg(test)]

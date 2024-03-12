@@ -202,7 +202,7 @@ impl TypedOp for Stft {
     fn output_facts(&self, inputs: &[&TypedFact]) -> TractResult<TVec<TypedFact>> {
         anyhow::ensure!(
             inputs[0].rank() >= 2,
-            "Expect rank 2 (one for fft dimension, one for complex dimension"
+            "Expect rank 2 (one for fft dimension, one for complex dimension)"
         );
         anyhow::ensure!(
             inputs[0].shape.last().unwrap() == &2.to_dim(),
