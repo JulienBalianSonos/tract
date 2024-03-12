@@ -482,7 +482,8 @@ impl BitUnpack {
 
     fn output_shape(&self, input_shape: Vec<usize>) -> Vec<usize> {
         let mut out_shape = input_shape.clone();
-        out_shape[0] = out_shape[0] * BitUnpack::N_BIT_PER_PACKED_TENSOR_ELM;
+        out_shape[0] = (out_shape[0]
+            * (BitUnpack::N_BIT_PER_PACKED_TENSOR_ELM as f32 / self.bit_width as f32) as usize);
         out_shape
     }
 
@@ -509,13 +510,13 @@ impl BitUnpack {
         let step = *input.shape().first().unwrap();
 
         out_arr_view
-            .slice_mut(s![..step])
+            .slice_mut(s![..step, .., ..])
             .iter_mut()
             .zip(&inp_arr_view)
-            .for_each(|(o, i)| *o = i & 0b11110000 as u8 >> 4u8);
+            .for_each(|(o, i)| *o = i & 0b11110000 as u8 >> 4);
 
         out_arr_view
-            .slice_mut(s![step..])
+            .slice_mut(s![step.., .., ..])
             .iter_mut()
             .zip(&inp_arr_view)
             .for_each(|(o, i)| *o = i & 0b00001111 as u8);
