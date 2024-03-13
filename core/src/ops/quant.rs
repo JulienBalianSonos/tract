@@ -482,8 +482,8 @@ impl BitUnpack {
 
     fn output_shape(&self, input_shape: Vec<usize>) -> Vec<usize> {
         let mut out_shape = input_shape.clone();
-        out_shape[0] = (out_shape[0]
-            * (BitUnpack::N_BIT_PER_PACKED_TENSOR_ELM as f32 / self.bit_width as f32) as usize);
+        out_shape[0] = out_shape[0]
+            * (BitUnpack::N_BIT_PER_PACKED_TENSOR_ELM as f32 / self.bit_width as f32) as usize;
         out_shape
     }
 
@@ -496,9 +496,10 @@ impl BitUnpack {
         //     .iter()
         //     .zip(output.as_slice_mut::<f32>()?.iter_mut())
         //     .for_each(|(x, y)| *y = (x.as_() - self.zero_point) as f32 * self.scale);
-        //  TODO: implement for each bit width expected unpack
         match self.bit_width {
             4 => self.unpack_4bit(input, &mut output)?,
+            2 => self.unpack_2bit(input, &mut output)?,
+            1 => self.unpack_1bit(input, &mut output)?,
             _ => bail!("not implemented for bit_width={:?}", self.bit_width),
         }
         Ok(output)
@@ -520,6 +521,92 @@ impl BitUnpack {
             .iter_mut()
             .zip(&inp_arr_view)
             .for_each(|(o, i)| *o = i & 0b00001111 as u8);
+        Ok(())
+    }
+
+    fn unpack_2bit(&self, input: &Tensor, output: &mut Tensor) -> TractResult<()> {
+        let mut out_arr_view = output.to_array_view_mut::<u8>()?;
+        let inp_arr_view = input.to_array_view::<u8>()?;
+        let step = *input.shape().first().unwrap();
+
+        out_arr_view
+            .slice_mut(s![..step, .., ..])
+            .iter_mut()
+            .zip(&inp_arr_view)
+            .for_each(|(o, i)| *o = i & 0b11000000 as u8 >> 6);
+
+        out_arr_view
+            .slice_mut(s![step..2 * step, .., ..])
+            .iter_mut()
+            .zip(&inp_arr_view)
+            .for_each(|(o, i)| *o = i & 0b00110000 as u8 >> 4);
+
+        out_arr_view
+            .slice_mut(s![2 * step..3 * step, .., ..])
+            .iter_mut()
+            .zip(&inp_arr_view)
+            .for_each(|(o, i)| *o = i & 0b00001100 as u8 >> 2);
+
+        out_arr_view
+            .slice_mut(s![3 * step.., .., ..])
+            .iter_mut()
+            .zip(&inp_arr_view)
+            .for_each(|(o, i)| *o = i & 0b00000011);
+        Ok(())
+    }
+
+    fn unpack_1bit(&self, input: &Tensor, output: &mut Tensor) -> TractResult<()> {
+        let mut out_arr_view = output.to_array_view_mut::<u8>()?;
+        let inp_arr_view = input.to_array_view::<u8>()?;
+        let step = *input.shape().first().unwrap();
+
+        out_arr_view
+            .slice_mut(s![..step, .., ..])
+            .iter_mut()
+            .zip(&inp_arr_view)
+            .for_each(|(o, i)| *o = i & 0b10000000 as u8 >> 7);
+
+        out_arr_view
+            .slice_mut(s![step..2 * step, .., ..])
+            .iter_mut()
+            .zip(&inp_arr_view)
+            .for_each(|(o, i)| *o = i & 0b01000000 as u8 >> 6);
+
+        out_arr_view
+            .slice_mut(s![2 * step..3 * step, .., ..])
+            .iter_mut()
+            .zip(&inp_arr_view)
+            .for_each(|(o, i)| *o = i & 0b00100000 as u8 >> 5);
+
+        out_arr_view
+            .slice_mut(s![3 * step..4 * step, .., ..])
+            .iter_mut()
+            .zip(&inp_arr_view)
+            .for_each(|(o, i)| *o = i & 0b00010000 as u8 >> 4);
+
+        out_arr_view
+            .slice_mut(s![4 * step..5 * step, .., ..])
+            .iter_mut()
+            .zip(&inp_arr_view)
+            .for_each(|(o, i)| *o = i & 0b00001000 as u8 >> 3);
+
+        out_arr_view
+            .slice_mut(s![5 * step..6 * step, .., ..])
+            .iter_mut()
+            .zip(&inp_arr_view)
+            .for_each(|(o, i)| *o = i & 0b00000100 as u8 >> 2);
+
+        out_arr_view
+            .slice_mut(s![6 * step..7 * step, .., ..])
+            .iter_mut()
+            .zip(&inp_arr_view)
+            .for_each(|(o, i)| *o = i & 0b00000010 as u8 >> 1);
+
+        out_arr_view
+            .slice_mut(s![7 * step.., .., ..])
+            .iter_mut()
+            .zip(&inp_arr_view)
+            .for_each(|(o, i)| *o = i & 0b00000001 as u8);
         Ok(())
     }
 }
