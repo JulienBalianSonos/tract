@@ -18,6 +18,7 @@ use tract_core::ops::nn::Reduce;
 use tract_core::tract_linalg::block_quant::Q4_0;
 use tract_core::transform::ModelTransform;
 use tract_gpu::fact::{DeviceFact, DeviceTypedFactExt};
+use tract_gpu::rewrite_rules::cast::bypass_device_downcast_roundtrip;
 use tract_gpu::rewrite_rules::rewire_syncs::rewire_syncs;
 use tract_gpu::rewrite_rules::rms_norm::remove_rms_norm_cast;
 use tract_gpu::sync::{
@@ -177,6 +178,11 @@ impl MetalTransform {
     ) -> TractResult<()> {
         // Init Metal Context if not done previously
         metal_context();
+        // The memory schema must treat MetalFusedAxisOp-wrapped view ops as
+        // aliasing (idempotent registration).
+        tract_gpu::memory::register_may_alias_check(
+            crate::ops::fused_axis_op::fused_axis_op_may_alias,
+        );
 
         rewire_sdpa_metal(model)?;
         rewrite_einsum_to_prefix_matmul(model, false)?;
@@ -192,6 +198,10 @@ impl MetalTransform {
         Rewriter::default()
             .with_rule_for("rewrite_kernel_conv_in_oihw", rewrite_kernel_conv_in_oihw)
             .with_rule_for("rewrite_conv_with_n_axis", rewrite_conv_with_n_axis)
+            .with_rule_for(
+                "collapse_adjacent_slice_concat",
+                tract_gpu::rewrite_rules::concat::collapse_adjacent_slice_concat,
+            )
             .with_rule_for("remove_rms_norm_cast", remove_rms_norm_cast)
             .with_rule_for("split_multi_axis_reduce", split_multi_axis_reduce)
             .rewrite(&(), model)?;
@@ -207,6 +217,28 @@ impl MetalTransform {
         }
 
         Rewriter::default()
+            .with_rule_for("bypass_device_downcast_roundtrip", bypass_device_downcast_roundtrip)
+            .rewrite(&(), model)?;
+        rewrite_rules::fuse_sibling_gemms(model)?;
+        Rewriter::default()
+            .with_rule_for("fuse_elementwise_chain_ew", rewrite_rules::fuse_elementwise_chain_ew)
+            .with_rule_for("fuse_elementwise_chain_bin", rewrite_rules::fuse_elementwise_chain_bin)
+            .with_rule_for(
+                "fuse_elementwise_chain_cast",
+                rewrite_rules::fuse_elementwise_chain_cast,
+            )
+            .rewrite(&(), model)?;
+        Rewriter::default()
+            .with_rule_for(
+                "fuse_view_copy_slice",
+                tract_gpu::rewrite_rules::fused_view_copy::fuse_view_copy_slice,
+            )
+            .with_rule_for(
+                "fuse_view_copy_axis",
+                tract_gpu::rewrite_rules::fused_view_copy::fuse_view_copy_axis,
+            )
+            .rewrite(&(), model)?;
+        Rewriter::default()
             .with_rule_for("fuse_move_axis", rewrite_rules::fuse_move_axis)
             .rewrite(&(), model)?;
         Rewriter::default()
@@ -214,6 +246,80 @@ impl MetalTransform {
             .rewrite(&(), model)?;
 
         rewire_syncs(model)?;
+
+        // Post-transform graph census for dispatch-count attribution:
+        // TRACT_METAL_DUMP_OPS=1 prints an op histogram, =2 also lists every
+        // copy-flavored node with its facts.
+        if let Ok(v) = std::env::var("TRACT_METAL_DUMP_OPS")
+            && v != "0"
+        {
+            let mut counts: HashMap<String, usize> = HashMap::new();
+            for node in model.nodes() {
+                *counts.entry(node.op.name().to_string()).or_default() += 1;
+            }
+            let mut sorted: Vec<_> = counts.into_iter().collect();
+            sorted.sort_by(|a, b| b.1.cmp(&a.1));
+            eprintln!("metal-transform op census ({} nodes):", model.nodes().len());
+            for (name, count) in &sorted {
+                eprintln!("  {count:5} {name}");
+            }
+            if v == "3" {
+                for node in model.nodes() {
+                    if node.op.name().contains("Gemm") {
+                        let ins: Vec<String> = node
+                            .inputs
+                            .iter()
+                            .map(|i| model.node(i.node).name.to_string())
+                            .collect();
+                        eprintln!("  gemm-node {} <- {:?}", node.name, ins);
+                    }
+                }
+            }
+            if v == "4" {
+                // Full one-line node listing: wiring around a node whose
+                // rewrite did not fire (names carry the source op chain).
+                for node in model.nodes() {
+                    let ins: Vec<String> = node
+                        .inputs
+                        .iter()
+                        .map(|i| format!("{}:{}", i.node, i.slot))
+                        .collect();
+                    let outs: Vec<String> =
+                        node.outputs.iter().map(|o| format!("{:?}", o.fact)).collect();
+                    eprintln!(
+                        "  node {} [{}] {} <- {:?} -> {:?}",
+                        node.id,
+                        node.op.name(),
+                        node.name,
+                        ins,
+                        outs
+                    );
+                }
+            }
+            if v == "2" {
+                for node in model.nodes() {
+                    let name = node.op.name();
+                    if name.contains("ViewCopy")
+                        || name.contains("Slice")
+                        || name.contains("AxisOp")
+                        || name.contains("Concat")
+                        || name.contains("broadcast")
+                    {
+                        let in_facts = model
+                            .node_input_facts(node.id)
+                            .map(|f| format!("{f:?}"))
+                            .unwrap_or_default();
+                        eprintln!(
+                            "  copy-node {} [{}] {:?} <- {}",
+                            node.name,
+                            name,
+                            node.outputs.iter().map(|o| &o.fact).collect::<Vec<_>>(),
+                            in_facts
+                        );
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -356,6 +462,9 @@ impl Translate<TypedFact, Box<dyn TypedOp>, TypedFact, Box<dyn TypedOp>> for Met
     }
 }
 
+/// Casts inserted by the Metal lowering itself (marked synthetic: they may
+/// be bypassed by precision-roundtrip rewrites). Source-graph Cast ops are
+/// converted separately in `kernels::array::cast` and stay non-synthetic.
 pub(crate) fn metal_cast_new(to: DatumType) -> Option<tract_gpu::ops::cast::GpuCast> {
     tract_gpu::ops::cast::GpuCast::new(
         to,
@@ -363,6 +472,7 @@ pub(crate) fn metal_cast_new(to: DatumType) -> Option<tract_gpu::ops::cast::GpuC
         kernels::array::metal_cast_dispatch,
         kernels::array::Cast::is_supported_dt,
     )
+    .map(tract_gpu::ops::cast::GpuCast::into_synthetic)
 }
 
 fn check_matmul_in_dts(in_facts: &[TypedFact]) -> bool {
@@ -550,7 +660,7 @@ fn convert_matmul_to_metal(
     Ok(matmul_output)
 }
 
-fn convert_const(op: &Const) -> TractResult<Const> {
+pub(crate) fn convert_const(op: &Const) -> TractResult<Const> {
     let typed_fact: TypedFact = Arc::clone(op.val()).try_into()?;
     let metal_fact = if let Some(of) = op.exotic_fact() {
         DeviceFact::from_host(typed_fact.with_exotic_fact(clone_box(of)))?

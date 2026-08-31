@@ -17,6 +17,24 @@ pub struct CudaFusedAxisOpState {
     pub op_state: Box<dyn OpState>,
 }
 
+/// Arena-lifetime aliasing predicate registered with
+/// `tract_gpu::memory::register_may_alias_check`: the wrapper's eval
+/// delegates to the innermost op, whose output may be a zero-copy view of
+/// its (axis-op-preprocessed, hence still aliased) input, so the wrapper
+/// aliases whenever the innermost op does.
+pub fn fused_axis_op_may_alias(node: &TypedNode) -> bool {
+    fn inner_aliases(op: &dyn TypedOp) -> bool {
+        if let Some(w) = op.downcast_ref::<CudaFusedAxisOp>() {
+            inner_aliases(w.op.as_ref())
+        } else {
+            op.downcast_ref::<tract_gpu::ops::slice::GpuSlice>().is_some()
+                || op.downcast_ref::<GpuAxisOp>().is_some()
+                || op.downcast_ref::<tract_gpu::ops::fused_view_copy::GpuFusedViewCopy>().is_some()
+        }
+    }
+    node.op_as::<CudaFusedAxisOp>().is_some_and(|w| inner_aliases(w.op.as_ref()))
+}
+
 fn compute_reshaped_inputs(
     inputs: TVec<TValue>,
     grouped_axis_ops: &TVec<TVec<GpuAxisOp>>,
