@@ -248,6 +248,11 @@ impl MetalTuning {
     }
 
     /// Pure resolution, env injected for hermetic tests.
+    /// Hard ceiling for `moe_commit_min_routes`: 512 routes = 64 prefilled
+    /// tokens at top_k 8, far below any corruption-prone long prefill, and
+    /// far above any decode step (route count = top_k).
+    pub const MOE_COMMIT_MIN_ROUTES_CEILING: usize = 512;
+
     fn resolve(
         overrides: &MetalTuningOverrides,
         env: impl Fn(&str) -> Option<String>,
@@ -274,9 +279,15 @@ impl MetalTuning {
                 .filter(|&n| n >= 1)
                 .or(overrides.max_command_buffers_in_flight.filter(|&n| n >= 1))
                 .unwrap_or(base.max_command_buffers_in_flight),
+            // The commit boundary this knob gates is CORRECTNESS-required on
+            // prefill-sized route batches (see MetalRoutedQ40MatMul::eval):
+            // clamp to a ceiling that keeps decode-sized batches uncommitted
+            // while guaranteeing the boundary fires for real prefills, so no
+            // override (env, hint or autotune) can disable it.
             moe_commit_min_routes: parsed("TRACT_METAL_MOE_COMMIT_MIN_ROUTES")
                 .or(overrides.moe_commit_min_routes)
-                .unwrap_or(base.moe_commit_min_routes),
+                .unwrap_or(base.moe_commit_min_routes)
+                .min(Self::MOE_COMMIT_MIN_ROUTES_CEILING),
             moe_grouped_min_routes: overrides
                 .moe_grouped_min_routes
                 .unwrap_or(base.moe_grouped_min_routes),
