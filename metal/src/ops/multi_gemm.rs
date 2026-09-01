@@ -110,16 +110,9 @@ fn is_dense(shape: &[usize], strides: &[isize]) -> bool {
 }
 
 impl EvalOp for MetalMultiGemm {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval_with_session(
-        &self,
-        node_id: usize,
-        session: &TurnState,
-        inputs: TVec<TValue>,
-    ) -> TractResult<TVec<TValue>> {
+    fn eval(&self, ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let (x_val, w_val) = args_2!(inputs);
         let x = x_val.to_device_tensor()?;
         let w = w_val.to_device_tensor()?;
@@ -218,9 +211,8 @@ impl EvalOp for MetalMultiGemm {
             let mut row0 = 0usize;
             for (slot, &n_i) in self.splits.iter().enumerate() {
                 let shape = self.concrete_output_shape_for(x.shape(), n_i);
-                let c = tract_gpu::session_handler::make_tensor_for_node_output(
-                    session, node_id, slot, dt, &shape,
-                )?;
+                let c =
+                    tract_gpu::turn_handler::make_tensor_for_node_output(ctx, slot, dt, &shape)?;
                 stream.retain_tensor(&c);
                 let w_offset = w.buffer_offset::<usize>() + row0 * row_bytes;
                 let (params, a_buf, b_buf) = if self.weight_first {

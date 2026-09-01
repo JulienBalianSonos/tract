@@ -78,16 +78,9 @@ impl Op for MetalFusedElementwise {
 }
 
 impl EvalOp for MetalFusedElementwise {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval_with_session(
-        &self,
-        node_id: usize,
-        session: &TurnState,
-        inputs: TVec<TValue>,
-    ) -> TractResult<TVec<TValue>> {
+    fn eval(&self, ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         ensure!(inputs.len() == self.n_inputs);
         let device_inputs: TVec<&DeviceTensor> = inputs
             .iter()
@@ -96,12 +89,8 @@ impl EvalOp for MetalFusedElementwise {
             .context("fused elementwise input is not a device tensor")?;
         let shapes: TVec<&[usize]> = device_inputs.iter().map(|t| t.shape()).collect();
         let out_shape = tract_core::broadcast::multi_broadcast(&shapes)?;
-        let output = tract_gpu::session_handler::make_tensor_for_node(
-            session,
-            node_id,
-            self.out_dt,
-            &out_shape,
-        )?;
+        let output =
+            tract_gpu::turn_handler::make_tensor_for_node(ctx, self.out_dt, &out_shape)?;
         let raw_steps: TVec<FusedEwStepRaw> = self.steps.iter().map(|s| s.raw()).collect();
         crate::with_metal_stream(|stream| {
             crate::kernels::element_wise::dispatch_fused_elementwise_chain(
