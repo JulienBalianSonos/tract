@@ -1414,6 +1414,57 @@ mod tests {
         Ok(())
     }
 
+    /// `OpState`s are cloned directly now (no freeze/unfreeze roundtrip):
+    /// a *first* clone off a still-live state must keep sharing the
+    /// append-in-place KV buffers (the ordinary decode-loop pattern is
+    /// `state = state.clone()`, dropping the original), but a *second*
+    /// clone off the same still-live state is a real branch and must get
+    /// private KV storage, or the two branches' appends would race the same
+    /// physical buffer and silently corrupt each other's rows.
+    #[test]
+    fn state_second_clone_of_live_state_gets_private_kv_storage() -> TractResult<()> {
+        crate::context::metal_context();
+        let (hkv, d) = (2usize, 8usize);
+        let mut seed = 11u64;
+        let init = rng_tensor(&[1, hkv, 3, d], &mut seed).cast_to::<f16>()?.into_owned();
+        let mut base = MetalFusedSdpaState {
+            scale: 1.0,
+            window: 0,
+            has_sinks: false,
+            k: DeviceKvBuffer::default(),
+            v: DeviceKvBuffer::transposed(),
+            flash_scratch: None,
+            neg_inf_sinks: None,
+            cloned: false.into(),
+        };
+        crate::with_metal_stream(|stream| {
+            base.k.append(&init.clone().into_device()?)?;
+            stream.wait_until_completed()
+        })?;
+
+        // First clone off `base`: cheap, shares the physical buffer.
+        let mut continued = base.clone();
+        // `base` is still live: a second clone is a genuine branch and must
+        // not alias `continued`'s buffer.
+        let mut branched = base.clone();
+
+        let chunk_a = rng_tensor(&[1, hkv, 1, d], &mut seed).cast_to::<f16>()?.into_owned();
+        let chunk_b = rng_tensor(&[1, hkv, 1, d], &mut seed).cast_to::<f16>()?.into_owned();
+        crate::with_metal_stream(|stream| {
+            continued.k.append(&chunk_a.clone().into_device()?)?;
+            branched.k.append(&chunk_b.clone().into_device()?)?;
+            stream.wait_until_completed()
+        })?;
+
+        let continued_got = continued.k.valid_view()?.to_host()?.into_tensor();
+        let branched_got = branched.k.valid_view()?.to_host()?.into_tensor();
+        let want_continued = Tensor::stack_tensors(2, &[&init, &chunk_a])?;
+        let want_branched = Tensor::stack_tensors(2, &[&init, &chunk_b])?;
+        continued_got.close_enough(&want_continued, Approximation::Exact)?;
+        branched_got.close_enough(&want_branched, Approximation::Exact)?;
+        Ok(())
+    }
+
     /// The q8 KV shadow path against the same CPU reference: caches stay
     /// f16-exact (the shadow never crosses the op boundary); only the
     /// attention output carries the ~0.5% q8 quantization error, absorbed by
