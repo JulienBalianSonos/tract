@@ -80,16 +80,9 @@ impl Op for MetalRoutedQ40SwiGlu {
 }
 
 impl EvalOp for MetalRoutedQ40SwiGlu {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval_with_session(
-        &self,
-        node_id: usize,
-        session: &TurnState,
-        inputs: TVec<TValue>,
-    ) -> TractResult<TVec<TValue>> {
+    fn eval(&self, ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         ensure!(inputs.len() == self.input_count());
         let tensors = inputs
             .iter()
@@ -101,9 +94,8 @@ impl EvalOp for MetalRoutedQ40SwiGlu {
 
         ensure!(route_token_ids.rank() == 1);
         ensure!(w1.rank() == 3);
-        let output = tract_gpu::session_handler::make_tensor_for_node(
-            session,
-            node_id,
+        let output = tract_gpu::turn_handler::make_tensor_for_node(
+            ctx,
             f32::datum_type(),
             &[route_token_ids.shape()[0], w1.shape()[1]],
         )?;

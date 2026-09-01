@@ -40,16 +40,9 @@ impl Op for MetalRoutedCombine {
 }
 
 impl EvalOp for MetalRoutedCombine {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval_with_session(
-        &self,
-        node_id: usize,
-        session: &TurnState,
-        inputs: TVec<TValue>,
-    ) -> TractResult<TVec<TValue>> {
+    fn eval(&self, ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let (shape_like_raw, route_values_raw, route_token_ids_raw, route_weights_raw) =
             args_4!(inputs);
         let shape_like = shape_like_raw
@@ -65,9 +58,8 @@ impl EvalOp for MetalRoutedCombine {
             format!("route_weights are not a Metal tensor: {route_weights_raw:?}")
         })?;
 
-        let output = tract_gpu::session_handler::make_tensor_for_node(
-            session,
-            node_id,
+        let output = tract_gpu::turn_handler::make_tensor_for_node(
+            ctx,
             f32::datum_type(),
             shape_like.shape(),
         )?;

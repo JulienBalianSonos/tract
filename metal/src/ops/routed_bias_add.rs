@@ -29,16 +29,9 @@ impl Op for MetalRoutedBiasAdd {
 }
 
 impl EvalOp for MetalRoutedBiasAdd {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval_with_session(
-        &self,
-        node_id: usize,
-        session: &TurnState,
-        inputs: TVec<TValue>,
-    ) -> TractResult<TVec<TValue>> {
+    fn eval(&self, ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let (value_raw, bias_raw, expert_ids_raw) = args_3!(inputs);
         let value = value_raw
             .to_device_tensor()
@@ -50,9 +43,8 @@ impl EvalOp for MetalRoutedBiasAdd {
             .to_device_tensor()
             .with_context(|| format!("expert ids are not a Metal tensor: {expert_ids_raw:?}"))?;
 
-        let output = tract_gpu::session_handler::make_tensor_for_node(
-            session,
-            node_id,
+        let output = tract_gpu::turn_handler::make_tensor_for_node(
+            ctx,
             f32::datum_type(),
             value.shape(),
         )?;

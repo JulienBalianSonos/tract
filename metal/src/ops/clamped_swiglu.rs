@@ -40,16 +40,9 @@ impl Op for MetalClampedSwiGlu {
 }
 
 impl EvalOp for MetalClampedSwiGlu {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval_with_session(
-        &self,
-        node_id: usize,
-        session: &TurnState,
-        inputs: TVec<TValue>,
-    ) -> TractResult<TVec<TValue>> {
+    fn eval(&self, ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let (gate_raw, up_raw) = args_2!(inputs);
         let gate = gate_raw
             .to_device_tensor()
@@ -58,9 +51,8 @@ impl EvalOp for MetalClampedSwiGlu {
             .to_device_tensor()
             .with_context(|| format!("up is not a Metal tensor: {up_raw:?}"))?;
 
-        let output = tract_gpu::session_handler::make_tensor_for_node(
-            session,
-            node_id,
+        let output = tract_gpu::turn_handler::make_tensor_for_node(
+            ctx,
             f32::datum_type(),
             gate.shape(),
         )?;
