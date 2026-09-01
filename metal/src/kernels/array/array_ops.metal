@@ -54,6 +54,72 @@ METAL_FUNC uint indices_to_outer_idx(uint3 indices,
     template [[host_name(                                                      \
         "array_ops::cast_" #tname)]] [[kernel]] cast_t cast<itype, otype>;
 
+// Tiled 2D-transpose fast path for strided copies whose output-innermost
+// axis is strided on the input while another axis is input-contiguous
+// (e.g. channel-major -> token-major layout changes at prefill). The
+// generic copy_nd kernels read such inputs fully uncoalesced (~20x off
+// roofline); staging 32x32 tiles through threadgroup memory keeps both
+// the loads and the stores coalesced.
+// args: [m, n, in_stride_n, out_stride_m, n_batch0, in_b0, out_b0, in_b1, out_b1]
+//  - m: length of the input-contiguous axis (input stride 1, output stride
+//    out_stride_m)
+//  - n: length of the output-contiguous axis (output stride 1, input stride
+//    in_stride_n)
+//  - grid.z enumerates the flattened batch: z = b1 * n_batch0 + b0
+// Launched with threadgroup size (32, 8, 1).
+template <typename T>
+[[kernel]] void copy_transpose2d(device const void *input_b [[buffer(0)]],
+                                 constant const size_t *args [[buffer(1)]],
+                                 device void *output_b [[buffer(2)]],
+                                 uint3 tgpig [[threadgroup_position_in_grid]],
+                                 ushort3 tpitg [[thread_position_in_threadgroup]]) {
+    device const T *input = (device const T *)input_b;
+    device T *output = (device T *)output_b;
+    const size_t m = args[0];
+    const size_t n = args[1];
+    const size_t in_stride_n = args[2];
+    const size_t out_stride_m = args[3];
+    const size_t n_batch0 = args[4];
+    const size_t b0 = tgpig.z % n_batch0;
+    const size_t b1 = tgpig.z / n_batch0;
+    const size_t in_base = b0 * args[5] + b1 * args[7];
+    const size_t out_base = b0 * args[6] + b1 * args[8];
+
+    threadgroup T tile[32][33];
+
+    const size_t m0 = (size_t)tgpig.x * 32;
+    const size_t n0 = (size_t)tgpig.y * 32;
+
+    // Load: threads sweep the input-contiguous m axis with tpitg.x.
+    const size_t mm_in = m0 + tpitg.x;
+    for (ushort j = tpitg.y; j < 32; j += 8) {
+        const size_t nn = n0 + j;
+        if (nn < n && mm_in < m) {
+            tile[j][tpitg.x] = input[in_base + nn * in_stride_n + mm_in];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Store: threads sweep the output-contiguous n axis with tpitg.x.
+    const size_t nn_out = n0 + tpitg.x;
+    for (ushort j = tpitg.y; j < 32; j += 8) {
+        const size_t mm = m0 + j;
+        if (nn_out < n && mm < m) {
+            output[out_base + mm * out_stride_m + nn_out] = tile[tpitg.x][j];
+        }
+    }
+}
+
+typedef decltype(copy_transpose2d<float>) copy_transpose2d_t;
+
+#define INSTANTIATE_COPY_TRANSPOSE(tname, type)                                \
+    template [[host_name("array_ops::copy_transpose2d_" #tname)]] [[kernel]]   \
+        copy_transpose2d_t copy_transpose2d<type>;
+
+INSTANTIATE_COPY_TRANSPOSE(u8, uint8_t)
+INSTANTIATE_COPY_TRANSPOSE(u16, uint16_t)
+INSTANTIATE_COPY_TRANSPOSE(u32, uint32_t)
+INSTANTIATE_COPY_TRANSPOSE(u64, uint64_t)
+
 template <typename In, typename Out>
 [[kernel]] void cast(device const void *input_b [[buffer(0)]],
                      device void *output_b [[buffer(1)]],
@@ -336,51 +402,6 @@ typedef decltype(gather<float>) gather_t;
     template [[host_name(                                                      \
         "array_ops::gather_" #tname)]] [[kernel]] gather_t gather<type>;
 
-// Resample one axis against a host-built plan: every output index owns a window
-// of `window` input indices (already clamped) and their weights, so nearest,
-// linear, cubic and their antialiased variants all run through this kernel.
-// The axes around the resampled one are flattened into `outer` and `inner`.
-//
-// params layout: [outer, len_in, len_out, inner, window]
-template <typename T>
-[[kernel]] void resize_axis(device const void *input_b [[buffer(0)]],
-                            device void *output_b [[buffer(1)]],
-                            device const int32_t *indices [[buffer(2)]],
-                            device const float *weights [[buffer(3)]],
-                            constant const int32_t *params [[buffer(4)]],
-                            uint3 tpig [[thread_position_in_grid]]) {
-    const int32_t len_in = params[1];
-    const int32_t len_out = params[2];
-    const int32_t inner = params[3];
-    const int32_t window = params[4];
-
-    const int32_t i = (int32_t)tpig.x;
-    const int32_t x = (int32_t)tpig.y;
-    const int32_t o = (int32_t)tpig.z;
-
-    if (i >= inner || x >= len_out)
-        return;
-
-    device const T *input = (device const T *)input_b;
-    device T *output = (device T *)output_b;
-
-    const int32_t in_base = o * len_in * inner + i;
-    float acc = 0.0f;
-    for (int32_t k = 0; k < window; ++k) {
-        const float w = weights[x * window + k];
-        if (w != 0.0f)
-            acc += w * (float)input[in_base + indices[x * window + k] * inner];
-    }
-    output[o * len_out * inner + x * inner + i] = (T)acc;
-}
-
-typedef decltype(resize_axis<float>) resize_axis_t;
-
-#define INSTANTIATE_RESIZE_AXIS(tname, type)                                   \
-    template [[host_name(                                                      \
-        "array_ops::resize_axis_" #tname)]] [[kernel]] resize_axis_t           \
-        resize_axis<type>;
-
 // Copy kernels: only u8/u16/u32/u64 (copy is type-size based)
 INSTANTIATE_COPY(u8, uint8_t)
 INSTANTIATE_COPY(u16, uint16_t)
@@ -424,7 +445,3 @@ INSTANTIATE_DIAG_GATHER(f16, half)
 // Axis Gather: f32 and f16 only (indices are int64).
 INSTANTIATE_GATHER(f32, float)
 INSTANTIATE_GATHER(f16, half)
-
-// Axis resample: f32 and f16 only (plan indices are int32, weights f32).
-INSTANTIATE_RESIZE_AXIS(f32, float)
-INSTANTIATE_RESIZE_AXIS(f16, half)
