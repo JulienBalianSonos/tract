@@ -21,9 +21,9 @@
 //!
 //! The swept knobs are read at execution time on every dispatch/commit
 //! (commit cadence per `command_buffer()` acquisition, in-flight depth per
-//! `commit_current`), so candidates can be swapped between fully quiesced
-//! runs without touching any Metal object. They must never change the
-//! computed values: each candidate's
+//! `commit_current`, MoE commit floor per routed dispatch), so candidates
+//! can be swapped between fully quiesced runs without touching any Metal
+//! object. They must never change the computed values: each candidate's
 //! outputs are compared byte-for-byte against the baseline outputs and a
 //! mismatch rejects the candidate loudly (it signals a tract bug, not a
 //! tuning trade-off).
@@ -56,6 +56,8 @@ struct Knob {
     set: fn(&mut MetalTuning, usize),
     /// Whether env/app/cache already supplies this knob (probe skips it).
     pinned: fn(&PinnedKnobs) -> bool,
+    /// Only meaningful when the plan contains routed-MoE fast-path ops.
+    moe_only: bool,
 }
 
 const KNOBS: &[Knob] = &[
@@ -65,6 +67,7 @@ const KNOBS: &[Knob] = &[
         get: |t| t.max_command_buffers_in_flight,
         set: |t, v| t.max_command_buffers_in_flight = v,
         pinned: |p| p.max_command_buffers_in_flight,
+        moe_only: false,
     },
     Knob {
         name: "commit_every_n_dispatches",
@@ -72,6 +75,15 @@ const KNOBS: &[Knob] = &[
         get: |t| t.commit_every_n_dispatches,
         set: |t, v| t.commit_every_n_dispatches = v,
         pinned: |p| p.commit_every_n_dispatches,
+        moe_only: false,
+    },
+    Knob {
+        name: "moe_commit_min_routes",
+        candidates: &[32, 64, 128],
+        moe_only: true,
+        get: |t| t.moe_commit_min_routes,
+        set: |t, v| t.moe_commit_min_routes = v,
+        pinned: |p| p.moe_commit_min_routes,
     },
 ];
 
@@ -153,9 +165,16 @@ fn probe(plan: &Arc<TypedSimplePlan>, resolved: MetalTuning) -> TractResult<Meta
     // Skip knobs an env var or an app override already supplies: better
     // information exists, and those layers outrank probe results anyway.
     let pinned = tuning::pinned_knobs();
+    let has_moe = plan.model().nodes().iter().any(|n| {
+        n.op_is::<crate::ops::MetalRoutedQ40MatMul>()
+            || n.op_is::<crate::ops::MetalRoutedQ40SwiGlu>()
+    });
     let knobs: Vec<&Knob> = KNOBS
         .iter()
         .filter(|knob| {
+            if knob.moe_only && !has_moe {
+                return false;
+            }
             if (knob.pinned)(&pinned) {
                 log::debug!(
                     "Metal load-time autotune: not probing {} (already supplied by an \
