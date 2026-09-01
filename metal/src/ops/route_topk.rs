@@ -54,16 +54,9 @@ impl Op for MetalRouteTopK {
 }
 
 impl EvalOp for MetalRouteTopK {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval_with_session(
-        &self,
-        _node_id: usize,
-        _session: &TurnState,
-        inputs: TVec<TValue>,
-    ) -> TractResult<TVec<TValue>> {
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         ensure!(inputs.len() == 2 || inputs.len() == 3);
         let x_raw = &inputs[0];
         let wg_raw = &inputs[1];

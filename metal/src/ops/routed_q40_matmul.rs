@@ -54,16 +54,9 @@ impl Op for MetalRoutedQ40MatMul {
 }
 
 impl EvalOp for MetalRoutedQ40MatMul {
-    fn is_stateless(&self) -> bool {
-        true
-    }
+    op_out_of_plan!();
 
-    fn eval_with_session(
-        &self,
-        node_id: usize,
-        session: &TurnState,
-        inputs: TVec<TValue>,
-    ) -> TractResult<TVec<TValue>> {
+    fn eval(&self, ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let (input_raw, weights_raw, route_token_ids_raw, route_expert_ids_raw) = args_4!(inputs);
         let input = input_raw
             .to_device_tensor()
@@ -80,9 +73,8 @@ impl EvalOp for MetalRoutedQ40MatMul {
 
         ensure!(route_token_ids.rank() == 1);
         ensure!(weights.rank() == 3);
-        let output = tract_gpu::session_handler::make_tensor_for_node(
-            session,
-            node_id,
+        let output = tract_gpu::turn_handler::make_tensor_for_node(
+            ctx,
             f32::datum_type(),
             &[route_token_ids.shape()[0], weights.shape()[1]],
         )?;
