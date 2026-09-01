@@ -177,14 +177,8 @@ impl TypedOp for MetalFusedSdpa {
 }
 
 impl EvalOp for MetalFusedSdpa {
-    fn is_stateless(&self) -> bool {
-        false
-    }
-    fn state(
-        &self,
-        _session: &TurnState,
-        _node_id: usize,
-    ) -> TractResult<Option<Box<dyn OpState>>> {
+    not_out_of_plan!();
+    fn state(&self, _ctx: &EvalContext) -> TractResult<Option<Box<dyn OpState>>> {
         Ok(Some(Box::new(MetalFusedSdpaState {
             scale: f32::from_bits(self.scale_bits),
             window: self.window,
@@ -196,6 +190,7 @@ impl EvalOp for MetalFusedSdpa {
             v: DeviceKvBuffer::transposed(),
             flash_scratch: None,
             neg_inf_sinks: None,
+            cloned: false.into(),
         })))
     }
 }
@@ -481,7 +476,7 @@ impl DeviceKvBuffer {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct MetalFusedSdpaState {
     scale: f32,
     window: u32,
@@ -495,12 +490,62 @@ pub struct MetalFusedSdpaState {
     /// Sinks-less models: cached [Hq] f32 buffer of -inf fed to the sinks
     /// kernels (exp(-inf - m) = 0, exactly the plain masked softmax).
     neg_inf_sinks: Option<DeviceTensor>,
+    /// True once this instance has already produced one clone. `OpState`s
+    /// are cloned directly now (no more freeze/unfreeze roundtrip): the
+    /// ordinary decode-loop pattern `state = state.clone()` drops the
+    /// original right after cloning, so a first clone can keep sharing the
+    /// append-in-place KV buffers for free. A *second* clone of the same
+    /// still-live instance is a real branch (e.g. coexisting
+    /// speculative/beam continuations) and must not race a sibling's
+    /// in-place appends, so it gets private KV storage instead.
+    cloned: std::sync::atomic::AtomicBool,
+}
+
+impl Clone for MetalFusedSdpaState {
+    fn clone(&self) -> Self {
+        use std::sync::atomic::Ordering;
+        if !self.cloned.swap(true, Ordering::Relaxed) {
+            return Self {
+                scale: self.scale,
+                window: self.window,
+                has_sinks: self.has_sinks,
+                k: self.k.clone(),
+                v: self.v.clone(),
+                flash_scratch: self.flash_scratch.clone(),
+                neg_inf_sinks: self.neg_inf_sinks.clone(),
+                cloned: false.into(),
+            };
+        }
+        // Branch: private KV storage. Scratch buffers are per-branch anyway
+        // (rewritten before every read), so sharing them is harmless; only
+        // the append-in-place KV buffers must not be shared.
+        let (k, v) = match (self.k.deep_copy(), self.v.deep_copy()) {
+            (Ok(k), Ok(v)) => (k, v),
+            (k, v) => {
+                // Surface the failure loudly rather than running corrupt.
+                panic!(
+                    "branching a MetalFusedSdpa state failed to copy its KV buffers: {:?}",
+                    k.err().or(v.err())
+                );
+            }
+        };
+        Self {
+            scale: self.scale,
+            window: self.window,
+            has_sinks: self.has_sinks,
+            k,
+            v,
+            flash_scratch: self.flash_scratch.clone(),
+            neg_inf_sinks: self.neg_inf_sinks.clone(),
+            cloned: false.into(),
+        }
+    }
 }
 
 impl OpState for MetalFusedSdpaState {
     fn eval(
         &mut self,
-        _state: &mut TurnState,
+        _ctx: &EvalContext,
         _op: &dyn Op,
         inputs: TVec<TValue>,
     ) -> TractResult<TVec<TValue>> {
@@ -1010,7 +1055,7 @@ impl OpState for MetalFusedSdpaState {
                 window: self.window,
                 has_sinks: self.has_sinks,
             };
-            let mut cpu_state = tract_core::ops::EvalOp::state(&cpu_op, _state, 0)?.unwrap();
+            let mut cpu_state = tract_core::ops::EvalOp::state(&cpu_op, _ctx)?.unwrap();
             let host = |t: &DeviceTensor| -> TractResult<TValue> {
                 Ok(t.to_host()?.into_tensor().into_tvalue())
             };
@@ -1025,7 +1070,7 @@ impl OpState for MetalFusedSdpaState {
             if self.has_sinks {
                 cpu_inputs.push(host(inputs[6].to_device_tensor()?)?);
             }
-            let cpu_out = cpu_state.eval(_state, &cpu_op, cpu_inputs)?;
+            let cpu_out = cpu_state.eval(_ctx, &cpu_op, cpu_inputs)?;
             let metal_out = DeviceTensor::ArenaView(DeviceArenaView::from_owned(
                 out.clone(),
                 f16::datum_type(),
@@ -1112,6 +1157,10 @@ impl OpState for MetalFusedSdpaState {
             self.v.valid_view()?.into_tensor().into_tvalue(),
         ))
     }
+
+    fn reset_lanes(&mut self, _lanes: &[LaneId]) -> TractResult<()> {
+        bail!("MetalFusedSdpaState is not lane-aware: the KV buffers have no lane axis")
+    }
 }
 
 fn subview_all(
@@ -1144,13 +1193,11 @@ fn subview_head(
     )?))
 }
 
-use tract_core::ops::{FrozenOpState, OpStateFreeze};
-
 impl DeviceKvBuffer {
     /// Private copy of the buffer: same geometry, fresh physical storage
     /// holding the valid region. The q8 shadow is dropped (it is rebuilt
-    /// from the exact f16 rows on the next append). Used when a frozen
-    /// snapshot branches: clones share `Arc`s to one physical buffer, and
+    /// from the exact f16 rows on the next append). Used when a cloned
+    /// state branches: clones share `Arc`s to one physical buffer, and
     /// two lineages appending at the same offsets would overwrite each
     /// other's rows.
     fn deep_copy(&self) -> TractResult<Self> {
@@ -1189,53 +1236,6 @@ impl DeviceKvBuffer {
             copy.len = 0;
         }
         Ok(copy)
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct FrozenMetalFusedSdpaState {
-    state: MetalFusedSdpaState,
-    /// The first unfreeze continues the lineage and may share the physical
-    /// KV buffers (single decode thread, freeze/unfreeze between every
-    /// call). Any later unfreeze of the same snapshot is a BRANCH: it gets
-    /// private buffer copies, because two live states appending into one
-    /// physical buffer overwrite each other's rows (byte-identical prefixes,
-    /// silently wrong logits afterwards).
-    lineage_continued: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl OpStateFreeze for MetalFusedSdpaState {
-    fn freeze(&self) -> Box<dyn FrozenOpState> {
-        Box::new(FrozenMetalFusedSdpaState {
-            state: self.clone(),
-            lineage_continued: Arc::new(false.into()),
-        })
-    }
-}
-
-impl FrozenOpState for FrozenMetalFusedSdpaState {
-    fn unfreeze(&self) -> Box<dyn OpState> {
-        if !self.lineage_continued.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            return Box::new(self.state.clone());
-        }
-        // Branch: private KV storage. Scratch buffers are per-branch anyway
-        // (rewritten before every read), so sharing them is harmless; only
-        // the append-in-place KV buffers must not be shared.
-        let mut branched = self.state.clone();
-        match (branched.k.deep_copy(), branched.v.deep_copy()) {
-            (Ok(k), Ok(v)) => {
-                branched.k = k;
-                branched.v = v;
-            }
-            (k, v) => {
-                // Surface the failure loudly rather than running corrupt.
-                panic!(
-                    "branching a frozen MetalFusedSdpa state failed to copy its KV buffers: {:?}",
-                    k.err().or(v.err())
-                );
-            }
-        }
-        Box::new(branched)
     }
 }
 
@@ -1441,9 +1441,9 @@ mod tests {
         let scale = (d as f32).sqrt().recip();
         let op = MetalFusedSdpa { scale_bits: scale.to_bits(), window: 0, has_sinks: true };
         let cpu_op = CpuOp { scale_bits: scale.to_bits(), window: 0, has_sinks: true };
-        let mut session = TurnState::default();
-        let mut metal_state = op.state(&session, 0)?.unwrap();
-        let mut cpu_state = EvalOp::state(&cpu_op, &session, 0)?.unwrap();
+        let ctx = EvalContext::out_of_plan();
+        let mut metal_state = op.state(&ctx)?.unwrap();
+        let mut cpu_state = EvalOp::state(&cpu_op, &ctx)?.unwrap();
 
         let mut seed = 43u64;
         let sinks = rng_tensor(&[hq], &mut seed);
@@ -1482,7 +1482,7 @@ mod tests {
             let mask = window_mask(step_len, past + step_len, usize::MAX);
 
             let cpu_out = cpu_state.eval(
-                &mut session,
+                &ctx,
                 &cpu_op,
                 tvec!(
                     q.clone().into_tvalue(),
@@ -1495,7 +1495,7 @@ mod tests {
                 ),
             )?;
             let metal_out = metal_state.eval(
-                &mut session,
+                &ctx,
                 &op,
                 tvec!(
                     q.clone().into_device()?.into_tensor().into_tvalue(),
@@ -1564,9 +1564,9 @@ mod tests {
             has_sinks: with_sinks,
         };
         let cpu_op = CpuOp { scale_bits: scale.to_bits(), window: 0, has_sinks: with_sinks };
-        let mut session = TurnState::default();
-        let mut metal_state = op.state(&session, 0)?.unwrap();
-        let mut cpu_state = EvalOp::state(&cpu_op, &session, 0)?.unwrap();
+        let ctx = EvalContext::out_of_plan();
+        let mut metal_state = op.state(&ctx)?.unwrap();
+        let mut cpu_state = EvalOp::state(&cpu_op, &ctx)?.unwrap();
 
         let mut seed = 42u64;
         let sinks = with_sinks.then(|| rng_tensor(&[hq], &mut seed));
@@ -1602,8 +1602,8 @@ mod tests {
                 cpu_inputs.push(sinks.clone().into_tvalue());
                 metal_inputs.push(sinks.clone().into_device()?.into_tensor().into_tvalue());
             }
-            let cpu_out = cpu_state.eval(&mut session, &cpu_op, cpu_inputs)?;
-            let metal_out = metal_state.eval(&mut session, &op, metal_inputs)?;
+            let cpu_out = cpu_state.eval(&ctx, &cpu_op, cpu_inputs)?;
+            let metal_out = metal_state.eval(&ctx, &op, metal_inputs)?;
             crate::with_metal_stream(|stream| stream.wait_until_completed())?;
 
             for (i, tol) in [(0usize, Approximation::SuperApproximate)].into_iter() {

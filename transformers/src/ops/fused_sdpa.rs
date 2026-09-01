@@ -29,7 +29,6 @@
 //! semantics stay exact.
 
 use tract_nnef::internal::*;
-use tract_nnef::tract_core::ops::{FrozenOpState, OpStateFreeze};
 use tract_nnef::tract_ndarray::{Array2, ArrayView2, Ix1, Ix4, s};
 
 use crate::ops::inplace_kv_cache::InPlaceKvCache;
@@ -84,14 +83,8 @@ impl Op for FusedSdpa {
 }
 
 impl EvalOp for FusedSdpa {
-    fn is_stateless(&self) -> bool {
-        false
-    }
-    fn state(
-        &self,
-        _session: &TurnState,
-        _node_id: usize,
-    ) -> TractResult<Option<Box<dyn OpState>>> {
+    not_out_of_plan!();
+    fn state(&self, _ctx: &EvalContext) -> TractResult<Option<Box<dyn OpState>>> {
         Ok(Some(Box::new(FusedSdpaState {
             scale: self.scale(),
             has_sinks: self.has_sinks,
@@ -138,7 +131,7 @@ pub struct FusedSdpaState {
 impl OpState for FusedSdpaState {
     fn eval(
         &mut self,
-        _state: &mut TurnState,
+        _ctx: &EvalContext,
         _op: &dyn Op,
         inputs: TVec<TValue>,
     ) -> TractResult<TVec<TValue>> {
@@ -257,20 +250,9 @@ impl OpState for FusedSdpaState {
             v_out.into_tvalue(),
         ))
     }
-}
 
-#[derive(Clone, Debug)]
-pub struct FrozenFusedSdpaState(FusedSdpaState);
-
-impl OpStateFreeze for FusedSdpaState {
-    fn freeze(&self) -> Box<dyn FrozenOpState> {
-        Box::new(FrozenFusedSdpaState(self.clone()))
-    }
-}
-
-impl FrozenOpState for FrozenFusedSdpaState {
-    fn unfreeze(&self) -> Box<dyn OpState> {
-        Box::new(self.0.clone())
+    fn reset_lanes(&mut self, _lanes: &[LaneId]) -> TractResult<()> {
+        bail!("FusedSdpaState is not lane-aware: the KV caches have no lane axis")
     }
 }
 
@@ -1059,7 +1041,7 @@ mod tests {
         mask: &Tensor,
         sinks: Option<&Tensor>,
     ) -> TVec<TValue> {
-        let mut session = TurnState::default();
+        let ctx = EvalContext::out_of_plan();
         let mut inputs = tvec!(
             q.clone().into_tvalue(),
             k_new.clone().into_tvalue(),
@@ -1071,7 +1053,7 @@ mod tests {
         if let Some(sinks) = sinks {
             inputs.push(sinks.clone().into_tvalue());
         }
-        state.eval(&mut session, op, inputs).unwrap()
+        state.eval(&ctx, op, inputs).unwrap()
     }
 
     fn state_for(op: &FusedSdpa) -> FusedSdpaState {
