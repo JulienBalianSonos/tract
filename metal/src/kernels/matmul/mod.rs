@@ -5,7 +5,7 @@ mod mlx_gemm;
 pub mod mlx_sdpa;
 
 pub use basic::BasicMatMul;
-pub use ggml_gemm::GgmlGemm;
+pub use ggml_gemm::{GgmlGemm, dispatch_mul_mv_f16_split_k, dispatch_mul_mv_q8_0};
 pub use mfa::MfaGemm;
 pub use mlx_gemm::MlxGemm;
 use tract_core::tract_linalg::block_quant::{BlockQuant, Q4_0};
