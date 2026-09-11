@@ -1,5 +1,6 @@
 pub mod conv;
 pub mod fused_axis_op;
+pub mod fused_sdpa;
 pub mod gemm;
 pub mod pool;
 

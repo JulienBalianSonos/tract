@@ -5189,6 +5189,7 @@ version = "0.23.6-pre"
 dependencies = [
  "float-ord",
  "rayon",
+ "tract-metal",
  "tract-nnef",
 ]
 
