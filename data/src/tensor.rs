@@ -1846,6 +1846,9 @@ impl Tensor {
         }
         let mut shape: TVec<usize> = self.shape().into();
         shape[axis] = end - start;
+        if let Some(tensor) = self.storage.as_storage().slice(axis, start, end)? {
+            return Ok(tensor);
+        }
         unsafe {
             let mut tensor = Tensor::uninitialized_dt(self.datum_type(), &shape)?;
             tensor.assign_slice_from_resolved(0..end - start, self, start..end, axis);
