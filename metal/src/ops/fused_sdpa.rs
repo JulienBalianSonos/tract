@@ -34,9 +34,9 @@ use crate::kernels::matmul::{
 };
 use crate::kernels::moe::{
     FlashAttnDims, dispatch_fused_sdpa_flash_attn_f16, dispatch_kv_quantize_q8_0,
-    dispatch_sinks_softmax_f16, dispatch_sum_chunks_f16, flash_attn_scratch_len,
     dispatch_sdpa_prefill_block_softmax_f16, dispatch_sdpa_prefill_finalize_f16,
-    dispatch_sdpa_prefill_rescale_acc_f32,
+    dispatch_sdpa_prefill_rescale_acc_f32, dispatch_sinks_softmax_f16, dispatch_sum_chunks_f16,
+    flash_attn_scratch_len,
 };
 use crate::utils::get_metal_buffer;
 
@@ -58,9 +58,7 @@ fn env_flag_with_legacy(new: &'static str, legacy: &'static str) -> bool {
     static CACHE: OnceLock<Mutex<HashMap<(&'static str, &'static str), bool>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut cache = cache.lock().expect("env flag cache poisoned");
-    *cache
-        .entry((new, legacy))
-        .or_insert_with(|| env_with_legacy(new, legacy).is_some())
+    *cache.entry((new, legacy)).or_insert_with(|| env_with_legacy(new, legacy).is_some())
 }
 
 /// Step sizes up to this may run the fused flash-attention kernel; larger
@@ -68,15 +66,13 @@ fn env_flag_with_legacy(new: &'static str, legacy: &'static str) -> bool {
 /// (what the fused kernel supports), not a tuned threshold.
 const FLASH_MAX_S: usize = 8;
 
-/// Context length where flash decode takes over from the batched gemms. See
-/// [`crate::tuning::MetalTuning::flash_sdpa_min_t`]
-/// (`TRACT_METAL_FLASH_SDPA_MIN_T`; disabled by default).
+/// Context length where flash decode takes over from the batched gemms.
 fn flash_min_t() -> usize {
     #[cfg(test)]
     if FLASH_MIN_T_TEST_OVERRIDE.with(|c| c.get()) {
         return 0;
     }
-    crate::tuning::tuning().flash_sdpa_min_t
+    usize::MAX
 }
 
 #[cfg(test)]
@@ -110,9 +106,7 @@ thread_local! {
 const Q8_BLOCK: usize = 32;
 const Q8_BLOCK_BYTES: usize = 34;
 
-/// Key-block size of the block-wise prefill attention, 0 disables. See
-/// [`crate::tuning::MetalTuning::sdpa_prefill_block`]
-/// (`TRACT_METAL_SDPA_PREFILL_BLOCK`).
+/// Key-block size of the block-wise prefill attention, 0 disables.
 fn sdpa_prefill_block() -> usize {
     #[cfg(test)]
     {
@@ -121,7 +115,7 @@ fn sdpa_prefill_block() -> usize {
             return v;
         }
     }
-    crate::tuning::tuning().sdpa_prefill_block
+    4096
 }
 
 #[cfg(test)]
@@ -130,15 +124,14 @@ thread_local! {
     /// prefill at test-sized T without racing the process environment.
     static SDPA_BLOCK_TEST_OVERRIDE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
-/// Context length where the decode AV gemv switches to split-k, and target
-/// keys per split-k chunk. See
-/// [`crate::tuning::MetalTuning::sdpa_split_k_min_t`] and
-/// [`crate::tuning::MetalTuning::sdpa_split_k_chunk`].
+/// Context length where the decode AV gemv switches to split-k.
 fn split_k_min_t() -> usize {
-    crate::tuning::tuning().sdpa_split_k_min_t
+    8192
 }
+
+/// Target keys per split-k chunk.
 fn split_k_chunk() -> usize {
-    crate::tuning::tuning().sdpa_split_k_chunk
+    2048
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -235,12 +228,7 @@ impl DeviceKvBuffer {
     /// [1, Hkv, seq, D] axis order.
     fn logical_strides(&self, cap: usize) -> TVec<isize> {
         if self.transposed {
-            tvec![
-                (self.hkv * self.d * cap) as isize,
-                (self.d * cap) as isize,
-                1,
-                cap as isize
-            ]
+            tvec![(self.hkv * self.d * cap) as isize, (self.d * cap) as isize, 1, cap as isize]
         } else {
             natural_strides(&[1, self.hkv, cap, self.d])
         }
@@ -323,9 +311,13 @@ impl DeviceKvBuffer {
         )?))
     }
 
-    fn alloc(&self, hkv: usize, d: usize, cap: usize) -> TractResult<Arc<Box<dyn OwnedDeviceTensor>>> {
-        let shape: [usize; 4] =
-            if self.transposed { [1, hkv, d, cap] } else { [1, hkv, cap, d] };
+    fn alloc(
+        &self,
+        hkv: usize,
+        d: usize,
+        cap: usize,
+    ) -> TractResult<Arc<Box<dyn OwnedDeviceTensor>>> {
+        let shape: [usize; 4] = if self.transposed { [1, hkv, d, cap] } else { [1, hkv, cap, d] };
         // Zero-filled (not pooled/uninitialized): the split-k attention reads
         // the capacity tail beyond `len` against zero probabilities, and
         // NaN garbage times zero would poison the sum.
@@ -421,8 +413,7 @@ impl DeviceKvBuffer {
         let mut from = from;
         if self.q8.as_ref().is_none_or(|t| t.len() != needed_bytes) {
             self.q8 = Some(Arc::new(
-                get_context()?
-                    .uninitialized_device_tensor(&[needed_bytes], u8::datum_type())?,
+                get_context()?.uninitialized_device_tensor(&[needed_bytes], u8::datum_type())?,
             ));
             from = 0; // fresh or regrown shadow: requantize everything
         }
@@ -558,8 +549,7 @@ impl OpState for MetalFusedSdpaState {
         let mask = inputs[5].to_device_tensor()?;
 
         ensure!(q.datum_type() == f16::datum_type(), "q must be f16");
-        let (b, hq, s_len, d) =
-            (q.shape()[0], q.shape()[1], q.shape()[2], q.shape()[3]);
+        let (b, hq, s_len, d) = (q.shape()[0], q.shape()[1], q.shape()[2], q.shape()[3]);
         ensure!(b == 1, "batch 1 only");
         let hkv = k_new.shape()[1];
         let group = hq / hkv;
@@ -610,10 +600,10 @@ impl OpState for MetalFusedSdpaState {
         };
 
         // Output scratch (scores/probs exist only on the gemm path).
-        let out = Arc::new(get_context()?.uninitialized_device_tensor(
-            &[hkv, group * s_len, d],
-            f16::datum_type(),
-        )?);
+        let out = Arc::new(
+            get_context()?
+                .uninitialized_device_tensor(&[hkv, group * s_len, d], f16::datum_type())?,
+        );
 
         // A operand for QK: q's dense [1, Hq, S, D] layout is exactly the
         // batched [Hkv, group*S, D] the gemm wants, so it is used in place; a
@@ -625,10 +615,10 @@ impl OpState for MetalFusedSdpaState {
         let (q_a, q_a_offset) = if q_dense {
             (q.clone(), q.buffer_offset::<usize>())
         } else {
-            let scratch = Arc::new(get_context()?.uninitialized_device_tensor(
-                &[hkv, group * s_len, d],
-                f16::datum_type(),
-            )?);
+            let scratch = Arc::new(
+                get_context()?
+                    .uninitialized_device_tensor(&[hkv, group * s_len, d], f16::datum_type())?,
+            );
             let dst = subview_all(&scratch, hkv * group * s_len, d)?;
             get_context()?.copy_nd(
                 q,
@@ -695,14 +685,14 @@ impl OpState for MetalFusedSdpaState {
                 stream.commit_current()?;
                 let t_pad = t_len.next_multiple_of(Q8_BLOCK);
                 let m = group * s_len;
-                let scores = Arc::new(get_context()?.uninitialized_device_tensor(
-                    &[hkv, m, t_pad],
-                    f16::datum_type(),
-                )?);
-                let probs = Arc::new(get_context()?.uninitialized_device_tensor(
-                    &[hkv, m, t_pad],
-                    f16::datum_type(),
-                )?);
+                let scores = Arc::new(
+                    get_context()?
+                        .uninitialized_device_tensor(&[hkv, m, t_pad], f16::datum_type())?,
+                );
+                let probs = Arc::new(
+                    get_context()?
+                        .uninitialized_device_tensor(&[hkv, m, t_pad], f16::datum_type())?,
+                );
                 let scores_all = subview_all(&scores, hkv * m, t_pad)?;
                 let probs_all = subview_all(&probs, hkv * m, t_pad)?;
                 let k_q8 = self.k.q8_view()?;
@@ -765,12 +755,10 @@ impl OpState for MetalFusedSdpaState {
             if use_flash {
                 let need = flash_attn_scratch_len(hq, s_len, t_len, d);
                 if self.flash_scratch.as_ref().is_none_or(|t| t.len() < need) {
-                    self.flash_scratch = Some(unsafe {
-                        DeviceTensor::uninitialized_dt(
-                            f32::datum_type(),
-                            &[(need * 2).next_power_of_two()],
-                        )?
-                    });
+                    self.flash_scratch = Some(DeviceTensor::uninitialized_dt(
+                        f32::datum_type(),
+                        &[(need * 2).next_power_of_two()],
+                    )?);
                 }
                 return dispatch_fused_sdpa_flash_attn_f16(
                     stream,
@@ -804,28 +792,17 @@ impl OpState for MetalFusedSdpaState {
             let block = sdpa_prefill_block();
             if s_len > FLASH_MAX_S && block > 0 && t_eff > block {
                 let rows = hkv * m;
-                let scores = Arc::new(get_context()?.uninitialized_device_tensor(
-                    &[hkv, m, block],
-                    f16dt,
-                )?);
-                let probs = Arc::new(get_context()?.uninitialized_device_tensor(
-                    &[hkv, m, block],
-                    f16dt,
-                )?);
-                let partial = Arc::new(get_context()?.uninitialized_device_tensor(
-                    &[hkv, m, d],
-                    f16dt,
-                )?);
+                let scores =
+                    Arc::new(get_context()?.uninitialized_device_tensor(&[hkv, m, block], f16dt)?);
+                let probs =
+                    Arc::new(get_context()?.uninitialized_device_tensor(&[hkv, m, block], f16dt)?);
+                let partial =
+                    Arc::new(get_context()?.uninitialized_device_tensor(&[hkv, m, d], f16dt)?);
                 let partial_all = subview_all(&partial, rows, d)?;
-                let acc = unsafe {
-                    DeviceTensor::uninitialized_dt(f32::datum_type(), &[rows, d])?
-                };
-                let m_state =
-                    unsafe { DeviceTensor::uninitialized_dt(f32::datum_type(), &[rows])? };
-                let l_state =
-                    unsafe { DeviceTensor::uninitialized_dt(f32::datum_type(), &[rows])? };
-                let rescale =
-                    unsafe { DeviceTensor::uninitialized_dt(f32::datum_type(), &[rows])? };
+                let acc = DeviceTensor::uninitialized_dt(f32::datum_type(), &[rows, d])?;
+                let m_state = DeviceTensor::uninitialized_dt(f32::datum_type(), &[rows])?;
+                let l_state = DeviceTensor::uninitialized_dt(f32::datum_type(), &[rows])?;
+                let rescale = DeviceTensor::uninitialized_dt(f32::datum_type(), &[rows])?;
                 let mut j = j0;
                 let mut first = true;
                 while j < t_len {
@@ -864,8 +841,8 @@ impl OpState for MetalFusedSdpaState {
                         get_metal_buffer(&scores_b),
                     )?;
                     dispatch_sdpa_prefill_block_softmax_f16(
-                        stream, &scores_b, &mask_2d, &probs_b, &m_state, &l_state, &rescale,
-                        rows, bt, s_len, self.scale, j, t_len, first,
+                        stream, &scores_b, &mask_2d, &probs_b, &m_state, &l_state, &rescale, rows,
+                        bt, s_len, self.scale, j, t_len, first,
                     )?;
                     // AV gemm of the block: partial [Hkv, m, D].
                     gemm.dispatch_eval(
@@ -895,7 +872,13 @@ impl OpState for MetalFusedSdpaState {
                         get_metal_buffer(&partial_all),
                     )?;
                     dispatch_sdpa_prefill_rescale_acc_f32(
-                        stream, &partial_all, &rescale, &acc, rows, d, first,
+                        stream,
+                        &partial_all,
+                        &rescale,
+                        &acc,
+                        rows,
+                        d,
+                        first,
                     )?;
                     // Boundary between dependent block iterations: the next
                     // block rewrites scores/probs read here and reads back
@@ -906,7 +889,15 @@ impl OpState for MetalFusedSdpaState {
                     j += bt;
                 }
                 dispatch_sdpa_prefill_finalize_f16(
-                    stream, &acc, &m_state, &l_state, &sinks_flat, &out_all, rows, d, s_len,
+                    stream,
+                    &acc,
+                    &m_state,
+                    &l_state,
+                    &sinks_flat,
+                    &out_all,
+                    rows,
+                    d,
+                    s_len,
                 )?;
                 return Ok(());
             }
@@ -921,8 +912,7 @@ impl OpState for MetalFusedSdpaState {
                 && !env_flag_with_legacy(
                     "TRACT_METAL_DISABLE_SDPA_SPLIT_K",
                     "TRACT_METAL_DISABLE_GPT_OSS_SPLIT_K",
-                )
-            {
+                ) {
                 let chunks = t_eff.div_ceil(split_k_chunk()).clamp(2, 16);
                 let k_chunk = t_eff.div_ceil(chunks).next_multiple_of(Q8_BLOCK);
                 let t_ck = chunks * k_chunk;
@@ -931,14 +921,12 @@ impl OpState for MetalFusedSdpaState {
                 None
             };
             let t_row = split_k.map_or(t_eff, |(_, _, t_ck)| t_ck);
-            let scores = Arc::new(get_context()?.uninitialized_device_tensor(
-                &[hkv, m, t_row],
-                f16::datum_type(),
-            )?);
-            let probs = Arc::new(get_context()?.uninitialized_device_tensor(
-                &[hkv, m, t_row],
-                f16::datum_type(),
-            )?);
+            let scores = Arc::new(
+                get_context()?.uninitialized_device_tensor(&[hkv, m, t_row], f16::datum_type())?,
+            );
+            let probs = Arc::new(
+                get_context()?.uninitialized_device_tensor(&[hkv, m, t_row], f16::datum_type())?,
+            );
             let scores_all = subview_all(&scores, hkv * m, t_row)?;
             let probs_all = subview_all(&probs, hkv * m, t_row)?;
             stream.retain_tensor(&scores_all);
@@ -983,10 +971,10 @@ impl OpState for MetalFusedSdpaState {
                 t_len,
             )?;
             if let Some((chunks, k_chunk, t_ck)) = split_k {
-                let partial = Arc::new(get_context()?.uninitialized_device_tensor(
-                    &[hkv * chunks, m, d],
-                    f16::datum_type(),
-                )?);
+                let partial = Arc::new(
+                    get_context()?
+                        .uninitialized_device_tensor(&[hkv * chunks, m, d], f16::datum_type())?,
+                );
                 let partial_all = subview_all(&partial, hkv * chunks * m, d)?;
                 stream.retain_tensor(&partial_all);
                 dispatch_mul_mv_f16_split_k(
@@ -1006,14 +994,7 @@ impl OpState for MetalFusedSdpaState {
                     m,
                     &partial_all,
                 )?;
-                dispatch_sum_chunks_f16(
-                    stream,
-                    &partial_all,
-                    &out_all,
-                    hkv,
-                    chunks,
-                    m * d,
-                )?;
+                dispatch_sum_chunks_f16(stream, &partial_all, &out_all, hkv, chunks, m * d)?;
                 return Ok(());
             }
             // One batched gemm: probs [Hkv, group*S, T] x V^T [Hkv, D, T]^T
@@ -1088,11 +1069,7 @@ impl OpState for MetalFusedSdpaState {
             let dot: f32 = mv.iter().zip(wv).map(|(a, b)| a * b).sum();
             let nm: f32 = mv.iter().map(|a| a * a).sum::<f32>().sqrt();
             let nw: f32 = wv.iter().map(|a| a * a).sum::<f32>().sqrt();
-            let max_abs = mv
-                .iter()
-                .zip(wv)
-                .map(|(a, b)| (a - b).abs())
-                .fold(0f32, f32::max);
+            let max_abs = mv.iter().zip(wv).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
             eprintln!(
                 "fused-sdpa-selfcheck: cosine {:.6} max_abs {:.4} (norms {:.2}/{:.2})",
                 dot / (nm * nw).max(f32::MIN_POSITIVE),
@@ -1201,11 +1178,7 @@ impl DeviceKvBuffer {
     /// two lineages appending at the same offsets would overwrite each
     /// other's rows.
     fn deep_copy(&self) -> TractResult<Self> {
-        let mut copy = Self {
-            buf: None,
-            q8: None,
-            ..self.clone()
-        };
+        let mut copy = Self { buf: None, q8: None, ..self.clone() };
         if self.buf.is_some() && self.len > 0 {
             let fresh = self.alloc(self.hkv, self.d, self.cap)?;
             let src = self.valid_view()?;
@@ -1218,16 +1191,13 @@ impl DeviceKvBuffer {
                 0,
             )?);
             let permuted = |s: &[isize]| -> TVec<isize> { tvec![s[0], s[1], s[3], s[2]] };
-            let (shape, src_strides, dst_strides): (TVec<usize>, TVec<isize>, TVec<isize>) =
-                if self.transposed {
-                    (
-                        tvec![1, self.hkv, self.d, self.len],
-                        permuted(src.strides()),
-                        permuted(&strides),
-                    )
-                } else {
-                    (tvec![1, self.hkv, self.len, self.d], src.strides().into(), strides)
-                };
+            let (shape, src_strides, dst_strides): (TVec<usize>, TVec<isize>, TVec<isize>) = if self
+                .transposed
+            {
+                (tvec![1, self.hkv, self.d, self.len], permuted(src.strides()), permuted(&strides))
+            } else {
+                (tvec![1, self.hkv, self.len, self.d], src.strides().into(), strides)
+            };
             get_context()?.copy_nd(&src, 0, &src_strides, &dst, 0, &shape, &dst_strides)?;
             copy.buf = Some(fresh);
         } else {
@@ -1240,8 +1210,7 @@ impl DeviceKvBuffer {
 }
 
 crate::register_metal_op!(FusedSdpa, |_source, _node, op| {
-    if env_flag_with_legacy("TRACT_METAL_DISABLE_FUSED_SDPA", "TRACT_METAL_DISABLE_GPT_OSS_SDPA")
-    {
+    if env_flag_with_legacy("TRACT_METAL_DISABLE_FUSED_SDPA", "TRACT_METAL_DISABLE_GPT_OSS_SDPA") {
         return Ok(None);
     }
     Ok(Some(Box::new(MetalFusedSdpa {
@@ -1500,8 +1469,10 @@ mod tests {
         let sinks = rng_tensor(&[hq], &mut seed);
         let mut k_all = Tensor::zero::<f16>(&[1, hkv, 0, d])?;
         let mut v_all = Tensor::zero::<f16>(&[1, hkv, 0, d])?;
-        let mut metal_k = Tensor::zero::<f16>(&[1, hkv, 0, d])?.into_device()?.into_tensor().into_tvalue();
-        let mut metal_v = Tensor::zero::<f16>(&[1, hkv, 0, d])?.into_device()?.into_tensor().into_tvalue();
+        let mut metal_k =
+            Tensor::zero::<f16>(&[1, hkv, 0, d])?.into_device()?.into_tensor().into_tvalue();
+        let mut metal_v =
+            Tensor::zero::<f16>(&[1, hkv, 0, d])?.into_device()?.into_tensor().into_tvalue();
 
         // (step_len, truncate-to-before-step)
         let plan: &[(usize, Option<usize>)] =

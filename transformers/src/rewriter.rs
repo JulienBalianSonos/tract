@@ -141,10 +141,7 @@ impl ModelTransform for TransformersTransform {
                 .with_rule_for("fold-const-dyn-slice", ops::fold_const_dyn_slice_rule)
                 .with_rule_for("fold-identity-cast", ops::fold_identity_cast_rule)
                 .with_rule_for("detect-rotate-half", ops::rotate_half_rule)
-                .with_rule_for(
-                    "detect-rotate-half-concat-pair",
-                    ops::rotate_half_concat_pair_rule,
-                )
+                .with_rule_for("detect-rotate-half-concat-pair", ops::rotate_half_concat_pair_rule)
                 .with_rule_for("detect-apply-rope", ops::apply_rope_rule);
         }
         rewriter

@@ -8,10 +8,10 @@
 // Exercises the Metal runtime: tract-metal is an Apple-only dev-dependency.
 #![cfg(target_vendor = "apple")]
 
-use tract_nnef::internal::*;
-use tract_transformers::WithTractTransformers;
 #[allow(unused_imports)]
-use tract_metal as _; // link the metal runtime into the registry
+use tract_metal as _;
+use tract_nnef::internal::*;
+use tract_transformers::WithTractTransformers; // link the metal runtime into the registry
 
 fn model_path() -> Option<String> {
     let path = std::env::var("QWEN35_NNEF").ok()?;
@@ -165,10 +165,7 @@ fn fused_matches_original_on_real_model() -> TractResult<()> {
                        ids: &[i64],
                        states: Option<&TVec<TValue>>|
      -> TractResult<TVec<TValue>> {
-        let p = model
-            .symbols
-            .get("P")
-            .context("model has no P symbol")?;
+        let p = model.symbols.get("P").context("model has no P symbol")?;
         let values = SymbolValues::default().with(&p, 0);
         let mut inputs = TVec::new();
         let mut state_ix = 0usize;
@@ -233,9 +230,8 @@ fn fused_matches_original_on_real_model() -> TractResult<()> {
             let nf: f32 = fv.iter().map(|a| a * a).sum::<f32>().sqrt();
             let cos = dot / (nr * nf).max(f32::MIN_POSITIVE);
             if i == 0 {
-                let argmax = |v: &[f32]| {
-                    v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0
-                };
+                let argmax =
+                    |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
                 ensure!(
                     argmax(rv) == argmax(fv),
                     "{step}: logits argmax differ: {} vs {}",

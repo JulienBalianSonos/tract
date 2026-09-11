@@ -9,10 +9,10 @@
 
 use std::collections::HashMap;
 
-use tract_nnef::internal::*;
-use tract_transformers::WithTractTransformers;
 #[allow(unused_imports)]
-use tract_metal as _; // link the metal runtime into the registry
+use tract_metal as _;
+use tract_nnef::internal::*;
+use tract_transformers::WithTractTransformers; // link the metal runtime into the registry
 
 fn model_path() -> Option<String> {
     let path = std::env::var("GPT_OSS_NNEF").ok()?;
@@ -34,7 +34,8 @@ fn explore_layer0_attention() -> TractResult<()> {
     let names: HashMap<usize, &str> =
         model.nodes().iter().map(|n| (n.id, n.name.as_str())).collect();
     for node in model.nodes() {
-        if !(node.name.contains("__0_selfAttn") || node.name.contains("cache_key_0")
+        if !(node.name.contains("__0_selfAttn")
+            || node.name.contains("cache_key_0")
             || node.name.contains("cache_value_0"))
         {
             continue;
@@ -44,11 +45,7 @@ fn explore_layer0_attention() -> TractResult<()> {
             .iter()
             .map(|o| format!("{}[{}].{}", names.get(&o.node).unwrap_or(&"?"), o.node, o.slot))
             .collect();
-        let outs: Vec<String> = node
-            .outputs
-            .iter()
-            .map(|o| format!("{:?}", o.fact))
-            .collect();
+        let outs: Vec<String> = node.outputs.iter().map(|o| format!("{:?}", o.fact)).collect();
         println!(
             "#{:<4} {:<24} {}\n      ins:  {}\n      out:  {}",
             node.id,
@@ -95,11 +92,8 @@ fn fuses_all_24_layers_on_real_model() -> TractResult<()> {
     );
     assert_eq!(model.inputs.len(), n_inputs, "input signature preserved");
     assert_eq!(model.outputs.len(), n_outputs, "output signature preserved");
-    let concats_to_cache: usize = model
-        .nodes()
-        .iter()
-        .filter(|n| n.name.starts_with("out_cache_"))
-        .count();
+    let concats_to_cache: usize =
+        model.nodes().iter().filter(|n| n.name.starts_with("out_cache_")).count();
     assert_eq!(concats_to_cache, 0, "cache concats eliminated");
     Ok(())
 }
@@ -128,9 +122,7 @@ fn fused_matches_original_on_real_model() -> TractResult<()> {
         for (slot, outlet) in model.inputs.iter().enumerate() {
             let fact = model.outlet_fact(*outlet)?;
             if fact.datum_type == i64::datum_type() && fact.rank() == 2 {
-                inputs.push(
-                    Tensor::from_shape(&[1, ids.len()], ids)?.into_tvalue(),
-                );
+                inputs.push(Tensor::from_shape(&[1, ids.len()], ids)?.into_tvalue());
             } else if fact.rank() == 0 {
                 inputs.push(tensor0(1i64).into_tvalue());
             } else {
@@ -138,9 +130,7 @@ fn fused_matches_original_on_real_model() -> TractResult<()> {
                 match caches {
                     None => {
                         let dt = fact.datum_type;
-                        inputs.push(
-                            Tensor::zero_dt(dt, &[1, 8, 0, 64])?.into_tvalue(),
-                        );
+                        inputs.push(Tensor::zero_dt(dt, &[1, 8, 0, 64])?.into_tvalue());
                     }
                     Some(prev) => {
                         inputs.push(prev[cache_ix].clone());
@@ -185,9 +175,8 @@ fn fused_matches_original_on_real_model() -> TractResult<()> {
                 let ff = f.cast_to::<f32>()?;
                 let rv = rr.try_as_plain()?.as_slice::<f32>()?;
                 let fv = ff.try_as_plain()?.as_slice::<f32>()?;
-                let argmax = |v: &[f32]| {
-                    v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0
-                };
+                let argmax =
+                    |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
                 ensure!(
                     argmax(rv) == argmax(fv),
                     "{step}: logits argmax differ: {} vs {}",
@@ -243,9 +232,19 @@ fn causal_llm_sequence_audit() -> TractResult<()> {
         *counts.entry(node.op.name().to_string()).or_insert(0usize) += 1;
     }
     for (op, n) in &counts {
-        if ["FusedSdpa", "Softmax", "Reduce<Max>", "Concat", "ApplyRope", "DynKeyValueCache", "Sdpa", "FlashSDPA", "MoeFfn"]
-            .iter()
-            .any(|k| op.contains(k))
+        if [
+            "FusedSdpa",
+            "Softmax",
+            "Reduce<Max>",
+            "Concat",
+            "ApplyRope",
+            "DynKeyValueCache",
+            "Sdpa",
+            "FlashSDPA",
+            "MoeFfn",
+        ]
+        .iter()
+        .any(|k| op.contains(k))
         {
             println!("{op}: {n}");
         }

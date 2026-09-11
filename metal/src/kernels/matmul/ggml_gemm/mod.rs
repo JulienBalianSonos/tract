@@ -402,11 +402,7 @@ pub fn dispatch_mul_mv_q8_0(
         encoder.set_buffer(2, Some(get_metal_buffer(a)), a_offset as NSUInteger);
         encoder.set_buffer(3, Some(get_metal_buffer(c)), c_offset as NSUInteger);
         // N_DST(4) x N_SIMDGROUP(2) rows per threadgroup, one r1 per grid.y.
-        let grid = MTLSize {
-            width: (n as u64).div_ceil(8),
-            height: m as u64,
-            depth: batch as u64,
-        };
+        let grid = MTLSize { width: (n as u64).div_ceil(8), height: m as u64, depth: batch as u64 };
         let group = MTLSize { width: 8, height: 8, depth: 1 };
         encoder.dispatch_thread_groups(grid, group);
     });
@@ -451,15 +447,15 @@ pub fn dispatch_mul_mv_f16_split_k(
         ne02: (heads * chunks) as i32,
         nb00: 2,
         nb01: b_row_stride as u64,
-        nb02: (k_chunk * 2) as u64,       // chunk step inside a B row region
-        nb03: b_head_stride as u64,       // head step
+        nb02: (k_chunk * 2) as u64, // chunk step inside a B row region
+        nb03: b_head_stride as u64, // head step
         ne10: k_chunk as i32,
         ne11: m as i32,
         ne12: chunks as i32,
         nb10: 2,
         nb11: a_row_stride as u64,
-        nb12: (k_chunk * 2) as u64,       // chunk step inside an A row region
-        nb13: a_head_stride as u64,       // head step
+        nb12: (k_chunk * 2) as u64, // chunk step inside an A row region
+        nb13: a_head_stride as u64, // head step
         ne0: n as i32,
         ne1: m as i32,
         r2: 1,

@@ -391,8 +391,10 @@ mod tests {
         let x = model.add_source("x", f32::fact([1, heads, seq, head_dim]))?;
         let cos_len = (0..seq * rotary_dim).map(|f| (f as f32).cos()).collect::<Vec<_>>();
         let sin_len = (0..seq * rotary_dim).map(|f| (f as f32).sin()).collect::<Vec<_>>();
-        let cos = model.add_const("cos", Tensor::from_shape(&[1, 1, seq, rotary_dim], &cos_len)?)?;
-        let sin = model.add_const("sin", Tensor::from_shape(&[1, 1, seq, rotary_dim], &sin_len)?)?;
+        let cos =
+            model.add_const("cos", Tensor::from_shape(&[1, 1, seq, rotary_dim], &cos_len)?)?;
+        let sin =
+            model.add_const("sin", Tensor::from_shape(&[1, 1, seq, rotary_dim], &sin_len)?)?;
 
         let half = rotary_dim / 2;
         let mut bound = |name: &str, v: usize| model.add_const(name, tensor0(v as i64));
@@ -415,14 +417,13 @@ mod tests {
         )?[0];
         let x1 =
             model.wire_node("x1", DynSlice { axis: 3, len: half.to_dim() }, &[rot, c0, chalf])?[0];
-        let x2 = model
-            .wire_node("x2", DynSlice { axis: 3, len: half.to_dim() }, &[rot, chalf, crot])?[0];
+        let x2 =
+            model.wire_node("x2", DynSlice { axis: 3, len: half.to_dim() }, &[rot, chalf, crot])?
+                [0];
         let neg = model.wire_node("neg", tract_nnef::tract_core::ops::math::neg(), &[x2])?[0];
         let cat = model.wire_node("cat", TypedConcat::new(3), &[neg, x1])?[0];
-        let mul_cos =
-            model.wire_node("mul_cos", TypedBinOp(Box::new(Mul), None), &[rot, cos])?[0];
-        let mul_sin =
-            model.wire_node("mul_sin", TypedBinOp(Box::new(Mul), None), &[cat, sin])?[0];
+        let mul_cos = model.wire_node("mul_cos", TypedBinOp(Box::new(Mul), None), &[rot, cos])?[0];
+        let mul_sin = model.wire_node("mul_sin", TypedBinOp(Box::new(Mul), None), &[cat, sin])?[0];
         let roped =
             model.wire_node("roped", TypedBinOp(Box::new(Add), None), &[mul_cos, mul_sin])?[0];
         let out = model.wire_node("out", TypedConcat::new(3), &[roped, pass])?[0];
@@ -442,8 +443,7 @@ mod tests {
             &(0..heads * seq * head_dim).map(|f| (f as f32 * 0.17).sin()).collect::<Vec<_>>(),
         )?;
 
-        let reference =
-            model.clone().into_runnable()?.run(tvec![input.clone().into()])?[0].clone();
+        let reference = model.clone().into_runnable()?.run(tvec![input.clone().into()])?[0].clone();
 
         let mut detected = model;
         crate::rewriter::ApplyRopeTransform.transform(&mut detected)?;

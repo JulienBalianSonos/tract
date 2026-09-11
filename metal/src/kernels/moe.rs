@@ -71,11 +71,7 @@ pub fn dispatch_sum_chunks_f16(
         encoder.set_slice(3, &[chunks as u32]);
         encoder.set_slice(4, &[plane as u32]);
         let group_width = (total as u64).min(256).max(1);
-        let grid = MTLSize {
-            width: (total as u64).div_ceil(group_width),
-            height: 1,
-            depth: 1,
-        };
+        let grid = MTLSize { width: (total as u64).div_ceil(group_width), height: 1, depth: 1 };
         let group = MTLSize { width: group_width, height: 1, depth: 1 };
         encoder.dispatch_thread_groups(grid, group);
     });
@@ -120,16 +116,8 @@ pub fn dispatch_fused_sdpa_flash_attn_f16(
     dims: FlashAttnDims,
     scale: f32,
 ) -> TractResult<()> {
-    let FlashAttnDims {
-        hq,
-        s_len,
-        t_len,
-        d,
-        group,
-        k_head_stride,
-        v_head_stride,
-        v_seq_stride,
-    } = dims;
+    let FlashAttnDims { hq, s_len, t_len, d, group, k_head_stride, v_head_stride, v_seq_stride } =
+        dims;
     let hkv = hq / group;
     for t in [q, k, v, mask, sinks] {
         stream.retain_tensor(t);
@@ -329,8 +317,16 @@ pub fn dispatch_sdpa_prefill_block_softmax_f16(
         encoder.set_metal_tensor(0, scores, metal::MTLResourceUsage::Read);
         encoder.set_metal_tensor(1, mask, metal::MTLResourceUsage::Read);
         encoder.set_metal_tensor(2, probs, metal::MTLResourceUsage::Write);
-        encoder.set_metal_tensor(3, m_state, metal::MTLResourceUsage::Read | metal::MTLResourceUsage::Write);
-        encoder.set_metal_tensor(4, l_state, metal::MTLResourceUsage::Read | metal::MTLResourceUsage::Write);
+        encoder.set_metal_tensor(
+            3,
+            m_state,
+            metal::MTLResourceUsage::Read | metal::MTLResourceUsage::Write,
+        );
+        encoder.set_metal_tensor(
+            4,
+            l_state,
+            metal::MTLResourceUsage::Read | metal::MTLResourceUsage::Write,
+        );
         encoder.set_metal_tensor(5, rescale, metal::MTLResourceUsage::Write);
         encoder.set_slice(6, &[rows as u32]);
         encoder.set_slice(7, &[bt as u32]);
@@ -370,7 +366,11 @@ pub fn dispatch_sdpa_prefill_rescale_acc_f32(
         encoder.set_compute_pipeline_state(&pipeline);
         encoder.set_metal_tensor(0, partial, metal::MTLResourceUsage::Read);
         encoder.set_metal_tensor(1, rescale, metal::MTLResourceUsage::Read);
-        encoder.set_metal_tensor(2, acc, metal::MTLResourceUsage::Read | metal::MTLResourceUsage::Write);
+        encoder.set_metal_tensor(
+            2,
+            acc,
+            metal::MTLResourceUsage::Read | metal::MTLResourceUsage::Write,
+        );
         encoder.set_slice(3, &[total as u32]);
         encoder.set_slice(4, &[d as u32]);
         encoder.set_slice(5, &[first_block as u32]);
@@ -454,7 +454,15 @@ mod sinks_softmax_tests {
             let probs_dev = DeviceTensor::uninitialized_dt(f16::datum_type(), &[rows, t_len])?;
 
             dispatch_sinks_softmax_f16(
-                stream, &scores_dev, &mask_dev, &sinks_dev, &probs_dev, s_len, scale, t_len, 0,
+                stream,
+                &scores_dev,
+                &mask_dev,
+                &sinks_dev,
+                &probs_dev,
+                s_len,
+                scale,
+                t_len,
+                0,
                 t_len,
             )?;
             stream.wait_until_completed()?;
@@ -497,48 +505,52 @@ mod flash_attn_bench {
     fn bench_flash_attn_gpt_oss_geometry() -> TractResult<()> {
         crate::utils::with_borrowed_metal_stream(|stream| {
             for t in [256usize, 1024, 2800, 8192] {
-            let (hq, hkv, d) = (64usize, 8usize, 64usize);
-            let group = hq / hkv;
-            let cap = 8192;
-            let q = Tensor::zero::<f16>(&[1, hq, 1, d])?.into_device()?;
-            let k = Tensor::zero::<f16>(&[1, hkv, cap, d])?.into_device()?;
-            let v = Tensor::zero::<f16>(&[1, hkv, d, cap])?.into_device()?;
-            let mask = Tensor::zero::<f32>(&[1, t])?.into_device()?;
-            let sinks = Tensor::zero::<f32>(&[hq])?.into_device()?;
-            let out = Tensor::zero::<f16>(&[1, hq, 1, d])?.into_device()?;
-            let scratch = unsafe {
-                DeviceTensor::uninitialized_dt(
-                    f32::datum_type(),
-                    &[flash_attn_scratch_len(hq, 1, t, d)],
-                )?
-            };
-            let dims = FlashAttnDims {
-                hq,
-                s_len: 1,
-                t_len: t,
-                d,
-                group,
-                k_head_stride: cap * d,
-                v_head_stride: cap * d,
-                v_seq_stride: cap,
-            };
-            // warmup
-            for _ in 0..10 {
-                dispatch_fused_sdpa_flash_attn_f16(
-                    stream, &q, &k, &v, &mask, &sinks, &out, &scratch, dims, 0.125,
-                )?;
-            }
-            stream.wait_until_completed()?;
-            let start = std::time::Instant::now();
-            const N: usize = 200;
-            for _ in 0..N {
-                dispatch_fused_sdpa_flash_attn_f16(
-                    stream, &q, &k, &v, &mask, &sinks, &out, &scratch, dims, 0.125,
-                )?;
-            }
-            stream.wait_until_completed()?;
-            let per = start.elapsed().as_secs_f64() / N as f64;
-            eprintln!("flash attn t={t}: {:.1} us/layer, {:.2} ms/token(24 layers)", per * 1e6, per * 24.0 * 1e3);
+                let (hq, hkv, d) = (64usize, 8usize, 64usize);
+                let group = hq / hkv;
+                let cap = 8192;
+                let q = Tensor::zero::<f16>(&[1, hq, 1, d])?.into_device()?;
+                let k = Tensor::zero::<f16>(&[1, hkv, cap, d])?.into_device()?;
+                let v = Tensor::zero::<f16>(&[1, hkv, d, cap])?.into_device()?;
+                let mask = Tensor::zero::<f32>(&[1, t])?.into_device()?;
+                let sinks = Tensor::zero::<f32>(&[hq])?.into_device()?;
+                let out = Tensor::zero::<f16>(&[1, hq, 1, d])?.into_device()?;
+                let scratch = unsafe {
+                    DeviceTensor::uninitialized_dt(
+                        f32::datum_type(),
+                        &[flash_attn_scratch_len(hq, 1, t, d)],
+                    )?
+                };
+                let dims = FlashAttnDims {
+                    hq,
+                    s_len: 1,
+                    t_len: t,
+                    d,
+                    group,
+                    k_head_stride: cap * d,
+                    v_head_stride: cap * d,
+                    v_seq_stride: cap,
+                };
+                // warmup
+                for _ in 0..10 {
+                    dispatch_fused_sdpa_flash_attn_f16(
+                        stream, &q, &k, &v, &mask, &sinks, &out, &scratch, dims, 0.125,
+                    )?;
+                }
+                stream.wait_until_completed()?;
+                let start = std::time::Instant::now();
+                const N: usize = 200;
+                for _ in 0..N {
+                    dispatch_fused_sdpa_flash_attn_f16(
+                        stream, &q, &k, &v, &mask, &sinks, &out, &scratch, dims, 0.125,
+                    )?;
+                }
+                stream.wait_until_completed()?;
+                let per = start.elapsed().as_secs_f64() / N as f64;
+                eprintln!(
+                    "flash attn t={t}: {:.1} us/layer, {:.2} ms/token(24 layers)",
+                    per * 1e6,
+                    per * 24.0 * 1e3
+                );
             }
             Ok(())
         })

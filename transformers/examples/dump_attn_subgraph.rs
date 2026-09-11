@@ -11,11 +11,7 @@ use tract_transformers::WithTractTransformers;
 
 fn describe(model: &TypedModel, id: usize) -> String {
     let n = model.node(id);
-    let facts: Vec<String> = n
-        .outputs
-        .iter()
-        .map(|o| format!("{:?}", o.fact))
-        .collect();
+    let facts: Vec<String> = n.outputs.iter().map(|o| format!("{:?}", o.fact)).collect();
     let ins: Vec<String> = n.inputs.iter().map(|i| format!("{}/{}", i.node, i.slot)).collect();
     format!(
         "#{id} {} [{}] inputs=[{}] -> {}",
@@ -35,12 +31,8 @@ fn main() -> TractResult<()> {
     let model = nnef.model_for_path(&path)?.into_decluttered()?;
     eprintln!("model loaded: {} nodes", model.nodes().len());
 
-    let softmaxes: Vec<usize> = model
-        .nodes()
-        .iter()
-        .filter(|n| n.op_is::<Softmax>())
-        .map(|n| n.id)
-        .collect();
+    let softmaxes: Vec<usize> =
+        model.nodes().iter().filter(|n| n.op_is::<Softmax>()).map(|n| n.id).collect();
     eprintln!("{} Softmax nodes", softmaxes.len());
 
     for (i, &sm) in softmaxes.iter().enumerate().take(max) {

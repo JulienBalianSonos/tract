@@ -72,12 +72,7 @@ impl Op for FusedSdpa {
         "FusedSdpa".into()
     }
     fn info(&self) -> TractResult<Vec<String>> {
-        Ok(vec![format!(
-            "scale={} window={} sinks={}",
-            self.scale(),
-            self.window,
-            self.has_sinks
-        )])
+        Ok(vec![format!("scale={} window={} sinks={}", self.scale(), self.window, self.has_sinks)])
     }
     op_as_typed_op!();
 }
@@ -136,9 +131,8 @@ impl OpState for FusedSdpaState {
         inputs: TVec<TValue>,
     ) -> TractResult<TVec<TValue>> {
         ensure!(inputs.len() == 6 + self.has_sinks as usize);
-        let (q_in, k_new, v_new, k_cache, v_cache, mask) = (
-            &inputs[0], &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5],
-        );
+        let (q_in, k_new, v_new, k_cache, v_cache, mask) =
+            (&inputs[0], &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5]);
         let sinks_in = self.has_sinks.then(|| &inputs[6]);
         let out_dt = q_in.datum_type();
         let past = k_cache.shape()[SEQ_AXIS];
@@ -211,11 +205,7 @@ impl OpState for FusedSdpaState {
         let kv_len = k.dim().2;
         ensure!(kv_len == past + k_new.shape()[SEQ_AXIS]);
         ensure!(mask.dim().1 == kv_len, "mask keys {} != cache len {kv_len}", mask.dim().1);
-        ensure!(
-            mask.dim().0 == s_len,
-            "mask rows {} != query seq len {s_len}",
-            mask.dim().0
-        );
+        ensure!(mask.dim().0 == s_len, "mask rows {} != query seq len {s_len}", mask.dim().0);
         if let Some(sinks) = &sinks {
             ensure!(sinks.len() == hq);
         }
@@ -352,8 +342,7 @@ fn parameters(sinks: SinksParam) -> Vec<Parameter> {
 fn dump(ast: &mut IntoAst, node: &TypedNode, op: &FusedSdpa) -> TractResult<Option<Arc<RValue>>> {
     // node.inputs already carries the trailing sinks tensor when has_sinks;
     // it maps onto the fragment's optional `sinks` parameter positionally.
-    let inputs: Vec<Arc<RValue>> =
-        node.inputs.iter().map(|i| ast.mapping[i].clone()).collect();
+    let inputs: Vec<Arc<RValue>> = node.inputs.iter().map(|i| ast.mapping[i].clone()).collect();
     Ok(Some(invocation(
         "tract_transformers_fused_sdpa",
         &inputs,
@@ -380,10 +369,8 @@ fn load_common(
     }
     let scale: f32 = invocation.named_arg_as(builder, "scale")?;
     let window: i64 = invocation.named_arg_as(builder, "window")?;
-    builder.wire(
-        FusedSdpa { scale_bits: scale.to_bits(), window: window as u32, has_sinks },
-        &inputs,
-    )
+    builder
+        .wire(FusedSdpa { scale_bits: scale.to_bits(), window: window as u32, has_sinks }, &inputs)
 }
 
 fn load(builder: &mut ModelBuilder, invocation: &ResolvedInvocation) -> TractResult<Value> {
@@ -429,9 +416,9 @@ fn load_legacy_with_sinks(
 use tract_nnef::tract_core::ops::array::{MultiBroadcastTo, Slice, TypedConcat};
 use tract_nnef::tract_core::ops::binary::TypedBinOp;
 use tract_nnef::tract_core::ops::cast::Cast;
-use tract_nnef::tract_core::ops::math::Mul;
 use tract_nnef::tract_core::ops::einsum::EinSum;
 use tract_nnef::tract_core::ops::konst::Const;
+use tract_nnef::tract_core::ops::math::Mul;
 use tract_nnef::tract_core::ops::nn::{Reduce, Reducer, Softmax};
 use tract_nnef::tract_core::ops::source::TypedSource;
 use tract_nnef::tract_core::transform::ModelTransform;
@@ -492,10 +479,7 @@ fn expand_chain_to_concat(model: &TypedModel, outlet: OutletId) -> Option<usize>
 /// reshape, the q-side f32 cast (einsum-in-f32 exports) and the q-side layout
 /// reshape are each optional; the q-part shape checks in the caller guard the
 /// tolerant walk.
-fn qk_branch(
-    model: &TypedModel,
-    branch_root: &TypedNode,
-) -> Option<(OutletId, usize, i64)> {
+fn qk_branch(model: &TypedModel, branch_root: &TypedNode) -> Option<(OutletId, usize, i64)> {
     let einsum =
         if branch_root.op_is::<AxisOp>() { prev(model, branch_root, 0) } else { branch_root };
     einsum.op_as::<EinSum>()?;
@@ -527,8 +511,7 @@ fn qk_branch(
 /// (full attention) when no such constant exists, which is always safe: the
 /// mask stays the semantic source of truth.
 fn extract_sliding_window(model: &TypedModel, mask_outlet: OutletId) -> u32 {
-    let debug =
-        env_flag_with_legacy("TRACT_DEBUG_FUSED_SDPA_WINDOW", "TRACT_DEBUG_GPT_OSS_WINDOW");
+    let debug = env_flag_with_legacy("TRACT_DEBUG_FUSED_SDPA_WINDOW", "TRACT_DEBUG_GPT_OSS_WINDOW");
     let mut seen = std::collections::HashSet::new();
     let mut stack = vec![mask_outlet.node];
     let mut candidates: Vec<u32> = vec![];
@@ -538,10 +521,7 @@ fn extract_sliding_window(model: &TypedModel, mask_outlet: OutletId) -> u32 {
         }
         let n = model.node(id);
         if debug {
-            let k = n
-                .op_as::<Const>()
-                .map(|k| format!(" = {:?}", k.val()))
-                .unwrap_or_default();
+            let k = n.op_as::<Const>().map(|k| format!(" = {:?}", k.val())).unwrap_or_default();
             eprintln!("mask-subgraph[{}]: {} {}{k}", mask_outlet.node, n.name, n.op.name());
         }
         if let Some(k) = n.op_as::<Const>() {
@@ -573,7 +553,10 @@ fn extract_sliding_window(model: &TypedModel, mask_outlet: OutletId) -> u32 {
         }
     }
     if debug {
-        eprintln!("fused-sdpa fuse: window candidates {candidates:?} for mask node {}", mask_outlet.node);
+        eprintln!(
+            "fused-sdpa fuse: window candidates {candidates:?} for mask node {}",
+            mask_outlet.node
+        );
     }
     match candidates.as_slice() {
         [w] => *w,
@@ -592,12 +575,8 @@ fn extract_sliding_window(model: &TypedModel, mask_outlet: OutletId) -> u32 {
 /// within `depth` successor hops. Window masks compare shifted positions
 /// against the window constant, possibly through one arithmetic hop.
 fn feeds_comparison_within(model: &TypedModel, node: usize, depth: usize) -> bool {
-    let successors: Vec<usize> = model
-        .node(node)
-        .outputs
-        .iter()
-        .flat_map(|o| o.successors.iter().map(|s| s.node))
-        .collect();
+    let successors: Vec<usize> =
+        model.node(node).outputs.iter().flat_map(|o| o.successors.iter().map(|s| s.node)).collect();
     successors.iter().any(|succ| {
         model
             .node(*succ)
@@ -661,9 +640,9 @@ pub fn fuse_sdpa_rule(
     }
     // Scalar scale constant on either side of the Mul (exports are not
     // consistent about binop operand order).
-    let Some(scale_slot) = (0..2).find(|&s| {
-        prev(model, scale_mul, s).op_as::<Const>().is_some_and(|k| k.val().len() == 1)
-    }) else {
+    let Some(scale_slot) = (0..2)
+        .find(|&s| prev(model, scale_mul, s).op_as::<Const>().is_some_and(|k| k.val().len() == 1))
+    else {
         return Ok(None);
     };
     let scale_k = prev(model, scale_mul, scale_slot).op_as::<Const>().unwrap();
@@ -677,8 +656,7 @@ pub fn fuse_sdpa_rule(
     // the patch can fold the softmax scale into q up front: post-scale
     // logits are softmax-sized, so f16 scores are safe again. f16-QK
     // exports are left untouched (bit-faithful to their own graph).
-    let qk_f32 = model.outlet_fact(scale_mul.inputs[1 - scale_slot])?.datum_type
-        == DatumType::F32;
+    let qk_f32 = model.outlet_fact(scale_mul.inputs[1 - scale_slot])?.datum_type == DatumType::F32;
     let mut branches: Vec<(OutletId, usize, i64)> = vec![];
     if is_bin(qk_root, "Add") {
         for slot in 0..2 {
@@ -792,8 +770,7 @@ pub fn fuse_sdpa_rule(
         if *start != covered as i64 {
             return Ok(None);
         }
-        let layout = if f.shape[1].to_usize().ok() == Some(hq) && f.shape[2].to_usize().is_err()
-        {
+        let layout = if f.shape[1].to_usize().ok() == Some(hq) && f.shape[2].to_usize().is_err() {
             Layout::HeadMajor
         } else if f.shape[2].to_usize().ok() == Some(hq) {
             Layout::SeqMajor
@@ -858,13 +835,11 @@ pub fn fuse_sdpa_rule(
         let tapped = patch.tap_model(model, *outlet)?;
         let normalized = match layout {
             Layout::HeadMajor => tapped,
-            Layout::SeqMajor => {
-                patch.wire_node(
-                    format!("{node_name}.q_part{i}_hsd"),
-                    AxisOp::Move(2, 1),
-                    &[tapped],
-                )?[0]
-            }
+            Layout::SeqMajor => patch.wire_node(
+                format!("{node_name}.q_part{i}_hsd"),
+                AxisOp::Move(2, 1),
+                &[tapped],
+            )?[0],
         };
         q_parts.push(normalized);
     }
@@ -880,8 +855,7 @@ pub fn fuse_sdpa_rule(
     // other exports already live with.
     let (q, op_scale) = if qk_f32 {
         let q_dt = patch.outlet_fact(q)?.datum_type;
-        let scale_t =
-            tensor0(scale).cast_to_dt(q_dt)?.into_owned().broadcast_into_rank(4)?;
+        let scale_t = tensor0(scale).cast_to_dt(q_dt)?.into_owned().broadcast_into_rank(4)?;
         let scale_c =
             patch.add_const(format!("{node_name}.q_prescale"), scale_t.into_arc_tensor())?;
         let scaled = patch.wire_node(
@@ -920,11 +894,7 @@ pub fn fuse_sdpa_rule(
         )?[0],
         AvLayout::Fold4 => patch.wire_node(
             format!("{node_name}.attn_reshape"),
-            AxisOp::Reshape(
-                0,
-                tvec![1.to_dim(), hq.to_dim()],
-                tvec![hkv.to_dim(), group.to_dim()],
-            ),
+            AxisOp::Reshape(0, tvec![1.to_dim(), hq.to_dim()], tvec![hkv.to_dim(), group.to_dim()]),
             &[fused[0]],
         )?[0],
         AvLayout::HeadMajor3 | AvLayout::SeqMajor3 => {
@@ -1071,9 +1041,8 @@ mod tests {
         let mut state = state_for(&op);
         let mut seed = 42u64;
         let sinks_t = with_sinks.then(|| rng_tensor(&[hq], &mut seed));
-        let sinks: Option<Vec<f32>> = sinks_t
-            .as_ref()
-            .map(|t| t.try_as_plain().unwrap().as_slice::<f32>().unwrap().to_vec());
+        let sinks: Option<Vec<f32>> =
+            sinks_t.as_ref().map(|t| t.try_as_plain().unwrap().as_slice::<f32>().unwrap().to_vec());
 
         // Accumulated "external" cache, grown the reference way.
         let mut k_all = Tensor::zero::<f32>(&[1, hkv, 0, d])?;
@@ -1102,10 +1071,7 @@ mod tests {
             let k_ref = Tensor::stack_tensors(SEQ_AXIS, &[&k_all, &k_new])?;
             let v_ref = Tensor::stack_tensors(SEQ_AXIS, &[&v_all, &v_new])?;
             let want = reference(&q, &k_ref, &v_ref, &mask, sinks.as_deref(), scale);
-            outputs[0]
-                .clone()
-                .into_tensor()
-                .close_enough(&want, Approximation::Approximate)?;
+            outputs[0].clone().into_tensor().close_enough(&want, Approximation::Approximate)?;
             outputs[1].clone().into_tensor().close_enough(&k_ref, Approximation::Exact)?;
             outputs[2].clone().into_tensor().close_enough(&v_ref, Approximation::Exact)?;
             k_all = k_ref;
@@ -1179,17 +1145,8 @@ mod tests {
         let k1 = rng_tensor(&[1, hkv, 1, d], &mut seed);
         let v1 = rng_tensor(&[1, hkv, 1, d], &mut seed);
         let mask = causal_mask(1, 3);
-        let outputs = run_state(
-            &mut state,
-            &op,
-            &q1,
-            &k1,
-            &v1,
-            &k_trunc,
-            &v_trunc,
-            &mask,
-            Some(&sinks_t),
-        );
+        let outputs =
+            run_state(&mut state, &op, &q1, &k1, &v1, &k_trunc, &v_trunc, &mask, Some(&sinks_t));
 
         let k_ref = Tensor::stack_tensors(SEQ_AXIS, &[&k_trunc, &k1])?;
         let v_ref = Tensor::stack_tensors(SEQ_AXIS, &[&v_trunc, &v1])?;
@@ -1211,8 +1168,7 @@ mod tests {
             let p = model.sym("P");
             let q_f: TVec<TDim> = tvec![1.to_dim(), hq.to_dim(), s.clone().into(), d.to_dim()];
             let new_f: TVec<TDim> = tvec![1.to_dim(), hkv.to_dim(), s.clone().into(), d.to_dim()];
-            let cache_f: TVec<TDim> =
-                tvec![1.to_dim(), hkv.to_dim(), p.clone().into(), d.to_dim()];
+            let cache_f: TVec<TDim> = tvec![1.to_dim(), hkv.to_dim(), p.clone().into(), d.to_dim()];
             let mask_f: TVec<TDim> = tvec![
                 1.to_dim(),
                 1.to_dim(),
