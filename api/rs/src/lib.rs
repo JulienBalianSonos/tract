@@ -564,47 +564,11 @@ impl TensorInterface for Tensor {
 }
 
 impl Tensor {
-    /// Slice `[start, end)` along `axis`. Plain host tensors are sliced by
-    /// copy; tensors backed by device storage (e.g. in-place KV-cache views)
-    /// are sliced as metadata only when possible, without synchronizing or
-    /// copying, keeping the backing device buffer alive.
+    /// Slice `[start, end)` along `axis`.
+    ///
+    /// Storage may preserve a device-backed slice as a metadata view; plain
+    /// tensors use the regular copy implementation.
     pub fn sliced(&self, axis: usize, start: usize, end: usize) -> Result<Tensor> {
-        use tract_gpu::tensor::{DeviceArenaView, DeviceTensor, DeviceTensorExt, OwnedDeviceTensor};
-        if let Some(dev) = self.0.as_device_tensor() {
-            let sliced = match dev {
-                DeviceTensor::ArenaView(view) => {
-                    DeviceTensor::ArenaView(view.sliced(axis, start, end)?)
-                }
-                DeviceTensor::Owned(o)
-                    if o.exotic_fact().is_none() && o.strides().iter().all(|&s| s >= 0) =>
-                {
-                    // Owned device tensors clone as cheap buffer handles:
-                    // wrap one in a metadata-only view and slice that,
-                    // keeping the data on device without synchronizing.
-                    let arc: Arc<Box<dyn OwnedDeviceTensor>> =
-                        Arc::new(tract_nnef::tract_core::dyn_clone::clone_box(&**o));
-                    let view = DeviceArenaView::from_owned(
-                        arc,
-                        dev.datum_type(),
-                        o.shape().into(),
-                        o.strides().into(),
-                        0,
-                    )?;
-                    DeviceTensor::ArenaView(view.sliced(axis, start, end)?)
-                }
-                DeviceTensor::Owned(_) => {
-                    // Exotic or negatively-strided layouts cannot be viewed:
-                    // go through the host. Correct, but synchronizes.
-                    log::debug!(
-                        "Tensor::sliced: owned device tensor with exotic/negative-stride \
-                         layout falls back to a host copy"
-                    );
-                    let host = dev.to_host()?;
-                    return Ok(Tensor(host.slice(axis, start, end)?.into_arc_tensor()));
-                }
-            };
-            return Ok(Tensor(sliced.into_tensor().into_arc_tensor()));
-        }
         Ok(Tensor(self.0.slice(axis, start, end)?.into_arc_tensor()))
     }
 }
