@@ -307,7 +307,14 @@ impl TensorStorage for DeviceTensor {
         // no meaningful hash for device memory
     }
 
-    fn slice(&self, axis: usize, start: usize, end: usize) -> TractResult<Option<Tensor>> {
+    fn slice(
+        &self,
+        _dt: DatumType,
+        _shape: &[usize],
+        axis: usize,
+        start: usize,
+        end: usize,
+    ) -> TractResult<Option<Tensor>> {
         let tensor = match self {
             Self::ArenaView(view) if view.exotic_fact().is_none() => {
                 let view = view.sliced(axis, start, end)?;

@@ -1964,14 +1964,11 @@ impl Tensor {
         }
         // Storage gets first refusal: one that can serve the slice without a
         // copy does so, anything else falls through to the copy below.
-        if let Some(sliced) =
-            self.storage.as_storage().slice(self.dt, self.shape(), axis, start, end)?
-        {
-            return Ok(sliced);
-        }
         let mut shape: TVec<usize> = self.shape().into();
         shape[axis] = end - start;
-        if let Some(tensor) = self.storage.as_storage().slice(axis, start, end)? {
+        if let Some(tensor) =
+            self.storage.as_storage().slice(self.dt, self.shape(), axis, start, end)?
+        {
             return Ok(tensor);
         }
         unsafe {
