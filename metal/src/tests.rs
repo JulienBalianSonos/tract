@@ -1098,7 +1098,8 @@ mod tests {
     fn slicing_a_device_output_stays_on_device_when_it_is_dense() -> TractResult<()> {
         use tract_gpu::tensor::LazyHostStorage;
         let t = Tensor::from_shape(&[4, 3], &(0..12).map(|i| i as f32).collect::<Vec<_>>())?;
-        let lazy = LazyHostStorage::new(t.clone().into_device()?).into_tensor();
+        let device = with_borrowed_metal_stream(|_| t.clone().into_device())?;
+        let lazy = LazyHostStorage::new(device).into_tensor();
 
         let dense = lazy.slice(0, 1, 3)?;
         assert!(dense.storage_as::<LazyHostStorage>().is_some(), "dense slice left the device");
