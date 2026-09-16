@@ -175,9 +175,11 @@ pub fn vector_size() -> usize {
 }
 
 impl Tensor {
+    /// Plain storage for this tensor's bytes, materializing it if the storage
+    /// keeps them elsewhere.
     #[inline]
     fn plain_storage(&self) -> &PlainStorage {
-        self.storage.as_plain().expect("Non-plain storage")
+        self.storage.materialize_plain().expect("Non-plain storage")
     }
 
     #[inline]
@@ -219,7 +221,8 @@ impl Tensor {
     /// Returns an immutable [`PlainView`], or an error if storage is not plain.
     #[inline]
     pub fn try_as_plain(&self) -> TractResult<PlainView<'_>> {
-        self.as_plain().context("Tensor storage is not plain")
+        let storage = self.storage.materialize_plain()?;
+        Ok(PlainView::new(self, storage))
     }
 
     /// Returns `true` if this tensor uses plain (contiguous) storage.
@@ -1562,6 +1565,11 @@ impl Tensor {
         }
         if start > self.shape[axis] || end > self.shape[axis] || start >= end {
             bail!("Invalid slicing range {start}..{end} on axis {axis} for {self:?}");
+        }
+        if let Some(sliced) =
+            self.storage.as_storage().slice(self.dt, self.shape(), axis, start, end)?
+        {
+            return Ok(sliced);
         }
         fn slice_t<T: Datum>(
             t: &Tensor,
