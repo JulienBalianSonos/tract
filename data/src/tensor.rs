@@ -218,6 +218,16 @@ impl Tensor {
         Some(PlainView::new(self, storage))
     }
 
+    #[inline]
+    pub fn as_plain_storage(&self) -> Option<&PlainStorage> {
+        self.storage.as_plain()
+    }
+
+    #[inline]
+    pub fn as_plain_storage_mut(&mut self) -> Option<&mut PlainStorage> {
+        self.storage.as_plain_mut()
+    }
+
     /// Returns an immutable [`PlainView`], or an error if storage is not plain.
     #[inline]
     pub fn try_as_plain(&self) -> TractResult<PlainView<'_>> {
