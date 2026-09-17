@@ -337,7 +337,7 @@ impl Tensor {
         if !tensor.storage.is_empty() {
             if dt == String::datum_type() || dt == Blob::datum_type() {
                 // assumes zero-initialized string and blob are valid
-                tensor.plain_storage_mut().as_bytes_mut().fill(0);
+                tensor.plain_ram_storage_mut().as_bytes_mut().fill(0);
             } else if dt == TDim::datum_type() {
                 unsafe {
                     tensor

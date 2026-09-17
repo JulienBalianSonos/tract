@@ -1116,7 +1116,16 @@ mod tests {
         with_borrowed_metal_stream(|_| {
             let host = Tensor::from_shape(&[2, 3], &[1f32, 2., 3., 4., 5., 6.])?;
             let device = host.clone().into_device()?;
-            let view = device.dense_slice(0, 0, 2)?.context("expected dense view")?;
+            let DeviceTensor::Owned(owned) = &device else {
+                bail!("expected owned tensor")
+            };
+            let view = DeviceTensor::ArenaView(tract_gpu::tensor::DeviceArenaView::from_owned(
+                Arc::new(tract_core::dyn_clone::clone_box(&**owned)),
+                f32::datum_type(),
+                tvec![2, 3],
+                tvec![3, 1],
+                0,
+            )?);
             assert!(matches!(view, DeviceTensor::ArenaView(_)));
             let sync = DeviceSync::new(DeviceSyncKind::ToHost);
             let owned = sync.eval(tvec![device.into_tensor().into_tvalue()])?;
@@ -1125,7 +1134,7 @@ mod tests {
             // Characterize the integration limitation: even a persistent owned
             // backing is read back because it uses the ArenaView variant.
             assert!(viewed[0].storage_as::<LazyHostStorage>().is_none());
-            assert!(viewed[0].is_plain());
+            assert!(viewed[0].is_plain_ram());
             viewed[0].close_enough(&host, Approximation::Exact)?;
             Ok(())
         })
