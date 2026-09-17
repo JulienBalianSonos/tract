@@ -1026,8 +1026,8 @@ impl OpState for MetalFusedSdpaState {
             .cast_to::<f32>()?
             .into_owned();
             let want = cpu_out[0].clone().into_tensor().cast_to::<f32>()?.into_owned();
-            let mv = metal_out.try_as_plain()?.as_slice::<f32>()?;
-            let wv = want.try_as_plain()?.as_slice::<f32>()?;
+            let mv = metal_out.try_as_plain_ram()?.as_slice::<f32>()?;
+            let wv = want.try_as_plain_ram()?.as_slice::<f32>()?;
             let dot: f32 = mv.iter().zip(wv).map(|(a, b)| a * b).sum();
             let nm: f32 = mv.iter().map(|a| a * a).sum::<f32>().sqrt();
             let nw: f32 = wv.iter().map(|a| a * a).sum::<f32>().sqrt();
@@ -1048,7 +1048,7 @@ impl OpState for MetalFusedSdpaState {
             crate::with_metal_stream(|stream| stream.wait_until_completed())?;
             let stats = |t: &DeviceTensor, tag: &str| -> TractResult<()> {
                 let host = t.to_host()?.into_tensor().cast_to::<f32>()?.into_owned();
-                let v = host.try_as_plain()?.as_slice::<f32>()?;
+                let v = host.try_as_plain_ram()?.as_slice::<f32>()?;
                 let nan = v.iter().filter(|x| x.is_nan()).count();
                 let inf = v.iter().filter(|x| x.is_infinite()).count();
                 let mx = v.iter().cloned().fold(f32::MIN, f32::max);
@@ -1063,7 +1063,7 @@ impl OpState for MetalFusedSdpaState {
             };
             let in_stats = |t: &DeviceTensor, tag: &str| -> TractResult<()> {
                 let h = t.to_host()?.into_tensor().cast_to::<f32>()?.into_owned();
-                let v = h.try_as_plain()?.as_slice::<f32>()?;
+                let v = h.try_as_plain_ram()?.as_slice::<f32>()?;
                 let mx = v.iter().cloned().fold(f32::MIN, f32::max);
                 let mn = v.iter().cloned().fold(f32::MAX, f32::min);
                 let sum: f32 = v.iter().sum();
@@ -1084,7 +1084,7 @@ impl OpState for MetalFusedSdpaState {
             let sv = sv.cast_to::<f32>()?.into_owned();
             eprintln!(
                 "fused-sdpa-dbg sinks[0..6]: {:?}",
-                &sv.try_as_plain()?.as_slice::<f32>()?[..6.min(hq)]
+                &sv.try_as_plain_ram()?.as_slice::<f32>()?[..6.min(hq)]
             );
         }
         let out_t = DeviceTensor::ArenaView(DeviceArenaView::from_owned(

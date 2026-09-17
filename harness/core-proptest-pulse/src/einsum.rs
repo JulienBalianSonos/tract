@@ -18,7 +18,7 @@ fn einsum_pulsedmm() {
 
     let mut input = Tensor::zero::<f32>(&[5, 8, 2]).unwrap();
     input
-        .try_as_plain_mut()
+        .try_as_plain_ram_mut()
         .unwrap()
         .as_slice_mut::<f32>()
         .unwrap()

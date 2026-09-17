@@ -171,7 +171,7 @@ macro_rules! impl_eval {
                         output: &mut Tensor,
                         add: impl Fn(T, T) -> T + Copy + 'static,
                         ) -> TractResult<()> {
-                        let mut output_plain = output.try_as_plain_mut()?;
+                        let mut output_plain = output.try_as_plain_ram_mut()?;
                         let output = output_plain.to_array_view_mut::<T>()?;
                         let n_o_hkwk_hw: ArrayView4<T> = n_o_hkwk_hw.to_plain_array_view::<T>()?.into_dimensionality()?;
                         match input_shape.hw_rank() {

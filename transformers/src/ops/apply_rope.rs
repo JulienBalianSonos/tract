@@ -68,7 +68,7 @@ pub fn fold_const_dyn_slice_rule(
 }
 
 fn as_scalar_tdim(t: &Tensor) -> TractResult<TDim> {
-    Ok(t.cast_to::<TDim>()?.try_as_plain()?.to_scalar::<TDim>()?.clone())
+    Ok(t.cast_to::<TDim>()?.try_as_plain_ram()?.to_scalar::<TDim>()?.clone())
 }
 
 /// Exporters may wrap binary-op operands in no-op casts (cast to the dtype

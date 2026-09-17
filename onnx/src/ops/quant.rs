@@ -76,7 +76,7 @@ impl Expansion for QuantizeLinear {
             .konst
             .as_ref()
             .context("y_scale must be a const")?
-            .try_as_plain()?
+            .try_as_plain_ram()?
             .as_slice::<f32>()?[0]
             .recip();
         let zero_point = if self.optional_zero_point_input.is_some() {
@@ -90,9 +90,9 @@ impl Expansion for QuantizeLinear {
             rctensor0(0u8)
         };
         let op: Box<dyn TypedOp> = if zero_point.datum_type() == u8::datum_type() {
-            Box::new(quantize_linear_u8(scale, zero_point.try_as_plain()?.as_slice::<u8>()?[0]))
+            Box::new(quantize_linear_u8(scale, zero_point.try_as_plain_ram()?.as_slice::<u8>()?[0]))
         } else {
-            Box::new(quantize_linear_i8(scale, zero_point.try_as_plain()?.as_slice::<i8>()?[0]))
+            Box::new(quantize_linear_i8(scale, zero_point.try_as_plain_ram()?.as_slice::<i8>()?[0]))
         };
         target.wire_node(prefix, op, &[inputs[0]])
     }
@@ -138,7 +138,7 @@ impl Expansion for DequantizeLinear {
             .konst
             .as_ref()
             .context("y_scale must be a const")?
-            .try_as_plain()?
+            .try_as_plain_ram()?
             .as_slice::<f32>()?[0];
         let zero_point = if self.optional_zero_point_input.is_some() {
             target
@@ -153,17 +153,17 @@ impl Expansion for DequantizeLinear {
         let op: Box<dyn TypedOp> = if zero_point.datum_type() == u8::datum_type() {
             Box::new(DequantizeLinearF32::new(
                 scale,
-                zero_point.try_as_plain()?.as_slice::<u8>()?[0] as i32,
+                zero_point.try_as_plain_ram()?.as_slice::<u8>()?[0] as i32,
             ))
         } else if zero_point.datum_type() == i8::datum_type() {
             Box::new(DequantizeLinearF32::new(
                 scale,
-                zero_point.try_as_plain()?.as_slice::<i8>()?[0] as i32,
+                zero_point.try_as_plain_ram()?.as_slice::<i8>()?[0] as i32,
             ))
         } else {
             Box::new(DequantizeLinearF32::new(
                 scale,
-                zero_point.try_as_plain()?.as_slice::<i32>()?[0],
+                zero_point.try_as_plain_ram()?.as_slice::<i32>()?[0],
             ))
         };
         target.wire_node(prefix, op, &[inputs[0]])
@@ -287,8 +287,8 @@ impl EvalOp for DynamicQuantizeLinearU8 {
         dynamic_quantize_linear_u8(
             scale,
             zero_point,
-            input.try_as_plain()?.as_slice::<f32>()?,
-            dst.try_as_plain_mut()?.as_slice_mut::<u8>()?,
+            input.try_as_plain_ram()?.as_slice::<f32>()?,
+            dst.try_as_plain_ram_mut()?.as_slice_mut::<u8>()?,
         );
 
         let quantized_tensor = dst.into_tvalue();

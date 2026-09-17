@@ -319,7 +319,7 @@ mod tests {
         let k = *shape.last().context("Q40 tensor has no last axis")?;
         ensure!(k % Q4_0.block_len() == 0);
         let m: usize = shape[..shape.len() - 1].iter().product();
-        let quant = Q4_0.quant_f32(tensor.try_as_plain()?.as_slice::<f32>()?)?;
+        let quant = Q4_0.quant_f32(tensor.try_as_plain_ram()?.as_slice::<f32>()?)?;
         let storage = BlockQuantStorage::new(Box::new(Q4_0), m, k, Arc::new(quant))?;
         let packed = Arc::new(storage.into_tensor_with_shape(f32::datum_type(), &shape));
         let fact = BlockQuantFact::new(Box::new(Q4_0), shape.iter().copied().collect());

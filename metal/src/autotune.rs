@@ -545,11 +545,11 @@ mod tests {
         assert_eq!(inputs.len(), 2);
         assert_eq!(inputs[0].shape(), &[1]);
         assert_eq!(inputs[0].datum_type(), i64::datum_type());
-        assert_eq!(inputs[0].try_as_plain().unwrap().as_slice::<i64>().unwrap(), &[0]);
+        assert_eq!(inputs[0].try_as_plain_ram().unwrap().as_slice::<i64>().unwrap(), &[0]);
         assert_eq!(inputs[1].shape(), &[1, 4, 1, 8]);
         assert!(
             inputs[1]
-                .try_as_plain()
+                .try_as_plain_ram()
                 .unwrap()
                 .as_slice::<f32>()
                 .unwrap()

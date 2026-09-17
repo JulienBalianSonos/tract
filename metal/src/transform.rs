@@ -1408,7 +1408,7 @@ mod q40_moe_lowering_tests {
         let k = *shape.last().context("Q40 tensor has no last axis")?;
         ensure!(k % Q4_0.block_len() == 0);
         let m: usize = shape[..shape.len() - 1].iter().product();
-        let quant = Q4_0.quant_f32(tensor.try_as_plain()?.as_slice::<f32>()?)?;
+        let quant = Q4_0.quant_f32(tensor.try_as_plain_ram()?.as_slice::<f32>()?)?;
         let storage = BlockQuantStorage::new(Box::new(Q4_0), m, k, Arc::new(quant))?;
         let packed = Arc::new(storage.into_tensor_with_shape(f32::datum_type(), &shape));
         let fact = BlockQuantFact::new(Box::new(Q4_0), shape.iter().copied().collect());
@@ -1699,8 +1699,8 @@ mod q40_moe_lowering_tests {
         let tr_bqs = transposed.try_storage_as::<BlockQuantStorage>()?;
         let orig = Q4_0.dequant_f32(orig_bqs.value())?;
         let tr = Q4_0.dequant_f32(tr_bqs.value())?;
-        let orig = orig.try_as_plain()?.as_slice::<f32>()?;
-        let tr = tr.try_as_plain()?.as_slice::<f32>()?;
+        let orig = orig.try_as_plain_ram()?.as_slice::<f32>()?;
+        let tr = tr.try_as_plain_ram()?.as_slice::<f32>()?;
         for e in 0..experts {
             for i in 0..a {
                 for j in 0..b {

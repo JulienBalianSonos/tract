@@ -186,8 +186,8 @@ fn fused_matches_original_on_real_model() -> TractResult<()> {
             if i == 0 {
                 let rr = r.cast_to::<f32>()?;
                 let ff = f.cast_to::<f32>()?;
-                let rv = rr.try_as_plain()?.as_slice::<f32>()?;
-                let fv = ff.try_as_plain()?.as_slice::<f32>()?;
+                let rv = rr.try_as_plain_ram()?.as_slice::<f32>()?;
+                let fv = ff.try_as_plain_ram()?.as_slice::<f32>()?;
                 let argmax = |v: &[f32]| {
                     v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0
                 };
@@ -213,8 +213,8 @@ fn fused_matches_original_on_real_model() -> TractResult<()> {
                 // upstream layers; require tight cosine instead of bits.
                 let rr = r.cast_to::<f32>()?.into_owned();
                 let ff = f.cast_to::<f32>()?.into_owned();
-                let rv = rr.try_as_plain()?.as_slice::<f32>()?;
-                let fv = ff.try_as_plain()?.as_slice::<f32>()?;
+                let rv = rr.try_as_plain_ram()?.as_slice::<f32>()?;
+                let fv = ff.try_as_plain_ram()?.as_slice::<f32>()?;
                 let dot: f32 = rv.iter().zip(fv).map(|(a, b)| a * b).sum();
                 let nr: f32 = rv.iter().map(|a| a * a).sum::<f32>().sqrt();
                 let nf: f32 = fv.iter().map(|a| a * a).sum::<f32>().sqrt();
@@ -327,8 +327,8 @@ fn fused_metal_matches_fused_cpu() -> TractResult<()> {
     for (i, (c, m)) in cpu_outs.iter().zip(metal_outs.iter()).enumerate() {
         let c = c.clone().into_tensor().cast_to::<f32>()?.into_owned();
         let m = m.clone().into_tensor().cast_to::<f32>()?.into_owned();
-        let cv = c.try_as_plain()?.as_slice::<f32>()?;
-        let mv = m.try_as_plain()?.as_slice::<f32>()?;
+        let cv = c.try_as_plain_ram()?.as_slice::<f32>()?;
+        let mv = m.try_as_plain_ram()?.as_slice::<f32>()?;
         let dot: f32 = cv.iter().zip(mv).map(|(a, b)| a * b).sum();
         let nc: f32 = cv.iter().map(|a| a * a).sum::<f32>().sqrt();
         let nm: f32 = mv.iter().map(|a| a * a).sum::<f32>().sqrt();

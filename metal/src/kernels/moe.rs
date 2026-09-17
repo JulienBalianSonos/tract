@@ -747,11 +747,11 @@ mod sinks_softmax_tests {
             )?;
             stream.wait_until_completed()?;
             let got = probs_dev.to_host()?.into_tensor().cast_to::<f32>()?.into_owned();
-            let got = got.try_as_plain()?.as_slice::<f32>()?;
+            let got = got.try_as_plain_ram()?.as_slice::<f32>()?;
 
             // CPU reference from the f16-rounded scores.
             let s16 = scores_f16.cast_to::<f32>()?.into_owned();
-            let s16 = s16.try_as_plain()?.as_slice::<f32>()?;
+            let s16 = s16.try_as_plain_ram()?.as_slice::<f32>()?;
             for r in 0..rows {
                 let head = r / s_len;
                 let mrow = r % s_len;

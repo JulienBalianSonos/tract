@@ -262,7 +262,7 @@ fn deconv2d() {
     let a = model.add_source("a", f32::fact(dims!(1, 2, s, 8))).unwrap();
     let mut kernel = Tensor::zero::<f32>(&[2, 2, 1, 3]).unwrap();
     kernel
-        .try_as_plain_mut()
+        .try_as_plain_ram_mut()
         .unwrap()
         .as_slice_mut::<f32>()
         .unwrap()
@@ -291,7 +291,7 @@ fn deconv2d() {
 
     let mut input = Tensor::zero::<f32>(&[1, 2, 5, 8]).unwrap();
     input
-        .try_as_plain_mut()
+        .try_as_plain_ram_mut()
         .unwrap()
         .as_slice_mut::<f32>()
         .unwrap()

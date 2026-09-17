@@ -228,8 +228,8 @@ fn fused_matches_original_on_real_model() -> TractResult<()> {
         for (i, (r, f)) in refs.iter().zip(fused.iter()).enumerate() {
             let r = r.clone().into_tensor().cast_to::<f32>()?.into_owned();
             let f = f.clone().into_tensor().cast_to::<f32>()?.into_owned();
-            let rv = r.try_as_plain()?.as_slice::<f32>()?;
-            let fv = f.try_as_plain()?.as_slice::<f32>()?;
+            let rv = r.try_as_plain_ram()?.as_slice::<f32>()?;
+            let fv = f.try_as_plain_ram()?.as_slice::<f32>()?;
             let dot: f32 = rv.iter().zip(fv).map(|(a, b)| a * b).sum();
             let nr: f32 = rv.iter().map(|a| a * a).sum::<f32>().sqrt();
             let nf: f32 = fv.iter().map(|a| a * a).sum::<f32>().sqrt();

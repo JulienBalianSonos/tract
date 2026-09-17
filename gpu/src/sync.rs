@@ -265,7 +265,7 @@ fn resolve_device_resident_output_ranges(
     };
     let ixes = t.cast_to::<i64>()?;
     let mut ranges = vec![];
-    for &ix in ixes.try_as_plain()?.as_slice::<i64>()? {
+    for &ix in ixes.try_as_plain_ram()?.as_slice::<i64>()? {
         ensure!(
             ix >= 0,
             "{DEVICE_RESIDENT_OUTPUTS_PROPERTY}: negative output index {ix} in declaration"

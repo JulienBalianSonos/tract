@@ -85,13 +85,13 @@ impl OpState for PulsedRangeState {
             // for the TDim-input branch — see `core/src/ops/array/range.rs`).
             let start = op
                 .start
-                .try_as_plain()?
+                .try_as_plain_ram()?
                 .to_scalar::<TDim>()?
                 .eval(&session.resolved_symbols)
                 .to_i64()?;
             let step = op
                 .step
-                .try_as_plain()?
+                .try_as_plain_ram()?
                 .to_scalar::<TDim>()?
                 .eval(&session.resolved_symbols)
                 .to_i64()?;
@@ -114,8 +114,8 @@ where
         + std::ops::Add<Output = T>
         + std::ops::Mul<Output = T>,
 {
-    let start = *start.try_as_plain()?.to_scalar::<T>()?;
-    let step = *step.try_as_plain()?.to_scalar::<T>()?;
+    let start = *start.try_as_plain_ram()?.to_scalar::<T>()?;
+    let step = *step.try_as_plain_ram()?.to_scalar::<T>()?;
     let base_t: T = tract_num_traits::cast(base as i64)
         .ok_or_else(|| format_err!("PulsedRange: base {base} doesn't fit in target dtype"))?;
     let mut data = Vec::with_capacity(pulse);

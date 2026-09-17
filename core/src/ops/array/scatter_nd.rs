@@ -54,7 +54,7 @@ impl ScatterNd {
         updates: &TValue,
     ) -> TractResult<()> {
         let mut data = unsafe { data.to_array_view_mut_unchecked::<T>() };
-        let updates_plain = updates.try_as_plain()?;
+        let updates_plain = updates.try_as_plain_ram()?;
         let updates_view = unsafe { updates_plain.to_array_view_unchecked::<T>() };
         for coords in tract_ndarray::indices(&indices.shape()[..indices.ndim() - 1]) {
             let mut indices_into_data = indices.view();
@@ -79,7 +79,7 @@ impl ScatterNd {
         reduction: ScatterReduction,
     ) -> TractResult<()> {
         let mut data = unsafe { data.to_array_view_mut_unchecked::<T>() };
-        let updates_plain = updates.try_as_plain()?;
+        let updates_plain = updates.try_as_plain_ram()?;
         let updates_view = unsafe { updates_plain.to_array_view_unchecked::<T>() };
         for coords in tract_ndarray::indices(&indices.shape()[..indices.ndim() - 1]) {
             let mut indices_into_data = indices.view();

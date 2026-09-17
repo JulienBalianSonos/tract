@@ -161,7 +161,7 @@ impl OpState for FusedSdpaState {
         if env_flag_with_legacy("TRACT_DEBUG_FUSED_SDPA", "TRACT_DEBUG_GPT_OSS_SDPA") {
             let stats = |t: &TValue, tag: &str| -> TractResult<()> {
                 let h = t.cast_to::<f32>()?.into_owned();
-                let v = h.try_as_plain()?.as_slice::<f32>()?;
+                let v = h.try_as_plain_ram()?.as_slice::<f32>()?;
                 let mx = v.iter().cloned().fold(f32::MIN, f32::max);
                 let mn = v.iter().cloned().fold(f32::MAX, f32::min);
                 let sum: f32 = v.iter().sum();
@@ -559,7 +559,7 @@ fn extract_sliding_window(model: &TypedModel, mask_outlet: OutletId) -> u32 {
                 && (v.datum_type().is_integer() || v.datum_type() == DatumType::TDim)
             {
                 if let Ok(x) = v.cast_to::<i64>() {
-                    if let Ok(x) = x.try_as_plain() {
+                    if let Ok(x) = x.try_as_plain_ram() {
                         if let Ok(x) = x.as_slice::<i64>() {
                             let w = x[0].unsigned_abs();
                             if (2..=1_000_000).contains(&w) {
@@ -647,7 +647,7 @@ pub fn fuse_sdpa_rule(
         return Ok(None);
     };
     let scale_k = prev(model, scale_mul, scale_slot).op_as::<Const>().unwrap();
-    let scale = scale_k.val().cast_to::<f32>()?.try_as_plain()?.as_slice::<f32>()?[0];
+    let scale = scale_k.val().cast_to::<f32>()?.try_as_plain_ram()?.as_slice::<f32>()?[0];
 
     // ---- QK branches: rope-split exports sum two dim-range einsums ----
     let qk_root = prev(model, scale_mul, 1 - scale_slot);
@@ -1053,7 +1053,7 @@ mod tests {
         let sinks_t = with_sinks.then(|| rng_tensor(&[hq], &mut seed));
         let sinks: Option<Vec<f32>> = sinks_t
             .as_ref()
-            .map(|t| t.try_as_plain().unwrap().as_slice::<f32>().unwrap().to_vec());
+            .map(|t| t.try_as_plain_ram().unwrap().as_slice::<f32>().unwrap().to_vec());
 
         // Accumulated "external" cache, grown the reference way.
         let mut k_all = Tensor::zero::<f32>(&[1, hkv, 0, d])?;
@@ -1131,7 +1131,7 @@ mod tests {
         let mut state = state_for(&op);
         let mut seed = 7u64;
         let sinks_t = rng_tensor(&[hq], &mut seed);
-        let sinks: Vec<f32> = sinks_t.try_as_plain()?.as_slice::<f32>()?.to_vec();
+        let sinks: Vec<f32> = sinks_t.try_as_plain_ram()?.as_slice::<f32>()?.to_vec();
 
         // Prime the state with a 4-token pass.
         let q0 = rng_tensor(&[1, hq, 4, d], &mut seed);
