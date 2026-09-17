@@ -576,7 +576,7 @@ where
 
                     if !cumulative {
                         use tract_gpu::tensor::{DeviceTensorExt, IntoDevice};
-                        if returning[slot].is_plain() {
+                        if !returning[slot].is_exotic() {
                             returning[slot] = reference.into_tvalue();
                         } else if returning[slot].as_device_tensor().is_some() {
                             // Device-resident output: stage the CPU reference
