@@ -15,6 +15,30 @@ pub fn stdlib() -> Vec<FragmentDef> {
     crate::ast::parse::parse_fragments(include_str!("../stdlib.nnef")).unwrap()
 }
 
+#[cfg(target_os = "macos")]
+fn disable_file_cache(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // The descriptor remains owned by File; fcntl changes only its I/O policy.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn open_model_file(path: &Path) -> TractResult<std::fs::File> {
+    let file = std::fs::File::open(path)?;
+    if std::env::var_os("TRACT_NNEF_NOCACHE").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        #[cfg(target_os = "macos")]
+        {
+            disable_file_cache(&file).context("Could not disable model-file caching")?;
+            log::info!("NNEF uncached file read: {}", path.display());
+        }
+        #[cfg(not(target_os = "macos"))]
+        bail!("TRACT_NNEF_NOCACHE requires macOS");
+    }
+    Ok(file)
+}
+
 pub struct Nnef {
     pub stdlib: Vec<FragmentDef>,
     pub registries: Vec<Registry>,
@@ -274,7 +298,7 @@ impl tract_core::prelude::Framework<ProtoModel, TypedModel> for Nnef {
     fn proto_model_for_path(&self, path: impl AsRef<Path>) -> TractResult<ProtoModel> {
         let path = path.as_ref();
         if path.is_file() {
-            let mut f = std::fs::File::open(path)?;
+            let mut f = open_model_file(path)?;
             return self.proto_model_for_read(&mut f);
         }
 
@@ -294,7 +318,7 @@ impl tract_core::prelude::Framework<ProtoModel, TypedModel> for Nnef {
                 .components()
                 .skip(path.components().count())
                 .collect::<std::path::PathBuf>();
-            let mut stream = std::fs::File::open(entry.path())?;
+            let mut stream = open_model_file(entry.path())?;
             read_stream(&subpath, &mut stream, &mut resources, self)?;
         }
         proto_model_from_resources(resources)
@@ -465,4 +489,32 @@ fn read_stream<R: std::io::Read>(
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod uncached_tests {
+    use super::*;
+
+    #[test]
+    fn uncached_archive_matches_cached_output() -> TractResult<()> {
+        let dir = temp_dir::TempDir::new()?;
+        let path = dir.path().join("model.nnef.tar");
+        let framework = nnef();
+        let mut model = TypedModel::default();
+        // More than eight elements forces a separate tensor archive entry.
+        let expected = tensor1(&[1f32; 16]);
+        let output = model.add_const("values", expected.clone())?;
+        model.select_output_outlets(&[output])?;
+        framework.write_to_tar(&model, std::fs::File::create(&path)?)?;
+        for uncached in [false, true] {
+            let mut file = std::fs::File::open(&path)?;
+            if uncached {
+                disable_file_cache(&file)?;
+            }
+            let loaded = framework.model_for_read(&mut file)?;
+            let actual = loaded.into_runnable()?.run(tvec![])?;
+            assert_eq!(&*actual[0], &expected);
+        }
+        Ok(())
+    }
 }
