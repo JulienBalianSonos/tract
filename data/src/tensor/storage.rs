@@ -31,6 +31,16 @@ pub trait TensorStorage:
     /// exotic-ness.
     fn exotic_fact(&self, shape: &[usize]) -> TractResult<Option<Box<dyn ExoticFact>>>;
 
+    /// True when the tensor's datum type and shape do not describe it on their
+    /// own, so a fact over it carries an `ExoticFact`.
+    ///
+    /// Defaults to true: a storage is exotic until it says otherwise. Storage
+    /// that holds plain bytes somewhere else -- on a device, in a file -- is
+    /// not exotic, whatever `as_plain` answers right now.
+    fn is_exotic(&self) -> bool {
+        true
+    }
+
     /// Plain storage for the tensor's bytes, producing it if this storage can.
     ///
     /// This is the accessor path: `Tensor::as_bytes` and friends go through it,
@@ -195,12 +205,17 @@ impl TensorStorage for PlainStorage {
     fn exotic_fact(&self, _shape: &[usize]) -> TractResult<Option<Box<dyn ExoticFact>>> {
         Ok(None)
     }
+
+    fn is_exotic(&self) -> bool {
+        false
+    }
 }
 
 /// Inline enum replacing `Box<dyn TensorStorage>`.
 ///
 /// The common `Plain` case stays inline (no heap alloc, no vtable indirection).
-/// `Exotic` covers non-plain backends behind a single Box indirection.
+/// `Exotic` covers every other backend behind a single Box indirection, whether
+/// or not it is exotic in the fact sense -- `is_exotic` answers that.
 #[derive(Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) enum StorageKind {
@@ -255,6 +270,14 @@ impl StorageKind {
         match self {
             StorageKind::Plain(d) => StorageKind::Plain(d.clone()),
             StorageKind::Exotic(o) => StorageKind::Exotic(o.deep_clone()),
+        }
+    }
+
+    #[inline]
+    pub fn is_exotic(&self) -> bool {
+        match self {
+            StorageKind::Plain(_) => false,
+            StorageKind::Exotic(o) => o.is_exotic(),
         }
     }
 

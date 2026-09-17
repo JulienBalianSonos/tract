@@ -165,6 +165,10 @@ impl TensorStorage for LazyHostStorage {
         Ok(None)
     }
 
+    fn is_exotic(&self) -> bool {
+        false
+    }
+
     fn materialize_plain(&self) -> TractResult<&PlainStorage> {
         self.materialize()?
             .as_plain_storage()
