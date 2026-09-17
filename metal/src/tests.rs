@@ -1110,4 +1110,26 @@ mod tests {
         gappy.close_enough(&t.slice(1, 1, 3)?, Approximation::Exact)?;
         Ok(())
     }
+
+    #[test]
+    fn owned_backed_view_output_is_eagerly_copied_by_host_sync() -> TractResult<()> {
+        use tract_gpu::sync::{DeviceSync, DeviceSyncKind};
+        use tract_gpu::tensor::{DeviceTensor, LazyHostStorage};
+        with_borrowed_metal_stream(|_| {
+            let host = Tensor::from_shape(&[2, 3], &[1f32, 2., 3., 4., 5., 6.])?;
+            let device = host.clone().into_device()?;
+            let view = device.dense_slice(0, 0, 2)?.context("expected dense view")?;
+            assert!(matches!(view, DeviceTensor::ArenaView(_)));
+            let sync = DeviceSync::new(DeviceSyncKind::ToHost);
+            let owned = sync.eval(tvec![device.into_tensor().into_tvalue()])?;
+            assert!(!owned[0].storage_as::<LazyHostStorage>().unwrap().is_materialized());
+            let viewed = sync.eval(tvec![view.into_tensor().into_tvalue()])?;
+            // Characterize the integration limitation: even a persistent owned
+            // backing is read back because it uses the ArenaView variant.
+            assert!(viewed[0].storage_as::<LazyHostStorage>().is_none());
+            assert!(viewed[0].is_plain());
+            viewed[0].close_enough(&host, Approximation::Exact)?;
+            Ok(())
+        })
+    }
 }
