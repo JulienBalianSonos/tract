@@ -80,7 +80,7 @@ impl SpecialOps<TypedFact, Box<dyn TypedOp>> for TypedModel {
                     .map(|f| {
                         f.konst
                             .as_ref()
-                            .filter(|k| k.volume() < 16 && k.is_plain())
+                            .filter(|k| k.volume() < 16 && k.is_plain_ram())
                             .cloned()
                             .map(|t| t.into_tvalue())
                     })
@@ -285,7 +285,7 @@ impl TypedModel {
             let node = self.node(n);
             let (inputs, outputs) = self.node_facts(n)?;
             if node.op.is_stateless()
-                && inputs.iter().all(|i| i.konst.as_ref().is_some_and(|k| k.is_plain()))
+                && inputs.iter().all(|i| i.konst.as_ref().is_some_and(|k| k.is_plain_ram()))
                 && outputs.iter().any(|o| o.konst.is_none())
             {
                 let inputs_ref =
