@@ -5349,6 +5349,7 @@ dependencies = [
  "byteorder",
  "erased-serde",
  "flate2",
+ "libc",
  "log",
  "minijinja",
  "nom 8.0.0",
