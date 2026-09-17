@@ -198,11 +198,7 @@ impl DeviceTensor {
             start < end && end <= shape[axis],
             "Invalid slicing range {start}..{end} on axis {axis} of {shape:?}"
         );
-        let is_exotic = match self {
-            Self::Owned(owned) => owned.exotic_fact().is_some(),
-            Self::ArenaView(view) => view.exotic_fact().is_some(),
-        };
-        if is_exotic {
+        if self.is_exotic() {
             return Ok(None);
         }
         // Packed row-major only: anything else is not a plain byte range.
@@ -357,15 +353,15 @@ impl TensorStorage for DeviceTensor {
         Box::new(self.clone())
     }
 
-    fn as_plain(&self) -> Option<&PlainStorage> {
+    fn as_plain_ram(&self) -> Option<&PlainStorage> {
         None
     }
 
-    fn as_plain_mut(&mut self) -> Option<&mut PlainStorage> {
+    fn as_plain_ram_mut(&mut self) -> Option<&mut PlainStorage> {
         None
     }
 
-    fn into_plain(self: Box<Self>) -> Option<PlainStorage> {
+    fn into_plain_ram(self: Box<Self>) -> Option<PlainStorage> {
         None
     }
 
@@ -413,6 +409,17 @@ impl TensorStorage for DeviceTensor {
             Self::Owned(_) => return Ok(Some((*self.to_host()?).slice(axis, start, end)?)),
         };
         Ok(Some(tensor.into_tensor()))
+    }
+
+    fn is_exotic(&self) -> bool {
+        match self {
+            Self::Owned(owned) => owned.exotic_fact().is_some(),
+            Self::ArenaView(view) => view.exotic_fact().is_some(),
+        }
+    }
+
+    fn in_ram(&self) -> bool {
+        false
     }
 
     fn exotic_fact(&self, _shape: &[usize]) -> TractResult<Option<Box<dyn ExoticFact>>> {
