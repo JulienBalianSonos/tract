@@ -592,7 +592,10 @@ impl MetalStream {
         self.command_buffer
             .borrow_mut()
             .get_or_insert_with(|| {
-                TCommandBuffer::new(self.command_queue.new_command_buffer().to_owned())
+                // Retain Rust ownership while draining temporary Objective-C ownership.
+                objc::rc::autoreleasepool(|| {
+                    TCommandBuffer::new(self.command_queue.new_command_buffer().to_owned())
+                })
             })
             .to_owned()
     }
