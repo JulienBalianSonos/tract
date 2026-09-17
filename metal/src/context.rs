@@ -489,10 +489,9 @@ impl MetalStream {
         let mut command_buffer = self.command_buffer.borrow_mut();
         if command_buffer.is_none() {
             let profile = self.profile.borrow().clone();
-            *command_buffer = Some(TCommandBuffer::new(
-                self.command_queue.new_command_buffer().to_owned(),
-                profile,
-            ));
+            *command_buffer = Some(objc::rc::autoreleasepool(|| {
+                TCommandBuffer::new(self.command_queue.new_command_buffer().to_owned(), profile)
+            }));
             self.context.command_buffer_started();
         }
         command_buffer.as_ref().unwrap().to_owned()
