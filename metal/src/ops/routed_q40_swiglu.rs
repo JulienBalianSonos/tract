@@ -1,6 +1,4 @@
-use crate::kernels::matmul::{
-    RoutedQ40InputMode, RoutedSwigluAct, dispatch_routed_q40_swiglu_f32,
-};
+use crate::kernels::matmul::{RoutedQ40InputMode, RoutedSwigluAct, dispatch_routed_q40_swiglu_f32};
 use anyhow::ensure;
 use tract_core::internal::*;
 use tract_core::tract_linalg::block_quant::Q4_0;
@@ -53,10 +51,7 @@ impl MetalRoutedQ40SwiGlu {
         ensure!(inputs[0].rank() == 2, "MetalRoutedQ40SwiGlu input must be rank 2");
         for w in [inputs[1], inputs[2]] {
             ensure!(w.rank() == 3, "MetalRoutedQ40SwiGlu weights must be rank 3 [E,N,K]");
-            ensure!(
-                as_quant_fact(w, &Q4_0).is_some(),
-                "MetalRoutedQ40SwiGlu weights must be Q4_0"
-            );
+            ensure!(as_quant_fact(w, &Q4_0).is_some(), "MetalRoutedQ40SwiGlu weights must be Q4_0");
         }
         ensure!(inputs[3].rank() == 1 && inputs[4].rank() == 1);
         ensure!(inputs[3].datum_type == i64::datum_type());
@@ -115,9 +110,9 @@ impl EvalOp for MetalRoutedQ40SwiGlu {
             )?;
             // Same prefill-only command-buffer boundary as
             // MetalRoutedQ40MatMul (see that op).
-            let min_routes = crate::tuning::tuning().moe_commit_min_routes;
+            let min_routes = 64;
             if self.sync_after_dispatch && route_token_ids.shape()[0] > min_routes {
-                stream.commit_current()?;
+                stream.wait_until_completed()?;
             }
             Ok(())
         })?;

@@ -192,7 +192,6 @@ mod tests {
         input: Tensor,
         weights_approx: Approximation,
     ) -> TractResult<()> {
-
         let mut transformed = model.clone();
         MetalTransform::default().transform(&mut transformed)?;
         let has_metal_route = transformed.nodes().iter().any(|node| node.op_is::<MetalRouteTopK>());

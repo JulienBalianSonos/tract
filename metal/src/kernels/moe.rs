@@ -99,10 +99,7 @@ pub fn dispatch_route_topk_f32(
     let takes_gemm_path = d % 32 == 0 && d >= 64 && token_count as usize > 4;
     if x2.datum_type() == DatumType::F16 && takes_gemm_path {
         let x32 = unsafe {
-            DeviceTensor::uninitialized_dt(
-                f32::datum_type(),
-                &[token_count as usize, d],
-            )?
+            DeviceTensor::uninitialized_dt(f32::datum_type(), &[token_count as usize, d])?
         };
         crate::kernels::array::Cast.dispatch_eval(stream, &x2, &x32)?;
         stream.retain_tensor(&x32);
