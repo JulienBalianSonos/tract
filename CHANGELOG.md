@@ -9,6 +9,131 @@
 
 For normal usage we recommend adopting the **`tract` facade crate** (the public API at `api/rs`) instead of wiring `tract-core`, `tract-nnef`, `tract-onnx`, `tract-pulse`, `tract-cuda`, `tract-metal`, etc. directly. The facade exposes one stable surface — `nnef()`, `onnx()`, `runtime_for_name("cpu" | "gpu" | "gpu-or-cpu" | "cuda" | "metal" | ...)`, plus `Model`, `Runnable`, `State`, `Tensor`, `TDim`, and a `SetSymbols` transform builder — with all the backends curated behind it. `impl_ndarray_interop!()` (0.23.0-dev.5) keeps `ndarray` interop opt-in without leaking an `ndarray` version into the public API. Downstream code that pinned `tract-core` + `tract-onnx` directly can usually drop those deps in favour of `tract = "0.23"` and `use tract::prelude::*;`. Examples are now organised around this facade — see `examples/onnx-mobilenet-v2`, `examples/nnef-mobilenet-v2`, and `examples/causal_llm`.
 
+# 0.23.8 - 2026-09-21
+
+### Platforms
+
+- [ALPHA] **A WebGPU backend, `tract-wgpu`.** A new crate giving tract a wgpu device for its tensors, and kernels for element-wise and binary ops, matrix multiplication, convolution / pooling / transposed convolution, reduction, softmax and resize. Element-wise chains, epilogues and axis ops fuse into their producer, a squeeze-excitation gate lowers to a single kernel, and the gemv pair folds its normalisation and trailing activation in and unrolls both reductions. On wasm a compute pass is recorded in one JS call; a `web` feature covers browser WebGPU and a `jspi` feature lets uncovered ops fall back to the CPU kernels mid-graph. (Contributed by Ckristian Zoli, #2811.)
+- `wasm32-unknown-emscripten` is covered by cross CI now that the `tar` crate builds there.
+
+### Core
+
+- Storage is a two-axis question — plain/exotic layout and in-RAM placement — and says so at its call sites; storage produces its own bytes and slices itself where it can.
+- **`Delay` holds its buffer as a ring.** It kept the buffer in stream order and shifted the whole of it down by a pulse every turn — on the GPU through a scratch copy, a device memcpy being undefined over overlapping regions — so retiring one frame of a 15-frame attention window rewrote 27 of them. Each lane now keeps the index of its oldest frame and the window is read in the one or two runs that spells (#2819).
+- Fix: **`PulsedSameAxisConcat` kept one position for the whole state**, so a turn seating several streams shared the counter saying whether the arriving pulse still overlaps the leading context, and an autobatched model refused every lane reset rather than serve a stream at all. Positions are per lane now.
+- A causal `WindowOnAxis` no longer pulsifies into a `Delay` followed by a `PulsePad` zero-filling the leading window, which is what the `Delay`'s zeroed buffer already returns.
+- `Delay` asks the optimiser for its axis only where that axis is not the batch axis a laned turn seats on.
+- **A laned turn seats several streams per call.** A call is exploded into one seat per slice of its batched inputs, so a caller feeding several at once — a beam handing its k hypotheses to a stateless model in one go — fills free lanes from the head of a seat queue instead of failing the turn's shape check; a call wider than the free lanes is split at the boundary.
+- **A `batchify` transform puts the batch axis where a laned turn can seat it** — axis 0 of every input and output — asking each op the axis reaches to host it through `change_axes` and refusing by name where it cannot. Models exported for a single stream, or with the batch buried inside, are seatable.
+
+### GPU
+
+- **CUDA fuses a pulsed attention window into its GEMM.** The window reached the GEMM as a fresh copy of 15 slots of which 14 were history the `Delay` already held — 507 MiB a turn on the pulsed nemotron encoder. `CudaRingGemm` holds one slot more, laid out as the GEMM reads it, and takes each seat's rotation instead of the window.
+- **Axis ops between a copy-based op and its consumer no longer each materialise a copy.** A copy-based op writes through `copy_nd`, so it takes the chain on its output: `FusedOutputLayout` carries it and the op writes through a view of the consumer's arena layout.
+- Fix: **an `Sdpa` node went straight into `CudaFlashAttention`**, which takes only a head dim of 64 or 128, so a model with any other head dim failed to load on CUDA instead of running. Nodes the kernel cannot take are exploded into primitives before translation, as the metal transform already does.
+- The CUDA matvec kernel takes the weights as a ring, so a caller holding a window no longer unrolls it into a fresh tensor per call.
+- A device output is brought back to host only if someone reads it, the host bytes a readback hands back are shared rather than copied, and the device is waited on by the thread that queued the work.
+- `Not` has a kernel on both CUDA and Metal — a graph negating a bool left the device and came back, which on the pulsed nemotron encoder was the attention mask going host and back every turn.
+- Metal `dump --profile` reports accelerator time, matching what CUDA records with events, and the profile JSON carries per-node accelerator time alongside CPU time.
+- Fix: the output-side arena rule took axis-op chains the input-side pass already folds, and the schema recognised a forwarding op by a downcast that never matched through a fused-axis op.
+- Fix: `GpuMultiBroadcastTo` on rank-0 input; `fuse_axis_op` hanging on multi-output ops (#2812).
+
+### NNEF / ONNX
+
+- **Integer nearest upsample declutters to one `NearestUpsample` op** rather than a reshape, a broadcast and a reshape back, and is evaluated in one pass; the op is expanded again for targets with no kernel for it, so tflite can still write those graphs and the GPU backends keep the stable-diffusion decoder's upsamples on device.
+- **The ONNX test suite runs 1.20.1, 1.21.0 and 1.22.0**, with 1.22.0 the default — it had stopped at 1.19.1 while the reference scoreboard ran 1.22.0, so three opsets of new operators were never exercised. A new `until:` qualifier mirrors `since:`, and 38 cases that already passed unclaimed are listed.
+- Fix: **`DFT` with both `inverse` and `onesided` is an irfft**, but the two flags were handled independently, so a 6-bin spectrum came back as 4 complex bins instead of the 10-sample real signal it encodes. The Hermitian spectrum is rebuilt first, then inverted, normalised and taken real.
+- Fix: **`QuantizeLinear` / `DequantizeLinear` read only the first element of `y_scale` and `y_zero_point`**, so per-axis quantization silently used channel 0's parameters for every channel.
+- Fix: `QuantizeLinearU8/I8` rounded ties away from zero where ONNX rounds ties to even.
+- Fix: **`MaxPool` and `AveragePool` passed no dilations to `PoolSpec`**, so dilated pools ran undilated.
+- Fix: **`SumPool` with `count_include_pad` divided every window by the full kernel size**, but under ceil mode the last window can run past the explicit padding, which ONNX does not count.
+- Fix: `MaxPool`'s `Indices` output flattens over the whole input, and `storage_order=1` makes the spatial part column-major.
+- Fix: **`InstanceNorm` reduced over the batch axis**, sharing the mean and variance across samples.
+- Fix: `LpNormalization` divided by the norm unconditionally, returning NaN for an all-zero slice where ONNX asks for zero from 1.21 on.
+- Fix: `Scan` ignored `scan_input_directions` / `scan_output_directions`, cast negative scan axes to `usize` (aborting on a huge allocation), and read output chunks from the wrong place.
+- Fix: `Shape` with a start past its end built an inverted range and panicked.
+- Fix: `Dropout` with a mask output declared a single output fact and panicked on translation; `SimplifiedLayerNormalization`'s optional `inv_std_var` output failed analysis.
+- Fix: missing sign checks on loader dimension casts (ONNX and tflite).
+- **`GroupQueryAttention` accepts a past key/value and an internal rotary** (#2645).
+- **`MatMulNBits` at 2 bits**, and asymmetric int4 stays block-quantized instead of falling back to a dense f32 weight eight times the size — the ORT-GenAI exports could not be imported otherwise. **`GatherBlockQuantized`** is supported, and its constant block-32 case folds onto Q4_0 and core's `Gather`.
+- tflite reads and writes `RESIZE_BILINEAR` and `RESIZE_NEAREST_NEIGHBOR` (#2817).
+- Fix: `Delay`'s NNEF dumper wrote `zero_pad` unconditionally, so every pulsed graph gained an attribute on an op whose reader has only just learned it.
+
+### CPU / linalg
+
+- **A GRU runs as one op instead of a per-timestep scan**, with its packed state no longer reallocated every timestep, correct behaviour for batch > 1, and per-turn state reset. `R` must be constant.
+- 2x2 stride-2 NCHW deconvolution is unpacked along W; NCHW 2x2 MaxPool is vectorised.
+
+### Dependencies / footprint
+
+- **The last copyleft crate is gone.** `dyn-eq` (MPL-2.0) sat under `tract-data`, so every tract build linked it and integrator license reviews kept flagging it; it is replaced by a `DynEq` trait and an `eq_trait_object!` macro. `dirs`, which dragged in `option-ext` (also MPL-2.0) for one `cache_dir()` call, is replaced by reading XDG directly.
+- **Template engines are out of the default build.** The CUDA convolution kernels expanded a fixed cross product through minijinja at runtime, linking a parser and VM — 899 KiB of `.text` — into every CUDA-enabled binary; they use askama now, which compiles to code. NNEF ran every `graph.nnef` through a template engine whether or not it held markers, 1.18 MB of `.text` in a library that only loads models; that is behind an off-by-default `unstable-jinja` feature.
+- **The facade's ONNX support is a default-on `onnx` feature**, so a consumer loading only NNEF no longer builds and links `tract-onnx` and its operator register. Fact specs are parsed by a new `TypedFact::from_spec` rather than through `tract-libcli`, which dragged the CLI's dependencies into any library linking the facade.
+- `regex` is dropped from `tract-cli`, `tract-data` and `tract-linalg`; `tract-libcli` no longer declares `tract-tflite` and `tract-gpu` (#2804).
+- Lockfile refreshed; rustls bumped to 0.23.45 for RUSTSEC-2026-0285; cargo-deny configs cleaned; the crates' repository metadata points at `sonos/tract` rather than the old `snipsco/tract`.
+- Fix: `nnef` and `libcli` did not compile with default features off, and CI now checks the crate subsets a downstream library links.
+
+### Python
+
+- Fix: `from_numpy` ran every array through `ascontiguousarray`, which returns at least rank 1, so a 0-d input reached tract as a rank-1 tensor and never matched a scalar.
+
+# 0.23.7 - 2026-09-08
+
+### CPU / linalg
+
+- **f32 `ln` and `exp` are linalg routines.** They went through libm one element at a time, which is most of what a log-mel featurizer costs. Scalar fits and shared coefficients live in `generic/{ln,exp}.rs`, with FMA and AVX-512 kernels on x86_64, NEON on aarch64, and simd128 on wasm (four lanes at a time through `madd_f32x4!`, so a relaxed-simd build fuses them); the f32 arms of the core ops dispatch to them.
+- **AVX2/FMA `erf` kernel**, and the erf-flavoured GELU is now detected with the half factored out.
+- Matmul chunking slack is gated on the problem rather than the machine alone, with the boundary at the 1.5 MB knee, and taken only where the cache absorbs it. The generic i32 4x4 tile is demoted off x86_64.
+- Input validation added to the packing functions.
+- **Depthwise convolution is vectorised along W.** NCHW W-inner `DepthWiseConv` ran `process_zone_n` scalar; consecutive output points are now computed together when the output stride is 1, by splatting each kernel tap and FMA-ing a 4/8-wide load, with `vld2q`/`vld3q` for the stride 2/3 paths the DPDFNet 48 kHz encoder uses. Padded and non-unit-output-stride zones stay scalar, and `BlockedConv` is untouched. The kernel lives in linalg as a `DepthwiseW` routine rather than as aarch64 intrinsics inside core.
+
+### Core
+
+- **`Stft::eval_t` addresses frames by offset.** It walked contiguous tensors one element at a time through dynamic-rank ndarray views, re-resolving the window and branching on the pad offset per sample. Whole frames are now gathered and stored as slices when contiguous, the zero-padded window is computed once per eval, and an element-wise path is kept for a time axis not adjacent to the complex pair.
+
+### NNEF / ONNX
+
+- Fix: **ONNX `SimplifiedLayerNormalization` lowered to a full LayerNorm** instead of an RMS norm, so it subtracted a mean the operator does not have (#2646).
+
+### GPU / transformers
+
+- **Metal convolution goes through an implicit GEMM.** The direct kernel computed one output position per thread and left most of the GPU idle — a 56x56x64 -> 128 3x3 layer ran at about 20 GFLOP/s on an M1 Pro. MLX's tiled implicit-GEMM conv is ported as owned `.metal` source and takes NHWC f16/f32 single-group 2D convolutions; every other shape stays on the direct kernel. A metal-local rule reorders eligible kernels from the shared rewrite's OIHW into the OHWI layout the ported kernel wants, as a constant, since the metal transform does not declutter afterwards.
+- **GatedDeltaNet recurrent and causal-conv1d-update CUDA kernels**, matching the Metal implementation, with CPU-vs-GPU criterion benches on both backends.
+- **RMSNorm fusions**: residual absorption and scaled-norm fusion across nn/gpu/cuda/metal, a CUDA fused scale/residual kernel matching Metal, support for a fused in/out dtype cast, end-to-end coverage through the real backend pipeline, and a before/after latency bench on Metal. `ScaledRmsNorm` evaluation moved to the ctx-based `EvalOp` API.
+- Fix: **the fused norms came out more precise than the graphs they replace**, which cost accuracy on q40ef16 LLMs. The scale fusions multiplied gamma against the raw f32 accumulator where the graph rounds first (`weight * hidden.to(input_dtype)`) — the rounding target is now recorded as `ScaledRmsNorm::scale_dt`, carried through the cast folds and applied before scaling; `fuse_scaled_rms_norm_out_cast` folded widening casts as well as narrowing ones, deleting a rounding step and flipping the top-1 token on OpenELM q40ef16; and the CUDA kernel normalized an unrounded f32 residual sum, diverging from Metal and from the standalone `Add` it claims to replace. The OpenELM f16 Metal top-1 expectations relaxed while the fusions were in flight are restored to their pre-fusion values.
+- Fix: `GpuMultiBroadcastTo` panicked on a rank-0 input, whose strides are empty.
+
+### Security
+
+- **`SECURITY.md`**: private reporting through GitHub advisories, the supported release lines, the trust boundary between developer-supplied models and untrusted inference inputs, and the `api/rs` facade (the `tract` crate) as the supported surface.
+- Fix: **NNEF tensor and resource labels could escape the destination directory.** Only a leading slash was stripped, so a label carrying a `..` component resolved outside the directory a model is written to. Labels are checked to be plain relative paths in both writers and in the CLI output dump.
+- Fix: **a tensor's shape arithmetic overflowed before it was allocated**, both ways, from a model file. `uninitialized_aligned_dt` multiplied the shape product by the datum size in wrapping arithmetic: wrapped large, `from_raw_dt_align` allocates before comparing against the payload, so a 4-byte payload made tract ask the allocator for 16 EiB (dims `[-1]` on 0.23.6); wrapped small, the length check passed and the tensor claimed far more elements than its buffer held, with `as_slice_unchecked()` handing out the oversized slice. The arithmetic is now checked, `isize::MAX` bound included, before allocating.
+- Fix: malformed TensorFlow `TensorProto`s return an error instead of panicking (CWE-248).
+- Fix: `read_tensor` is hardened against an untrusted NNEF string length (CWE-770).
+
+### Docs / infra
+
+- **`AGENTS.md` is the single normative contributor file**; the descriptive material moves to `doc/overview.md`, and `CLAUDE.md`, `GEMINI.md` and `.github/copilot-instructions.md` are symlinks to it. The rules had drifted between the two copies.
+- The test infra runtime reports the interface facts a transposing device runtime actually takes; the harness `causal-conv1d-update` case declares shapes the op accepts.
+- Dependency and action group bumps.
+
+### [WIP] Autobatch / streaming
+
+- **One prepared model can serve many concurrent sessions.** A laned state holds its lanes in a table, so several streams share one prepared model and one set of weights; a model whose state cannot be laned is refused up front, and a laned runnable counts the turns it runs and the seats they fill. `OptMatMul`'s output stores are keyed on the shape they were built for.
+- **Unstable exposition on the public API** as `Runnable::autobatch(max_sessions)` behind the `unstable-autobatch` feature, which wraps a prepared model and fails there when it carries no batch axis. The streaming ASR example takes a session count and checks that batching leaves the transcript alone.
+- Fix: **a laned turn served every seat the shared inputs of seat 0.** Inputs with no batch axis — one value for the whole turn — were read from seat 0 with no check on the others, so streams disagreeing about one were silently served seat 0's value (for the nemotron encoder's `lang_id`, every seat of the turn transcribed in seat 0's language). The shared inputs are now compared across seats and the turn fails when they disagree.
+- Fix: **a blockified mask read the absolute chunk index**, so its band predicate held only while every turn advanced every stream; a laned runtime seating a stream on some turns and not others inflated the older window slots past the band and masked real context out. The predicate now reads the window's own slot offsets, leaving the per-lane `PulsePad` as the only positional input.
+- Fix: a blockified mask wired its position-free zeros as a scalar, so an axis change reaching the broadcast in front of them asserted on a rank-0 tensor.
+- `PulsedRange` says what its counter counts when it refuses lanes; `PulsePad`'s pad constant is cast to the datum type it fills, and the harness runs the pulsified pad case in f16 too.
+
+### [WIP] CLI / diagnostics for Autobatch
+
+- **`run` and `bench` take `--streams`.** `run` feeds each stream the turns rotated by its own index — so no two seats of a turn carry the same values — and checks each against the same sequence run alone; `bench` saturates a thread per stream and reports what they served together. Input facts resolve against `--set`, so a pulsed model whose batch axis stays symbolic can be fed at all.
+- **Real-time capacity, not just saturation.** `bench --turn-period` paces the streams against the wall clock and times a turn from the arrival of its input, and `--capacity` doubles the load until the deadline breaks at a quantile, then bisects back to the largest load that holds.
+- **Session churn.** Under `--session-duration` a stream is a seat in a steady population: it holds a session for an exponential draw around that mean, gives it up and admits another, joining a fixed lattice of slots so churn costs what admitting a session costs. Reports admissions per second, the share that waited for a lane, and the wait at a quantile.
+- `--lanes` is renamed **`--autobatch-sessions`**, matching the public API surface; messages and help say *sessions* for what a caller asks for and keep *lane* for where one session's state sits. The paced and saturating multi-session benches move to a `profile_autobatch` module gated once instead of twelve wasm gates.
+- Fix: **`--override-fact` reported success and changed nothing** on an NNEF model input — it set only the outlet fact, which a `TypedSource` puts back from the fact held in the op. It now rewires the model from the new fact (re-deriving downstream facts and failing on an op that cannot take it), refuses a node that is not a source, and reads the fact in the model's own symbol scope.
+
 # 0.23.6 - 2026-09-02
 
 ### Platforms

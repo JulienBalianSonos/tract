@@ -1,6 +1,6 @@
-use tract_nnef::internal::*;
+use std::ops::Range;
 
-use crate::lane::lane_runs;
+use tract_nnef::internal::*;
 
 pub fn register(registry: &mut Registry) {
     registry.register_primitive(
@@ -10,6 +10,7 @@ pub fn register(registry: &mut Registry) {
             TypeName::Integer.named("axis"),
             TypeName::Integer.named("delay"),
             TypeName::Integer.named("overlap"),
+            TypeName::Logical.named("zero_pad").default(false),
         ],
         &[("output", TypeName::Scalar.tensor())],
         de_delay,
@@ -22,16 +23,20 @@ fn de_delay(builder: &mut ModelBuilder, invocation: &ResolvedInvocation) -> Trac
     let delay = invocation.named_arg_as::<i64>(builder, "delay")? as usize;
     let overlap = invocation.named_arg_as::<i64>(builder, "overlap")? as usize;
     let input_fact = builder.model.outlet_fact(wire)?;
-    let op = Delay::new_typed(input_fact, axis, delay, overlap);
+    let mut op = Delay::new_typed(input_fact, axis, delay, overlap);
+    op.zero_pad = invocation.named_arg_as(builder, "zero_pad")?;
     builder.wire(op, &[wire])
 }
 
-/// The streaming context preceding the current pulse. `lanes` is the extent of
-/// the buffer's lane axis, 1 when the state serves a single stream and the
-/// buffer has no lane axis at all.
+/// The streaming context preceding the current pulse, held as a ring: `heads`
+/// is each lane's ring index of the oldest buffered frame, so a turn overwrites
+/// the frames it retires instead of shifting the whole buffer down. `lanes` is
+/// the extent of the buffer's lane axis, 1 when the state serves a single
+/// stream and the buffer has no lane axis at all.
 #[derive(Debug, Clone, Default)]
 pub struct DelayState {
     pub buffer: Option<Tensor>,
+    heads: TVec<usize>,
     lanes: usize,
 }
 
@@ -48,20 +53,23 @@ impl DelayState {
         lane: Option<usize>,
     ) -> TractResult<()> {
         let axis = op.axis;
-        let buffered = op.delay + op.overlap;
         let input_pulse = input.shape()[axis];
         let output_pulse = input_pulse + op.overlap;
         let from_input = input_pulse.saturating_sub(op.delay);
-        let from_buffer = output_pulse.saturating_sub(from_input);
+        let from_buffer = output_pulse - from_input;
+        let head = self.heads[lane.unwrap_or(0)];
         let buffer = self.buffer.as_mut().unwrap();
-        output.assign_slice_at_prefix(
-            seat.as_slice(),
-            0..from_buffer,
-            buffer,
-            lane.as_slice(),
-            0..from_buffer,
-            axis,
-        )?;
+        for (at, run) in op.ring_runs(head, from_buffer) {
+            let len = run.len();
+            output.assign_slice_at_prefix(
+                seat.as_slice(),
+                at..at + len,
+                buffer,
+                lane.as_slice(),
+                run,
+                axis,
+            )?;
+        }
         output.assign_slice_at_prefix(
             seat.as_slice(),
             from_buffer..output_pulse,
@@ -70,36 +78,20 @@ impl DelayState {
             0..from_input,
             axis,
         )?;
-        if buffered < input_pulse {
-            let tail = input_pulse - buffered;
+        let fresh = input_pulse.min(op.buffered());
+        for (at, run) in op.ring_runs(op.ring_index(head + input_pulse - fresh), fresh) {
+            let len = run.len();
+            let from = input_pulse - fresh + at;
             buffer.assign_slice_at_prefix(
                 lane.as_slice(),
-                0..buffered,
+                run,
                 input,
                 seat.as_slice(),
-                tail..input_pulse,
-                axis,
-            )?;
-        } else {
-            let keep = buffered - input_pulse;
-            // The kept context moves down inside the buffer, so source and
-            // destination are the same tensor and no assign can name both.
-            let dt_size = buffer.datum_type().size_of();
-            let bshape: TVec<usize> = buffer.shape().into();
-            let source = lane_runs(&bshape, dt_size, axis, lane, input_pulse..buffered);
-            let buf = buffer.as_bytes_mut();
-            for (to, from) in lane_runs(&bshape, dt_size, axis, lane, 0..keep).zip(source) {
-                buf.copy_within(from, to.start);
-            }
-            buffer.assign_slice_at_prefix(
-                lane.as_slice(),
-                keep..buffered,
-                input,
-                seat.as_slice(),
-                0..input_pulse,
+                from..from + len,
                 axis,
             )?;
         }
+        self.heads[lane.unwrap_or(0)] = op.ring_index(head + input_pulse);
         Ok(())
     }
 }
@@ -132,6 +124,7 @@ impl OpState for DelayState {
             // per-node comparison meaningless on the warmup region.
             self.buffer = Some(Tensor::zero_dt(dt, &shape)?);
             self.lanes = max_lanes;
+            self.heads = tvec!(0; max_lanes);
         }
         ensure!(
             self.lanes == max_lanes,
@@ -164,6 +157,7 @@ impl OpState for DelayState {
         let stride = buffer.as_bytes().len() / self.lanes;
         for lane in lanes {
             buffer.as_bytes_mut()[lane.0 * stride..][..stride].fill(0);
+            self.heads[lane.0] = 0;
         }
         Ok(())
     }
@@ -175,13 +169,53 @@ pub struct Delay {
     pub axis: usize,
     pub delay: usize,
     pub overlap: usize,
+    /// The `overlap` frames the op prepends to a pulse stand for the
+    /// out-of-stream past as zero padding, so they count in the stream's dim
+    /// instead of as delay the consumer waits out. Sound only because the
+    /// buffer starts and resets to zero, hence a leading `Constant(0)` pad and
+    /// no other.
+    pub zero_pad: bool,
 }
 
 impl Delay {
     pub fn new_typed(input_fact: &TypedFact, axis: usize, delay: usize, overlap: usize) -> Delay {
         let mut buffer_shape: TVec<TDim> = input_fact.shape.to_tvec();
         buffer_shape[axis] = (delay + overlap).to_dim();
-        Delay { buffer_shape, axis, delay, overlap }
+        Delay { buffer_shape, axis, delay, overlap, zero_pad: false }
+    }
+
+    /// The number of frames the state buffers, and so the length of its ring.
+    pub fn buffered(&self) -> usize {
+        self.delay + self.overlap
+    }
+
+    /// Wrap a ring index which may have run one lap past the end.
+    pub fn ring_index(&self, index: usize) -> usize {
+        if self.buffered() == 0 { 0 } else { index % self.buffered() }
+    }
+
+    /// The one or two runs of the ring holding `len` frames from ring index
+    /// `start`, each paired with its offset in the contiguous sequence of
+    /// frames they spell out.
+    /// The move `suggested_axis_changes` asks for, when the layout has one to
+    /// gain: the ring copies runs of frames, and a run is contiguous only when
+    /// the axis leads. A symbolic leading extent is the batch axis a laned turn
+    /// addresses its buffer by, and displacing it would leave the state
+    /// un-lane-addressable, so the layout stays as it is.
+    fn wants_axis_first(&self) -> bool {
+        self.axis != 0 && self.buffer_shape[0].as_i64().is_some()
+    }
+
+    pub fn ring_runs(&self, start: usize, len: usize) -> TVec<(usize, Range<usize>)> {
+        if len == 0 {
+            return tvec!();
+        }
+        let first = len.min(self.buffered() - start);
+        let mut runs = tvec!((0, start..start + first));
+        if first < len {
+            runs.push((first, 0..len - first));
+        }
+        runs
     }
 }
 
@@ -192,7 +226,13 @@ impl Op for Delay {
 
     fn info(&self) -> TractResult<Vec<String>> {
         Ok(vec![
-            format!("axis: {} delay: {} overlap: {}", self.axis, self.delay, self.overlap),
+            format!(
+                "axis: {} delay: {} overlap: {}{}",
+                self.axis,
+                self.delay,
+                self.overlap,
+                if self.zero_pad { " zero_pad" } else { "" }
+            ),
             format!("buffer: {:?}", self.buffer_shape),
         ])
     }
@@ -222,7 +262,7 @@ impl TypedOp for Delay {
     }
 
     fn suggested_axis_changes(&self) -> TractResult<TVec<(InOut, AxisOp)>> {
-        if self.axis != 0 {
+        if self.wants_axis_first() {
             Ok(tvec!((InOut::In(0), AxisOp::Move(self.axis, 0))))
         } else {
             Ok(tvec!())

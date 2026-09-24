@@ -3,6 +3,7 @@ use tract_core::ops;
 
 mod broadcast;
 mod cast;
+mod clamped_swiglu;
 #[cfg(feature = "complex")]
 mod complex;
 mod downsample;
@@ -13,6 +14,7 @@ mod gather;
 mod gelu_approximate;
 mod grid_sample;
 mod gru_cell;
+mod gru_seq;
 mod is_inf;
 mod lstm_cell;
 mod matmul;
@@ -51,6 +53,7 @@ pub fn register(registry: &mut Registry) {
     registry.register_binary("tract_shr", &ops::math::ShiftRight);
     broadcast::register(registry);
     cast::register(registry);
+    clamped_swiglu::register(registry);
     #[cfg(feature = "complex")]
     complex::register(registry);
     downsample::register(registry);
@@ -62,6 +65,7 @@ pub fn register(registry: &mut Registry) {
     pow_const::register(registry);
     grid_sample::register(registry);
     gru_cell::register(registry);
+    gru_seq::register(registry);
     lstm_cell::register(registry);
     matmul::register(registry);
     one_hot::register(registry);

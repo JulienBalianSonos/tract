@@ -1,5 +1,7 @@
 #![allow(unpredictable_function_pointer_comparisons)]
 use crate::device::{DeviceContext, get_context};
+use crate::ops::change_axes::GpuAxisOp;
+use crate::ops::fused_output::make_fused_output_for_node;
 use crate::tensor::{DeviceTensor, DeviceTensorExt, IntoDevice};
 use crate::turn_handler::make_tensor_for_node;
 use crate::utils::compute_broadcast_strides;
@@ -13,11 +15,23 @@ use tract_pulse_opl::ops::{AffineChunkTrim, Delay, PulsePad};
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GpuDelay {
     pub inner: Delay,
+    /// The layout its consumer wants the window written in.
+    pub out_axis_ops: TVec<GpuAxisOp>,
 }
 
 impl GpuDelay {
     pub fn new(inner: &Delay) -> Self {
-        Self { inner: inner.clone() }
+        Self { inner: inner.clone(), out_axis_ops: tvec!() }
+    }
+}
+
+impl crate::ops::fused_output::FusedOutputLayout for GpuDelay {
+    fn out_axis_ops(&self) -> &[GpuAxisOp] {
+        &self.out_axis_ops
+    }
+
+    fn with_out_axis_ops(&self, ops: TVec<GpuAxisOp>) -> Box<dyn TypedOp> {
+        Box::new(Self { out_axis_ops: ops, ..self.clone() })
     }
 }
 
@@ -27,7 +41,14 @@ impl Op for GpuDelay {
     }
 
     fn info(&self) -> TractResult<Vec<String>> {
-        self.inner.info()
+        let mut info = self.inner.info()?;
+        if !self.out_axis_ops.is_empty() {
+            info.push(format!(
+                "writes through: {:?}",
+                self.out_axis_ops.iter().map(|o| &o.inner).collect::<Vec<_>>()
+            ));
+        }
+        Ok(info)
     }
 
     op_as_typed_op!();
@@ -40,7 +61,7 @@ impl EvalOp for GpuDelay {
         Ok(Some(Box::new(GpuDelayState {
             node_id: ctx.node_id,
             buffer: None,
-            shift_scratch: None,
+            heads: tvec!(),
             lanes: 0,
         })))
     }
@@ -48,8 +69,14 @@ impl EvalOp for GpuDelay {
 
 impl TypedOp for GpuDelay {
     fn output_facts(&self, inputs: &[&TypedFact]) -> TractResult<TVec<TypedFact>> {
-        crate::utils::facts_to_device_facts(inputs, |facts| self.inner.output_facts(facts))
-            .with_context(|| format!("Error while computing output facts for {}", self.name()))
+        crate::utils::facts_to_device_facts(inputs, |facts| {
+            let mut facts = self.inner.output_facts(facts)?;
+            for op in &self.out_axis_ops {
+                op.inner.change_shape(&mut facts[0].shape, false)?;
+            }
+            Ok(facts)
+        })
+        .with_context(|| format!("Error while computing output facts for {}", self.name()))
     }
 
     fn cost(&self, inputs: &[&TypedFact]) -> TractResult<TVec<(Cost, TDim)>> {
@@ -63,7 +90,7 @@ impl TypedOp for GpuDelay {
 /// each: axis 0 is the lane axis, or the copy spans it when the lanes are absent
 /// and the tensors carry a single stream's state.
 #[allow(clippy::too_many_arguments)]
-fn copy_lane(
+pub fn copy_lane(
     ctx: &dyn DeviceContext,
     dst: &DeviceTensor,
     dst_lane: Option<usize>,
@@ -90,7 +117,7 @@ fn copy_lane(
 
 /// Zero each of `lanes` whole, or the whole tensor when it holds a single
 /// stream's state and has no lane axis.
-fn zero_lanes(
+pub fn zero_lanes(
     ctx: &dyn DeviceContext,
     dst: &DeviceTensor,
     lanes: &[LaneId],
@@ -141,14 +168,16 @@ fn fill_lane(
     )
 }
 
-/// The streaming context preceding the current pulse. `lanes` is the extent of
-/// the buffer's lane axis, 1 when the state serves a single stream and the
-/// buffer has no lane axis at all.
+/// The streaming context preceding the current pulse, held as a ring: `heads`
+/// is each lane's ring index of the oldest buffered frame, so a turn overwrites
+/// the frames it retires instead of shifting the whole buffer down. `lanes` is
+/// the extent of the buffer's lane axis, 1 when the state serves a single
+/// stream and the buffer has no lane axis at all.
 #[derive(Debug, Clone)]
 pub struct GpuDelayState {
     pub node_id: usize,
     pub buffer: Option<DeviceTensor>,
-    pub shift_scratch: Option<DeviceTensor>,
+    heads: TVec<usize>,
     lanes: usize,
 }
 
@@ -166,39 +195,24 @@ impl GpuDelayState {
         lane: Option<usize>,
     ) -> TractResult<()> {
         let axis = op.axis;
-        let buffered = op.delay + op.overlap;
         let input_pulse = input.shape()[axis];
         let output_pulse = input_pulse + op.overlap;
         let from_input = input_pulse.saturating_sub(op.delay);
-        let from_buffer = output_pulse.saturating_sub(from_input);
+        let from_buffer = output_pulse - from_input;
+        let head = self.heads[lane.unwrap_or(0)];
         let buffer = self.buffer.as_ref().unwrap();
 
-        copy_lane(ctx, output, seat, 0, buffer, lane, 0, axis, from_buffer)?;
+        for (at, run) in op.ring_runs(head, from_buffer) {
+            copy_lane(ctx, output, seat, at, buffer, lane, run.start, axis, run.len())?;
+        }
         copy_lane(ctx, output, seat, from_buffer, input, seat, 0, axis, from_input)?;
 
-        if buffered < input_pulse {
-            copy_lane(ctx, buffer, lane, 0, input, seat, input_pulse - buffered, axis, buffered)?;
-        } else {
-            // CUDA memcpy is undefined for overlapping regions in the same
-            // buffer (parallel threads), so shift the lane left by input_pulse
-            // through a scratch buffer.
-            let keep = buffered - input_pulse;
-            let scratch = match self.shift_scratch.as_ref() {
-                Some(scratch) => scratch,
-                None => {
-                    let mut shape: TVec<usize> = buffer.shape().into();
-                    if lane.is_some() {
-                        shape[0] = 1;
-                    }
-                    self.shift_scratch
-                        .insert(DeviceTensor::uninitialized_dt(input.datum_type(), &shape)?)
-                }
-            };
-            let scratch_lane = lane.map(|_| 0);
-            copy_lane(ctx, scratch, scratch_lane, 0, buffer, lane, input_pulse, axis, keep)?;
-            copy_lane(ctx, buffer, lane, 0, scratch, scratch_lane, 0, axis, keep)?;
-            copy_lane(ctx, buffer, lane, keep, input, seat, 0, axis, input_pulse)?;
+        let fresh = input_pulse.min(op.buffered());
+        for (at, run) in op.ring_runs(op.ring_index(head + input_pulse - fresh), fresh) {
+            let from = input_pulse - fresh + at;
+            copy_lane(ctx, buffer, lane, run.start, input, seat, from, axis, run.len())?;
         }
+        self.heads[lane.unwrap_or(0)] = op.ring_index(head + input_pulse);
         Ok(())
     }
 }
@@ -211,7 +225,8 @@ impl OpState for GpuDelayState {
         inputs: TVec<TValue>,
     ) -> TractResult<TVec<TValue>> {
         let input = args_1!(inputs);
-        let op = &op.downcast_ref::<GpuDelay>().ok_or_else(|| format_err!("Wrong Op type"))?.inner;
+        let gpu_op = op.downcast_ref::<GpuDelay>().ok_or_else(|| format_err!("Wrong Op type"))?;
+        let op = &gpu_op.inner;
         let device_input = input.as_device_tensor().context("Expected a GPU tensor")?;
         let mut output_shape: TVec<usize> = device_input.shape().into();
         output_shape[op.axis] = device_input.shape()[op.axis] + op.overlap;
@@ -227,13 +242,15 @@ impl OpState for GpuDelayState {
             }
             self.buffer = Some(Tensor::zero_dt(dt, &shape)?.into_device()?);
             self.lanes = max_lanes;
+            self.heads = tvec!(0; max_lanes);
         }
         ensure!(
             self.lanes == max_lanes,
             "GpuDelay buffer holds {} lanes, this turn seats {max_lanes} of them",
             self.lanes
         );
-        let mut output = make_tensor_for_node(ctx, dt, &output_shape)?;
+        let (mut output, published) =
+            make_fused_output_for_node(ctx, dt, &output_shape, &gpu_op.out_axis_ops)?;
         if max_lanes > 1 {
             ensure!(
                 device_input.shape()[0] == ctx.seating.occupancy(),
@@ -246,7 +263,7 @@ impl OpState for GpuDelayState {
             let (seat, lane) = ctx.seating.address(ix);
             self.delay_seat(&*device, op, device_input, &mut output, seat, lane)?;
         }
-        Ok(tvec!(output.into_tensor().into()))
+        Ok(tvec!(published.into_tensor().into()))
     }
 
     fn reset_lanes(&mut self, lanes: &[LaneId]) -> TractResult<()> {
@@ -256,6 +273,9 @@ impl OpState for GpuDelayState {
             "GpuDelay buffer holds {} lanes, asked to reset {lanes:?}",
             self.lanes
         );
+        for lane in lanes {
+            self.heads[lane.0] = 0;
+        }
         zero_lanes(&*get_context()?, buffer, lanes, self.lanes > 1)
     }
 }
@@ -269,9 +289,12 @@ pub struct GpuPulsePad {
 }
 
 impl GpuPulsePad {
-    pub fn new(op: &PulsePad) -> TractResult<Self> {
-        let device_cst =
-            if let PadMode::Constant(c) = &op.mode { Some(c.clone().into_device()?) } else { None };
+    pub fn new(op: &PulsePad, dt: DatumType) -> TractResult<Self> {
+        let device_cst = if let PadMode::Constant(c) = &op.mode {
+            Some(c.cast_to_dt(dt)?.into_owned().into_device()?)
+        } else {
+            None
+        };
         Ok(Self { op: op.clone(), device_cst })
     }
 }
@@ -567,6 +590,10 @@ impl Op for GpuAffineChunkTrim {
 
 impl EvalOp for GpuAffineChunkTrim {
     op_out_of_plan!();
+
+    fn forwards_input(&self) -> Option<usize> {
+        Some(0)
+    }
 
     fn eval(&self, ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let input_value = args_1!(inputs);
