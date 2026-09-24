@@ -33,6 +33,7 @@ mod topk;
 mod trilu;
 
 pub fn register(registry: &mut Registry) {
+    clamped_swiglu::register(registry);
     registry.register_unit_element_wise("tract_core_round_even", &ops::math::RoundHalfToEven {});
     registry.register_unit_element_wise("tract_core_erf", &ops::math::Erf {});
     registry.register_unit_element_wise("tract_core_hard_swish", &ops::nn::HardSwish {});
@@ -78,3 +79,4 @@ pub fn register(registry: &mut Registry) {
     trilu::register(registry);
     is_inf::register(registry);
 }
+mod clamped_swiglu;

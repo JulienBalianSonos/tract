@@ -4,16 +4,17 @@ use super::{
 };
 use crate::ops::routed_matmul::{
     PreparedRoutedMatMulState, RoutedInputRows, RoutedRowsInput, build_block_quant_routed_matmul,
-    run_prepared_routed_matmul,
+    f32_input, run_prepared_routed_matmul,
 };
 use tract_ndarray::{Array2, ArrayView2, ArrayView3, s};
 use tract_nnef::internal::*;
 use tract_nnef::tract_core::ops::{OpState, OpStateFreeze};
-use tract_nnef::tract_core::tract_linalg::{
-    block_quant::BlockQuantStorage,
-    mmm::{AsInputValue, FusedSpec, MMMInputValue, MatMatMul},
-    pack::PackedFormat,
+
+use tract_nnef::tract_core::tract_linalg::block_quant::BlockQuantStorage;
+use tract_nnef::tract_core::tract_linalg::mmm::{
+    AsInputValue, FusedSpec, MMMInputValue, MatMatMul,
 };
+use tract_nnef::tract_core::tract_linalg::pack::PackedFormat;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct RouteTopK {
@@ -34,8 +35,9 @@ impl EvalOp for RouteTopK {
     }
 
     fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
-        let x_t = inputs[0].cast_to::<f32>()?.into_owned();
-        let wg_t = inputs[1].cast_to::<f32>()?.into_owned();
+        let (x_t, wg_t) = args_2!(inputs);
+        let x_t = x_t.cast_to::<f32>()?;
+        let wg_t = wg_t.cast_to::<f32>()?;
         let x = as_2d_tokens(x_t.to_plain_array_view::<f32>()?)?;
         let wg = router_weights_as_2d(wg_t.to_plain_array_view::<f32>()?)?;
 
@@ -111,11 +113,6 @@ pub enum RoutedInputMode {
 pub struct RoutedMatMul {
     pub input_mode: RoutedInputMode,
     pub cache_weights: bool,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub struct RoutedQ40MatMul {
-    pub input_mode: RoutedInputMode,
 }
 
 #[derive(Clone, Debug)]
@@ -208,7 +205,7 @@ impl RoutedMatMul {
 
     fn eval_with_mmm(
         &self,
-        input_t: &Tensor,
+        input_t: &Arc<Tensor>,
         weights_t: &Tensor,
         route_token_ids: &[i64],
         route_expert_ids: &[i64],
@@ -235,17 +232,15 @@ impl RoutedMatMul {
 
         let expert_routes = self.group_routes(route_count, num_experts, route_expert_ids)?;
         let mut output = Array2::<f32>::zeros((route_count, n_dim));
-        let item_size = f32::datum_type().size_of() as isize;
-        let base = input.as_ptr();
-        let row_stride_bytes = input.strides()[0] * item_size;
-        let k_stride_bytes = input.strides()[1] * item_size;
+        let row_stride = usize::try_from(input.strides()[0])?;
+        let k_stride = usize::try_from(input.strides()[1])?;
 
         for (eid, routes) in expert_routes.iter().enumerate() {
             if routes.is_empty() {
                 continue;
             }
 
-            let mut row_byte_offsets = Vec::with_capacity(routes.len());
+            let mut row_offsets = Vec::with_capacity(routes.len());
             for &r in routes {
                 let src = self.source_row(r, route_token_ids)?;
                 ensure!(
@@ -253,16 +248,15 @@ impl RoutedMatMul {
                     "route {r} references input row {src}, but input has {} rows",
                     input.shape()[0]
                 );
-                row_byte_offsets.push(row_stride_bytes * src as isize);
+                row_offsets.push(row_stride * src);
             }
 
             let a = RoutedRowsInput::new(
-                base,
-                row_byte_offsets,
+                input_t.clone(),
+                RoutedInputRows::explicit(row_offsets, k_stride),
                 k_dim,
-                k_stride_bytes,
                 a_format.clone(),
-            );
+            )?;
             let w_e = weights_t.view_at_prefix(&[eid])?;
             let b = b_format.pack_tensor_view(&w_e, 0, 1)?;
             let mut expert_output = Tensor::zero::<f32>(&[routes.len(), n_dim])?;
@@ -318,7 +312,7 @@ impl RoutedMatMul {
 
     fn eval_with_cached_mmm(
         &self,
-        input_t: &Tensor,
+        input_t: &Arc<Tensor>,
         route_token_ids: &[i64],
         route_expert_ids: &[i64],
         cache: &RoutedMatMulWeightsCache,
@@ -352,17 +346,15 @@ impl RoutedMatMul {
 
         let expert_routes = self.group_routes(route_count, cache.num_experts, route_expert_ids)?;
         let mut output = Array2::<f32>::zeros((route_count, cache.n_dim));
-        let item_size = f32::datum_type().size_of() as isize;
-        let base = input.as_ptr();
-        let row_stride_bytes = input.strides()[0] * item_size;
-        let k_stride_bytes = input.strides()[1] * item_size;
+        let row_stride = usize::try_from(input.strides()[0])?;
+        let k_stride = usize::try_from(input.strides()[1])?;
 
         for (eid, routes) in expert_routes.iter().enumerate() {
             if routes.is_empty() {
                 continue;
             }
 
-            let mut row_byte_offsets = Vec::with_capacity(routes.len());
+            let mut row_offsets = Vec::with_capacity(routes.len());
             for &r in routes {
                 let src = self.source_row(r, route_token_ids)?;
                 ensure!(
@@ -370,16 +362,15 @@ impl RoutedMatMul {
                     "route {r} references input row {src}, but input has {} rows",
                     input.shape()[0]
                 );
-                row_byte_offsets.push(row_stride_bytes * src as isize);
+                row_offsets.push(row_stride * src);
             }
 
             let a = RoutedRowsInput::new(
-                base,
-                row_byte_offsets,
+                input_t.clone(),
+                RoutedInputRows::explicit(row_offsets, k_stride),
                 cache.k_dim,
-                k_stride_bytes,
                 cache.a_format.clone(),
-            );
+            )?;
             let mut expert_output = Tensor::zero::<f32>(&[routes.len(), cache.n_dim])?;
             let store = unsafe { mmm.c_view(Some(0), Some(1)).wrap(&expert_output.view_mut()) };
             let uops = tvec![
@@ -480,9 +471,10 @@ impl OpState for RoutedMatMulState {
             return self.op.eval(inputs);
         };
 
-        let input_t = inputs[0].cast_to::<f32>()?.into_owned();
-        let route_token_ids_t = inputs[2].cast_to::<i64>()?.into_owned();
-        let route_expert_ids_t = inputs[3].cast_to::<i64>()?.into_owned();
+        let (input, _weights, token_ids, expert_ids) = args_4!(inputs);
+        let input_t = f32_input(input)?;
+        let route_token_ids_t = token_ids.cast_to::<i64>()?.into_owned();
+        let route_expert_ids_t = expert_ids.cast_to::<i64>()?.into_owned();
         let route_token_ids = plain_i64_slice(&route_token_ids_t, "route_token_ids")?;
         let route_expert_ids = plain_i64_slice(&route_expert_ids_t, "route_expert_ids")?;
         let output =
@@ -510,10 +502,11 @@ impl EvalOp for RoutedMatMul {
 
     fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         // inputs: data, weights [E,K,N], route_token_ids [R], route_expert_ids [R].
-        let input_t = inputs[0].cast_to::<f32>()?.into_owned();
-        let weights_t = inputs[1].cast_to::<f32>()?.into_owned();
-        let route_token_ids_t = inputs[2].cast_to::<i64>()?.into_owned();
-        let route_expert_ids_t = inputs[3].cast_to::<i64>()?.into_owned();
+        let (input, weights, token_ids, expert_ids) = args_4!(inputs);
+        let input_t = f32_input(input)?;
+        let weights_t = weights.cast_to::<f32>()?.into_owned();
+        let route_token_ids_t = token_ids.cast_to::<i64>()?.into_owned();
+        let route_expert_ids_t = expert_ids.cast_to::<i64>()?.into_owned();
         let route_token_ids = plain_i64_slice(&route_token_ids_t, "route_token_ids")?;
         let route_expert_ids = plain_i64_slice(&route_expert_ids_t, "route_expert_ids")?;
 
@@ -540,6 +533,11 @@ impl TypedOp for RoutedMatMul {
     }
 
     as_op!();
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct RoutedQ40MatMul {
+    pub input_mode: RoutedInputMode,
 }
 
 impl RoutedQ40MatMul {
@@ -589,10 +587,11 @@ impl EvalOp for RoutedQ40MatMul {
         // route_expert_ids [R]. Weights are in the linear layout consumed by
         // the Q40 kernels, unlike RoutedMatMul's canonical [E,K,N] contract.
         ensure!(inputs.len() == 4);
-        let input_t = inputs[0].cast_to::<f32>()?.into_owned();
-        let weights_t = inputs[1].clone().into_tensor();
-        let route_token_ids_t = inputs[2].cast_to::<i64>()?.into_owned();
-        let route_expert_ids_t = inputs[3].cast_to::<i64>()?.into_owned();
+        let (input, weights, token_ids, expert_ids) = args_4!(inputs);
+        let input_t = f32_input(input)?;
+        let weights_t = weights.into_tensor();
+        let route_token_ids_t = token_ids.cast_to::<i64>()?.into_owned();
+        let route_expert_ids_t = expert_ids.cast_to::<i64>()?.into_owned();
         let route_token_ids = plain_i64_slice(&route_token_ids_t, "route_token_ids")?;
         let route_expert_ids = plain_i64_slice(&route_expert_ids_t, "route_expert_ids")?;
         ensure!(route_token_ids.len() == route_expert_ids.len());
@@ -628,19 +627,15 @@ impl EvalOp for RoutedQ40MatMul {
         let mut state = PreparedRoutedMatMulState::default();
         let mut output = Tensor::zero_dt(f32::datum_type(), &[route_count, n_dim])?;
 
-        let input_plain = input_t.try_as_plain_ram()?;
-        let input = input_plain.as_slice::<f32>()?;
-        let base = input.as_ptr();
-        let item_size = f32::datum_type().size_of() as isize;
-        let row_stride_bytes = input_t.strides()[0] * item_size;
-        let k_stride_bytes = input_t.strides()[1] * item_size;
+        let row_stride = usize::try_from(input_t.strides()[0])?;
+        let k_stride = usize::try_from(input_t.strides()[1])?;
 
         for (eid, routes) in expert_routes.iter().enumerate() {
             if routes.is_empty() {
                 continue;
             }
 
-            let mut row_byte_offsets = Vec::with_capacity(routes.len());
+            let mut row_offsets = Vec::with_capacity(routes.len());
             for &route in routes {
                 let src = self.source_row(route, route_token_ids)?;
                 ensure!(
@@ -648,14 +643,15 @@ impl EvalOp for RoutedQ40MatMul {
                     "route {route} references input row {src}, but input has {} rows",
                     input_t.shape()[0]
                 );
-                row_byte_offsets.push(row_stride_bytes * src as isize);
+                row_offsets.push(row_stride * src);
             }
 
             let mut expert_output = Tensor::zero::<f32>(&[routes.len(), n_dim])?;
             run_prepared_routed_matmul(
                 &plan,
                 eid,
-                RoutedInputRows::explicit(base, row_byte_offsets, k_stride_bytes),
+                &input_t,
+                RoutedInputRows::explicit(row_offsets, k_stride),
                 &mut expert_output,
                 &mut state,
             )?;
@@ -763,7 +759,6 @@ impl TypedOp for RoutedCombine {
 
     as_op!();
 }
-
 impl OpStateFreeze for RoutedMatMulState {
     fn freeze(&self) -> Box<dyn FrozenOpState> {
         Box::new(self.clone())
