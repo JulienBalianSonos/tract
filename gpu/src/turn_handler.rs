@@ -68,33 +68,14 @@ impl TurnStateHandler for DeviceTurnHandler {
                 return Ok(());
             }
         };
-        // Arena observability: per-evaluation resolved size. Measured on
-        // qwen3.5-35B @11k context (2026-08-14) that a context-bucketed
-        // schema ladder would shave only ~0.4% off the peak arena (the
-        // largest transients sort first under any packing hint), so the
-        // single hint-built schema stays; this log is what measured it.
         if std::env::var("TRACT_GPU_LOG_ARENA").is_ok_and(|v| v == "1") {
             log::info!("device memory arena size: {} bytes", resolved_mem_schema.memory_size);
         }
-        // The storage cache lives in the session scratch slot, which survives
-        // clones of the owning SimpleState (the tract API clones the state
-        // between turns), so consecutive evaluations reuse one storage
-        // allocation.
-        let cache = match &turn.session_scratch {
-            Some(scratch) => scratch.clone(),
-            None => {
-                let cache: Arc<dyn std::any::Any + Send + Sync> =
-                    Arc::new(crate::memory::ArenaStorageCache::default());
-                turn.session_scratch = Some(cache.clone());
-                cache
-            }
-        };
-        let memory_pool = match cache.downcast_ref::<crate::memory::ArenaStorageCache>() {
-            Some(cache) => DeviceMemoryPool::from_schema_with_cache(resolved_mem_schema, cache)?,
-            // Someone else owns the scratch slot: run with a per-evaluation
-            // storage rather than fighting over it.
-            None => DeviceMemoryPool::from_schema(resolved_mem_schema)?,
-        };
+        if turn.shared.get::<crate::memory::ArenaStorageCache>().is_none() {
+            turn.shared.insert(crate::memory::ArenaStorageCache::default());
+        }
+        let cache = turn.shared.get::<crate::memory::ArenaStorageCache>().unwrap();
+        let memory_pool = DeviceMemoryPool::from_schema_with_cache(resolved_mem_schema, cache)?;
 
         turn.shared.insert(memory_pool);
         ensure!(turn.shared.get::<DeviceMemoryPool>().is_some());

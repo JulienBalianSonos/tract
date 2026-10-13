@@ -1,12 +1,12 @@
 //! Load-time autotune probe for the Metal scheduling knobs.
 //!
-//! ON BY DEFAULT: at the end of `Runtime::prepare`, while the tuning
+//! Disabled by default: at the end of `Runtime::prepare`, while the tuning
 //! profile is still in its probe window (see `crate::tuning`), the Metal
 //! runtime drives the freshly prepared plan with a synthetic decode-shaped
 //! workload, greedily sweeps the output-invariant scheduling knobs one at a
 //! time (the same candidate sets as the offline `tune_decode` sweep), and
-//! adopts winners IN-MEMORY for the process. Opt out with
-//! `TRACT_METAL_AUTOTUNE=0` or [`crate::tuning::set_autotune`]`(false)`;
+//! adopts winners in memory for the process. Opt in with
+//! `TRACT_METAL_AUTOTUNE=1` or [`crate::tuning::set_autotune`]`(true)`;
 //! opted out, nothing here runs and the profile freezes at its first read,
 //! exactly the historical behavior.
 //!

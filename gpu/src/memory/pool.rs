@@ -12,22 +12,12 @@ pub struct DeviceMemoryPool {
     resolved_schema: DeviceResolvedMemSchema,
 }
 
-/// Session-lived arena storage, cached in the session state across plan
-/// evaluations. Without it every evaluation allocates (and wires) a fresh
-/// multi-hundred-MB device buffer: over a chunked long-context prefill that
-/// is gigabytes of alloc/free churn, enough to push the process into the
-/// compressor and stall the next evaluations on driver re-residency.
+/// Arena storage retained across evaluations in `TurnState.shared`.
 ///
-/// Growth allocates 25% headroom so a prefill whose per-chunk arena grows
-/// with the past-context length reallocates a handful of times instead of
-/// once per chunk; when demand drops to half the cached size or less (the
-/// prefill -> decode transition), the storage shrinks back to the demand.
-///
-/// Safety: the cached storage is only reused when this cache holds the sole
-/// reference to it. Anything still alive from an earlier evaluation (an
-/// escaped output view, an in-flight command buffer, a concurrently running
-/// clone of the state) keeps its own `Arc`, which forces a fresh allocation
-/// here instead of clobbering memory someone still reads.
+/// Storage is reused only while the cache holds its sole reference. Escaped
+/// views and in-flight command buffers retain their own references and require
+/// a fresh allocation. Growth reserves 25% headroom; a demand below half the
+/// cached capacity releases that headroom.
 #[derive(Debug, Default)]
 pub struct ArenaStorageCache {
     #[allow(clippy::type_complexity)]

@@ -535,16 +535,13 @@ fn extract_sliding_window(model: &TypedModel, mask_outlet: OutletId) -> u32 {
             if v.len() == 1
                 && (v.datum_type().is_integer() || v.datum_type() == DatumType::TDim)
                 && feeds_comparison_within(model, id, 2)
+                && let Ok(x) = v.cast_to::<i64>()
+                && let Ok(x) = x.try_as_plain_ram()
+                && let Ok(x) = x.as_slice::<i64>()
             {
-                if let Ok(x) = v.cast_to::<i64>() {
-                    if let Ok(x) = x.try_as_plain_ram() {
-                        if let Ok(x) = x.as_slice::<i64>() {
-                            let w = x[0].unsigned_abs();
-                            if (2..=1_000_000).contains(&w) {
-                                candidates.push(w as u32);
-                            }
-                        }
-                    }
+                let w = x[0].unsigned_abs();
+                if (2..=1_000_000).contains(&w) {
+                    candidates.push(w as u32);
                 }
             }
         }

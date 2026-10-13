@@ -176,10 +176,33 @@ pub fn sync_inputs_if_required(
 
 /// Model property key declaring device-resident outputs: a rank-1 i64 tensor
 /// of model-output indexes, set through [`declare_device_resident_outputs`]
-/// (or `Model::declare_device_resident_outputs` in the rust embedding API).
+/// or the experimental `gpu_device_resident_outputs` JSON transform.
 /// Living on the model, it survives clones and serialization and reaches the
 /// GPU runtime transform without any side channel.
 pub const DEVICE_RESIDENT_OUTPUTS_PROPERTY: &str = "gpu.device_resident_outputs";
+
+/// Output indices retained on device by the experimental JSON transform.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct DeviceResidentOutputsConfig {
+    pub outputs: Vec<usize>,
+}
+
+#[derive(Debug)]
+struct DeviceResidentOutputsTransform(DeviceResidentOutputsConfig);
+
+impl tract_core::transform::ModelTransform for DeviceResidentOutputsTransform {
+    fn name(&self) -> StaticName {
+        "gpu_device_resident_outputs".into()
+    }
+
+    fn transform(&self, model: &mut TypedModel) -> TractResult<()> {
+        declare_device_resident_outputs(model, self.0.outputs.iter().copied())
+    }
+}
+
+register_model_transform!("gpu_device_resident_outputs", DeviceResidentOutputsConfig, |config| Ok(
+    Box::new(DeviceResidentOutputsTransform(config))
+));
 
 /// Declare model outputs the caller keeps device-resident: they are fed back
 /// verbatim as next-step inputs (recurrent/conv states, unfolded KV caches)
@@ -279,7 +302,7 @@ fn resolve_device_resident_output_ranges(
 }
 
 /// True when the caller declared this src-model output device-resident,
-/// either through [`declare_device_resident_outputs`] (the supported API) or
+/// through the experimental JSON transform, the internal declaration helper, or
 /// the `TRACT_GPU_DEVICE_RESIDENT_OUTPUTS` env var (escape hatch, wins over
 /// the declaration in both directions when set). Errors (instead of silently
 /// keeping the ToHost sync, which would strip the loop-closing behavior for
@@ -367,6 +390,26 @@ mod tests {
     fn test_declare_device_resident_outputs_validates_range() -> TractResult<()> {
         let mut m = model_with_outputs(2)?;
         assert!(declare_device_resident_outputs(&mut m, [2]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_device_resident_outputs_transform() -> TractResult<()> {
+        let mut model = model_with_outputs(3)?;
+        let config = serde::de::value::MapDeserializer::<_, serde::de::value::Error>::new(
+            [("outputs", serde::de::value::SeqDeserializer::new([0usize, 2].into_iter()))]
+                .into_iter(),
+        );
+        let mut erased = <dyn erased_serde::Deserializer>::erase(config);
+        let transform = tract_core::transform::get_transform_with_params(
+            "gpu_device_resident_outputs",
+            &mut erased,
+        )?
+        .context("device output transform must be registered")?;
+        transform.transform(&mut model)?;
+        assert!(is_device_resident_output_with_env(None, &model, model.outputs[0])?);
+        assert!(!is_device_resident_output_with_env(None, &model, model.outputs[1])?);
+        assert!(is_device_resident_output_with_env(None, &model, model.outputs[2])?);
         Ok(())
     }
 

@@ -5331,8 +5331,10 @@ dependencies = [
  "derive-new",
  "downcast-rs",
  "dyn-hash",
+ "erased-serde",
  "log",
  "num-traits",
+ "serde",
  "tract-core",
  "tract-pulse-opl",
  "tract-transformers",
@@ -5428,7 +5430,6 @@ dependencies = [
  "byteorder",
  "erased-serde",
  "flate2",
- "libc",
  "log",
  "minijinja",
  "nom 8.0.0",
@@ -5586,7 +5587,6 @@ dependencies = [
  "float-ord",
  "ndarray-npy",
  "rayon",
- "tract-metal",
  "tract-nnef",
 ]
 

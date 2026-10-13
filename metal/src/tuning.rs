@@ -1,53 +1,13 @@
-//! Device performance-tuning profile for the Metal runtime.
+//! Per-process scheduling defaults and overrides for the Metal runtime.
 //!
-//! Every Metal perf constant that used to be scattered as a hardcoded const
-//! plus an env escape hatch lives here, resolved into a single
-//! [`MetalTuning`] value per process. Resolution order (lowest to highest
-//! precedence):
+//! Environment overrides take precedence over application overrides and the
+//! baseline profile. The optional, budget-capped synthetic workload probe is
+//! disabled by default; enable it with `TRACT_METAL_AUTOTUNE=1` or
+//! [`set_autotune`]. Explicit overrides are excluded from its sweep.
 //!
-//! 1. [`MetalTuning::BASELINE`]: the hardcoded defaults. All of them were
-//!    tuned on an Apple M4 Pro, 48 GB, during the 2026-08 decode-perf
-//!    campaign (models: gpt-oss-20b q40 MoE, qwen3.5-35B-A3B q40 hybrid).
-//! 2. Device-informed derivations. None exist today: no baseline value has a
-//!    principled scaling rule across device classes yet. When one does, it
-//!    belongs in [`MetalTuning::resolve`], between the baseline and the
-//!    probe.
-//! 3. The load-time autotune probe (see `crate::autotune`): ON by default,
-//!    at the end of the Metal runtime's `prepare` it sweeps the
-//!    output-invariant scheduling knobs on a synthetic decode-shaped
-//!    workload (budget `TRACT_METAL_AUTOTUNE_BUDGET_MS`, default 10 s) and
-//!    adopts winners IN-MEMORY for the process; nothing is ever persisted.
-//!    Opt out with `TRACT_METAL_AUTOTUNE=0` or [`set_autotune`]`(false)`
-//!    (the env var wins over the hint; `TRACT_METAL_AUTOTUNE=1` forces it
-//!    back on).
-//! 4. Application overrides ([`set_tuning_overrides`]): programmatic hints an
-//!    embedding application registers before the first Metal dispatch. The
-//!    probe does not sweep knobs these pin.
-//! 5. Env overrides: the historical variable names, unchanged semantics,
-//!    still highest precedence. The probe does not sweep knobs these pin.
-//!
-//! # Profile lifecycle
-//!
-//! resolve -> optional probe window -> frozen. The first [`tuning`] read
-//! resolves the profile from layers 1, 2, 4 and 5. With the probe enabled
-//! the profile stays swappable (mutex-guarded, values coherent at every
-//! read) until the probe at `prepare` freezes it, winners included; with
-//! the probe opted out it freezes at that first read, the historical
-//! resolve-once behavior (env lookups on per-dispatch hot paths measurably
-//! show up in decode CPU profiles, hence a frozen static read). Once
-//! frozen, the profile is immutable: late [`set_tuning_overrides`] /
-//! [`set_autotune`] calls fail, late probe writes fail.
-//!
-//! Nothing here reads or writes any file: tuning state lives and dies with
-//! the process (some target systems have read-only disks).
-//!
-//! Debug/disable escape hatches (`TRACT_METAL_DISABLE_*`, `TRACT_METAL_LOG_*`,
-//! `TRACT_METAL_PROFILE_KERNELS`, `TRACT_METAL_GEMM_IMPL`, ...) are NOT part
-//! of the profile: they select code paths for debugging, they are not tuned
-//! quantities, and some are toggled mid-process by tests. Kernel-coupled
-//! constants (e.g. `GDN_CHUNK` = 64, `GDN_COL_BLOCK` = 16 in
-//! `gdn_recurrent.rs`) are also excluded: they must match `constant`
-//! declarations compiled into the shaders and cannot be tuned host-side.
+//! The first dispatch resolves the profile. Without a probe it freezes at
+//! resolution; with a probe it freezes after the sweep. Late overrides fail.
+//! Tuning state is process-local and is never persisted.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -319,21 +279,21 @@ fn probe_window() -> &'static Mutex<Option<MetalTuning>> {
     W.get_or_init(|| Mutex::new(None))
 }
 
-/// The autotune probe opt-OUT hint ([`set_autotune`]`(false)`); the probe is
-/// on by default. `TRACT_METAL_AUTOTUNE` (0/1), when set, wins over the hint.
-static AUTOTUNE_DISABLED_HINT: AtomicBool = AtomicBool::new(false);
+/// The autotune probe opt-in hint ([`set_autotune`]`(true)`); the probe is
+/// disabled by default. `TRACT_METAL_AUTOTUNE` (0/1), when set, wins over the hint.
+static AUTOTUNE_ENABLED_HINT: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn autotune_enabled() -> bool {
     static ENV: OnceLock<Option<bool>> = OnceLock::new();
     let env = *ENV.get_or_init(|| std::env::var("TRACT_METAL_AUTOTUNE").ok().map(|v| v != "0"));
-    autotune_enabled_from(env, AUTOTUNE_DISABLED_HINT.load(Ordering::Acquire))
+    autotune_enabled_from(env, AUTOTUNE_ENABLED_HINT.load(Ordering::Acquire))
 }
 
-/// Pure polarity rule, env pre-parsed for hermetic tests: default ON, the
-/// hint opts out, an explicit env value overrides the hint in both
+/// Pure polarity rule, env pre-parsed for hermetic tests: default disabled, the
+/// hint opts in, an explicit env value overrides the hint in both
 /// directions.
-fn autotune_enabled_from(env: Option<bool>, hint_disabled: bool) -> bool {
-    env.unwrap_or(!hint_disabled)
+fn autotune_enabled_from(env: Option<bool>, hint_enabled: bool) -> bool {
+    env.unwrap_or(hint_enabled)
 }
 
 /// The process-wide tuning profile. Lifecycle: the first call resolves (and
@@ -416,11 +376,11 @@ pub fn set_tuning_overrides(overrides: MetalTuningOverrides) -> TractResult<()> 
 }
 
 /// Enable or disable the load-time autotune probe for this process (see
-/// `crate::autotune`). The probe is ON by default: at the end of the Metal
+/// `crate::autotune`). The probe is disabled by default: at the end of the Metal
 /// runtime's `prepare`, a short budget-capped synthetic-workload probe
 /// sweeps the output-invariant scheduling knobs not already pinned by an
 /// env var or an app override, and adopts winners in-memory for the
-/// process. `set_autotune(false)` opts out; the `TRACT_METAL_AUTOTUNE` env
+/// process. `set_autotune(true)` opts in; the `TRACT_METAL_AUTOTUNE` env
 /// var (0/1), when set, wins over this hint. Same contract as
 /// [`set_tuning_overrides`]: must run before the first Metal dispatch of
 /// the process, fails once the profile has been resolved.
@@ -431,7 +391,7 @@ pub fn set_autotune(enable: bool) -> TractResult<()> {
              set_autotune must run before the first Metal dispatch"
         );
     }
-    AUTOTUNE_DISABLED_HINT.store(!enable, Ordering::Release);
+    AUTOTUNE_ENABLED_HINT.store(enable, Ordering::Release);
     Ok(())
 }
 
@@ -524,14 +484,14 @@ mod tests {
         assert_eq!(t.commit_every_n_dispatches, 0);
     }
 
-    /// Probe polarity: ON by default, hint opts out, explicit env wins over
+    /// Probe polarity: disabled by default, hint opts in, explicit env wins over
     /// the hint in both directions.
     #[test]
     fn autotune_polarity() {
-        assert!(autotune_enabled_from(None, false), "default must be enabled");
-        assert!(!autotune_enabled_from(None, true), "hint must opt out");
-        assert!(!autotune_enabled_from(Some(false), false), "env 0 must opt out");
-        assert!(autotune_enabled_from(Some(true), true), "env 1 must win over the hint");
+        assert!(!autotune_enabled_from(None, false), "default must be disabled");
+        assert!(autotune_enabled_from(None, true), "hint must opt in");
+        assert!(!autotune_enabled_from(Some(false), true), "env 0 must win over the hint");
+        assert!(autotune_enabled_from(Some(true), false), "env 1 must opt in");
     }
 
     /// Knobs supplied by env or app override are pinned: the probe must not

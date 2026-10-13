@@ -106,12 +106,10 @@ pub fn eval_device_mem_req_for_nodes(
     let mut end_by_node: Vec<Option<usize>> = vec![None; model.nodes().len()];
     let step_of: HashMap<usize, usize> =
         order.iter().enumerate().map(|(step, n)| (*n, step)).collect();
-    for n in order {
-        end_by_node[*n] = flush_lists
-            .iter()
-            .enumerate()
-            .find(|(_step, flush_list)| flush_list.contains(n))
-            .map(|it| usize::min(it.0 + 1, order.len()));
+    for (step, nodes) in flush_lists.iter().enumerate() {
+        for node in nodes {
+            end_by_node[*node].get_or_insert(usize::min(step + 1, order.len()));
+        }
     }
 
     // Aliasing ops may hand out views of their input's buffer: extend the
