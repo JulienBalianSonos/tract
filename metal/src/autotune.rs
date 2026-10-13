@@ -327,19 +327,19 @@ fn probe(plan: &Arc<TypedSimplePlan>, resolved: MetalTuning) -> TractResult<Meta
             // known buffer-pool/in-flight nondeterminism note above); either
             // way the candidate must not be adopted.
             let out = host_bytes(&run_once(&mut state, &inputs)?);
-            if let (Some(reference), Some(out)) = (&reference, &out) {
-                if let Some(ix) = first_mismatch(reference, out) {
-                    log::error!(
-                        "Metal load-time autotune: {}={candidate} CHANGED THE OUTPUTS \
+            if let (Some(reference), Some(out)) = (&reference, &out)
+                && let Some(ix) = first_mismatch(reference, out)
+            {
+                log::error!(
+                    "Metal load-time autotune: {}={candidate} CHANGED THE OUTPUTS \
                          (first mismatch: output #{ix}). Scheduling knobs must be \
                          output-invariant: this points at a scheduling-sensitive \
                          numerics bug in tract (known suspect: transient buffer \
                          recycling under low in-flight depth), report it. \
                          Candidate rejected.",
-                        knob.name
-                    );
-                    continue;
-                }
+                    knob.name
+                );
+                continue;
             }
             let score = measure(&mut state, &inputs, runs)?;
             log::info!(
@@ -394,15 +394,15 @@ fn probe(plan: &Arc<TypedSimplePlan>, resolved: MetalTuning) -> TractResult<Meta
     // was individually checked, greedily chained; this recheck is cheap).
     tuning::probe_set(current)?;
     let out = host_bytes(&run_once(&mut state, &inputs)?);
-    if let (Some(reference), Some(out)) = (&reference, &out) {
-        if let Some(ix) = first_mismatch(reference, out) {
-            log::error!(
-                "Metal load-time autotune: the adopted combination {adopted:?} CHANGED \
+    if let (Some(reference), Some(out)) = (&reference, &out)
+        && let Some(ix) = first_mismatch(reference, out)
+    {
+        log::error!(
+            "Metal load-time autotune: the adopted combination {adopted:?} CHANGED \
                  THE OUTPUTS (first mismatch: output #{ix}). This is a tract bug, \
                  report it. Keeping the resolved profile."
-            );
-            return Ok(resolved);
-        }
+        );
+        return Ok(resolved);
     }
     log::info!(
         "Metal load-time autotune: adopted {adopted:?} in-memory for this process \
@@ -536,10 +536,16 @@ mod tests {
         assert_eq!(inputs.len(), 2);
         assert_eq!(inputs[0].shape(), &[1]);
         assert_eq!(inputs[0].datum_type(), i64::datum_type());
-        assert_eq!(inputs[0].try_as_plain().unwrap().as_slice::<i64>().unwrap(), &[0]);
+        assert_eq!(inputs[0].try_as_plain_ram().unwrap().as_slice::<i64>().unwrap(), &[0]);
         assert_eq!(inputs[1].shape(), &[1, 4, 1, 8]);
         assert!(
-            inputs[1].try_as_plain().unwrap().as_slice::<f32>().unwrap().iter().all(|&v| v == 0.0)
+            inputs[1]
+                .try_as_plain_ram()
+                .unwrap()
+                .as_slice::<f32>()
+                .unwrap()
+                .iter()
+                .all(|&v| v == 0.0)
         );
     }
 

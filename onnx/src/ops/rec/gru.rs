@@ -50,6 +50,35 @@ impl WireBody for GRU {
         false
     }
 
+    fn fused_sequence_op(
+        &self,
+        hidden: usize,
+        has_bias: bool,
+        chunk: isize,
+        seq_len: usize,
+        emit_y: bool,
+    ) -> Option<Box<dyn TypedOp>> {
+        // GruSeq's loop body IS GruEpilogue, so the fused form is valid exactly
+        // where the epilogue is.
+        (seq_len >= 4
+            && self.linear_before_reset
+            && is_element_wise::<tract_hir::tract_core::ops::nn::Sigmoid>(self.f.as_ref())
+            && is_element_wise::<tract_hir::tract_core::ops::math::Tanh>(self.g.as_ref()))
+        .then(|| {
+            Box::new(tract_hir::tract_core::ops::gru_seq::GruSeq {
+                hidden,
+                has_bias,
+                chunk,
+                // The Scan this replaces is built with reset_every_turn false, so
+                // the fused op starts from the same contract.
+                reset_every_turn: false,
+                emit_y,
+                projected: false,
+                packed_r: None,
+            }) as Box<dyn TypedOp>
+        })
+    }
+
     #[allow(non_snake_case)]
     fn wire_body(&self, prefix: &str, body: &mut TypedModel) -> TractResult<()> {
         use tract_hir::ops::{array, math};

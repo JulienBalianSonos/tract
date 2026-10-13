@@ -58,6 +58,7 @@ fn next_nodes<'a>(model: &'a TypedModel, node: &TypedNode) -> Option<TVec<&'a Ty
 /// inner op whose eval may still return a view). Missing an aliasing op
 /// here silently corrupts activations (the arena recycles a region a live
 /// view still reads), so wrapper types MUST register.
+#[allow(clippy::type_complexity)]
 static EXTRA_ALIAS_CHECKS: std::sync::RwLock<Vec<fn(&TypedNode) -> bool>> =
     std::sync::RwLock::new(Vec::new());
 
@@ -196,6 +197,24 @@ pub fn eval_device_mem_req_for_nodes(
         }
     }
 
+    // Walked backwards so a chain of forwarders carries the extension down to
+    // the region it all aliases.
+    for n in order.iter().rev() {
+        let Some(ix) = model.node(*n).op.forwards_input() else { continue };
+        let Some(end) = scoped_nodes
+            .iter()
+            .filter(|req| req.outlet_id.node == *n)
+            .map(|req| req.lifetime.end)
+            .max()
+        else {
+            continue;
+        };
+        let src = model.node(*n).inputs[ix];
+        for req in scoped_nodes.iter_mut().filter(|req| req.outlet_id == src) {
+            req.lifetime.end = req.lifetime.end.max(end);
+        }
+    }
+
     Ok(scoped_nodes)
 }
 
@@ -324,18 +343,22 @@ impl DeviceMemSchema {
     /// Evaluate peak memory size for given symbols. The return value is lower or equal to the memory
     /// size of the schema. The difference between peak memory size and memory size represents the
     /// memory fragmentation introduced by the schema.
+    /// Per-step arena occupancy as symbolic expressions; the peak for a given
+    /// symbol assignment is the max of these evaluated. These do not depend on
+    /// symbol values, so a caller sweeping many assignments should compute them
+    /// once rather than re-summing the symbolic terms for every point.
+    pub fn peak_memory_terms(&self) -> Vec<TDim> {
+        self.by_steps
+            .iter()
+            .map(|active_nodes| active_nodes.iter().flatten().map(|it| it.mem_size.clone()).sum())
+            .collect()
+    }
+
     pub fn eval_peak_memory_size(&self, symbols: &SymbolValues) -> TractResult<i64> {
         Ok(self
-            .by_steps
+            .peak_memory_terms()
             .iter()
-            .map(|active_nodes| {
-                active_nodes
-                    .iter()
-                    .flatten()
-                    .map(|it| it.mem_size.clone())
-                    .sum::<TDim>()
-                    .eval_to_i64(symbols)
-            })
+            .map(|term| term.eval_to_i64(symbols))
             .collect::<TractResult<Vec<_>>>()?
             .into_iter()
             .max()

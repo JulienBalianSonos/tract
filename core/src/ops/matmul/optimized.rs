@@ -429,16 +429,28 @@ impl Op for OptMatMul {
 /// picked kernel cannot use the one already there -- and `stores` memoizes the
 /// trivial path's output-store descriptors per node, since those depend on that
 /// node's micro-ops. Thread-local, so nothing here has to be `Send`; a session's
-/// entry goes when the plan calls [`EvalOp::drop_session`].
+/// entry goes when the plan calls [`EvalOp::drop_session`], and its kernel buffer is
+/// kept to start the thread's next session, whose first op would otherwise allocate one.
 #[derive(Default)]
 struct MmmScratch {
     space: Option<Box<dyn tract_linalg::mmm::ScratchSpace>>,
-    stores: HashMap<usize, TVec<Option<OutputStore>>>,
+    stores: HashMap<usize, StoreMemo>,
+}
+
+/// The [`OutputStore`]s of one node, and the output shape and kernel they were
+/// built for: their strides come from that shape, so a turn of another shape
+/// -- a batch axis of another extent, say -- needs its own.
+struct StoreMemo {
+    c_shape: TVec<usize>,
+    mode: usize,
+    stores: TVec<Option<OutputStore>>,
 }
 
 thread_local! {
     static MMM_SCRATCH: std::cell::RefCell<HashMap<SessionId, MmmScratch>> =
         std::cell::RefCell::new(HashMap::new());
+    static SPARE_SPACE: std::cell::RefCell<Option<Box<dyn tract_linalg::mmm::ScratchSpace>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 impl EvalOp for OptMatMul {
@@ -446,12 +458,19 @@ impl EvalOp for OptMatMul {
 
     fn eval(&self, ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         MMM_SCRATCH.with_borrow_mut(|per_session| {
-            self.eval_with_scratch(ctx, inputs, per_session.entry(ctx.session).or_default())
+            let scratch = per_session.entry(ctx.session).or_insert_with(|| MmmScratch {
+                space: SPARE_SPACE.take(),
+                stores: HashMap::new(),
+            });
+            self.eval_with_scratch(ctx, inputs, scratch)
         })
     }
 
     fn drop_session(&self, session: SessionId, _node_id: usize) {
-        MMM_SCRATCH.with_borrow_mut(|per_session| per_session.remove(&session));
+        let space = MMM_SCRATCH.with_borrow_mut(|per_session| per_session.remove(&session));
+        if let Some(space) = space.and_then(|scratch| scratch.space) {
+            SPARE_SPACE.set(Some(space));
+        }
     }
 }
 
@@ -475,19 +494,26 @@ impl OptMatMul {
             }
             let scratch = space.as_mut().unwrap();
             if self.trivial_path {
-                let stores = stores.entry(ctx.node_id).or_insert_with(|| {
-                    self.micro_ops
+                let memo = || StoreMemo {
+                    c_shape: c.shape().into(),
+                    mode,
+                    stores: self
+                        .micro_ops
                         .iter()
                         .map(|o| match o {
                             ProtoFusedSpec::Store(oss) => Some(oss[mode].wrap(&c.view())),
                             _ => None,
                         })
-                        .collect()
-                });
+                        .collect(),
+                };
+                let stores = stores.entry(ctx.node_id).or_insert_with(memo);
+                if stores.c_shape.as_slice() != c.shape() || stores.mode != mode {
+                    *stores = memo();
+                }
                 let uops: TVec<FusedSpec> = self
                     .micro_ops
                     .iter()
-                    .zip(stores.iter())
+                    .zip(stores.stores.iter())
                     .map(|(o, store)| o.resolve_trivial_cached(&inputs, &mut c, mmm, mode, *store))
                     .collect();
                 mmm.run_with_scratch_space(m, n, scratch.as_mut(), &uops)?;

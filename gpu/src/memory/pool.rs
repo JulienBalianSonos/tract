@@ -1,7 +1,7 @@
 use crate::device::get_context;
 use crate::memory::DeviceResolvedMemSchema;
-use crate::tensor::DeviceArenaView;
 use crate::tensor::DeviceTensor;
+use crate::tensor::DeviceView;
 use crate::tensor::OwnedDeviceTensor;
 
 use tract_core::internal::*;
@@ -30,6 +30,7 @@ pub struct DeviceMemoryPool {
 /// here instead of clobbering memory someone still reads.
 #[derive(Debug, Default)]
 pub struct ArenaStorageCache {
+    #[allow(clippy::type_complexity)]
     storage: std::sync::Mutex<Option<(Arc<Box<dyn OwnedDeviceTensor>>, usize)>>,
 }
 
@@ -103,29 +104,13 @@ impl DeviceMemoryPool {
         dt: DatumType,
         shape: &[usize],
     ) -> TractResult<DeviceTensor> {
-        self.resolved_schema.offsets_by_node[node_id]
-            .as_ref()
-            .map(|offsets| {
-                ensure!(
-                    offsets.len() == 1 && offsets[0].len() == 1,
-                    "'tensor_for_node' is for mono-output nodes only"
-                );
-                Ok(DeviceArenaView {
-                    arena: Arc::clone(&self.storage),
-                    dt,
-                    len: shape.iter().product(),
-                    shape: shape.into(),
-                    strides: Tensor::natural_strides(shape),
-                    offset_bytes: offsets[0][0],
-                    exotic_fact: None,
-                }
-                .into())
-            })
-            .unwrap_or_else(|| DeviceTensor::uninitialized_dt(dt, shape))
+        if let Some(offsets) = self.resolved_schema.offsets_by_node[node_id].as_ref() {
+            ensure!(offsets.len() == 1, "'tensor_for_node' is for mono-output nodes only");
+        }
+        self.tensor_for_node_output(node_id, 0, dt, shape)
     }
 
-    /// Per-output variant of [`Self::tensor_for_node`] for multi-output nodes:
-    /// each output slot has its own arena region in the schema.
+    /// Allocate one output slot of a multi-output node from its arena region.
     pub fn tensor_for_node_output(
         &self,
         node_id: usize,
@@ -134,18 +119,16 @@ impl DeviceMemoryPool {
         shape: &[usize],
     ) -> TractResult<DeviceTensor> {
         match self.resolved_schema.offsets_by_node[node_id].as_ref() {
-            Some(offsets) if slot < offsets.len() && offsets[slot].len() == 1 => {
-                Ok(DeviceArenaView {
-                    arena: Arc::clone(&self.storage),
-                    dt,
-                    len: shape.iter().product(),
-                    shape: shape.into(),
-                    strides: Tensor::natural_strides(shape),
-                    offset_bytes: offsets[slot][0],
-                    exotic_fact: None,
-                }
-                .into())
+            Some(offsets) if slot < offsets.len() && offsets[slot].len() == 1 => Ok(DeviceView {
+                buffer: Arc::clone(&self.storage),
+                dt,
+                len: shape.iter().product(),
+                shape: shape.into(),
+                strides: Tensor::natural_strides(shape),
+                offset_bytes: offsets[slot][0],
+                exotic_fact: None,
             }
+            .into()),
             _ => DeviceTensor::uninitialized_dt(dt, shape),
         }
     }
@@ -162,8 +145,8 @@ impl DeviceMemoryPool {
                     offsets.len() == 1 && offsets[0].len() == 2,
                     "'scalar_exotic_tensor_for_node' is for mono-output nodes only"
                 );
-                Ok(DeviceArenaView {
-                    arena: Arc::clone(&self.storage),
+                Ok(DeviceView {
+                    buffer: Arc::clone(&self.storage),
                     dt,
                     len: 1,
                     shape: tvec!(),

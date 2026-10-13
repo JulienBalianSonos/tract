@@ -83,7 +83,7 @@ enum RouteGateMode : uint {
         }
         // Order-preserving uint key: max score via simd_max, then the
         // smallest expert id among the lanes holding that score.
-        const uint b = as_type<uint>(lbest);
+        const uint b = as_type<uint>(lbest == 0.0f ? 0.0f : lbest);
         const uint mono = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
         const uint win_mono = simd_max(mono);
         const uint cand = (mono == win_mono) ? (lbest_r * 32 + lane) : 0xFFFFFFFFu;

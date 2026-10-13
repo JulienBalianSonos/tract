@@ -39,6 +39,14 @@ fn main() {
     eprintln!("=== int8 matvec (n=1): wasm_i32_4x4 vs generic_i32_4x1 ({target}) ===");
     bench_i8_matvec::run();
 
+    eprintln!();
+    eprintln!("=== ln/exp: wasm simd128 vs generic scalar ({target}) ===");
+    bench_ln_exp::run();
+
+    eprintln!();
+    eprintln!("=== depthwise: wasm simd128 kernel vs the scalar walk ({target}) ===");
+    bench_depthwise::run();
+
     #[cfg(target_feature = "relaxed-simd")]
     {
         eprintln!();
@@ -698,6 +706,154 @@ mod bench_activations {
         bench("hidden=256", 256, 5_000);
         bench("hidden=512", 512, 3_000);
         bench("hidden=1024", 1024, 2_000);
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+mod bench_ln_exp {
+    //! Microbench: the WASM SIMD ln and exp kernels against the generic scalar
+    //! fallback, whose per-element fit is what a log-mel featurizer pays.
+    //!
+    //! The buffer is restored from a source before every call: run in place over
+    //! and over, ln walks its own output into NaN and exp into infinity within a
+    //! few iterations, and the timing then belongs to the special paths. The
+    //! restore is timed on its own and taken off both readings.
+
+    use std::time::Instant;
+    use tract_linalg::element_wise::ElementWiseKer;
+
+    fn ns_per_call<K: ElementWiseKer<f32>>(src: &[f32], buf: &mut [f32], iters: usize) -> f64 {
+        for _ in 0..50 {
+            buf.copy_from_slice(src);
+            K::run(buf, ());
+        }
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            buf.copy_from_slice(src);
+            K::run(buf, ());
+        }
+        let with_restore = t0.elapsed().as_secs_f64() / iters as f64 * 1e9;
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            buf.copy_from_slice(src);
+            std::hint::black_box(&buf);
+        }
+        with_restore - t0.elapsed().as_secs_f64() / iters as f64 * 1e9
+    }
+
+    fn bench(label: &str, n: usize, iters: usize) {
+        let positive: Vec<f32> = (0..n).map(|i| (i % 37) as f32 * 0.7 + 0.1).collect();
+        let centered: Vec<f32> = (0..n).map(|i| ((i % 37) as f32 - 18.0) * 0.5).collect();
+        let mut buf = vec![0f32; n];
+
+        let scalar_ln =
+            ns_per_call::<tract_linalg::generic::ln::generic_ln_f32_4n>(&positive, &mut buf, iters);
+        let simd_ln =
+            ns_per_call::<tract_linalg::wasm::wasm_ln_f32_16n>(&positive, &mut buf, iters);
+        let scalar_exp = ns_per_call::<tract_linalg::generic::exp::generic_exp_f32_4n>(
+            &centered, &mut buf, iters,
+        );
+        let simd_exp =
+            ns_per_call::<tract_linalg::wasm::wasm_exp_f32_16n>(&centered, &mut buf, iters);
+
+        eprintln!(
+            "{label} n={n} iters={iters}: \
+             ln scalar={scalar_ln:.0} ns simd={simd_ln:.0} ns ({:.2}x); \
+             exp scalar={scalar_exp:.0} ns simd={simd_exp:.0} ns ({:.2}x)",
+            scalar_ln / simd_ln,
+            scalar_exp / simd_exp,
+        );
+    }
+
+    pub fn run() {
+        bench("frame=256", 256, 5_000);
+        bench("frame=512", 512, 3_000);
+        bench("frame=1024", 1024, 2_000);
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+mod bench_depthwise {
+    //! Microbench: the WASM SIMD depthwise kernel against the scalar walk the op
+    //! runs when `depthwise_w_f32` is absent. Contiguous input (in_stride 1), the
+    //! only stride this kernel takes, over the tap counts a 3x3 / 5x5 / 7x7
+    //! convolution reaches it with.
+
+    use std::time::Instant;
+    use tract_linalg::routines::depthwise_w_f32;
+
+    fn scalar_walk(
+        input: &[f32],
+        center: usize,
+        output: &mut [f32],
+        taps: &[f32],
+        offsets: &[isize],
+        bias: f32,
+    ) {
+        for (i, out) in output.iter_mut().enumerate() {
+            let mut sum = bias;
+            for (tap, offset) in taps.iter().zip(offsets) {
+                sum += tap * input[(center as isize + offset + i as isize) as usize];
+            }
+            *out = sum;
+        }
+    }
+
+    fn bench(label: &str, taps_n: usize, len: usize, iters: usize) {
+        let Some(ker) = depthwise_w_f32() else {
+            eprintln!("{label}: no depthwise kernel on this host, skipping");
+            return;
+        };
+        let taps: Vec<f32> = (0..taps_n).map(|t| (t as f32 * 0.7).sin()).collect();
+        let offsets: Vec<isize> = (0..taps_n as isize).map(|t| t - taps_n as isize / 2).collect();
+        let bias = 0.25f32;
+        let center = taps_n;
+        let input: Vec<f32> =
+            (0..center + len - 1 + center).map(|i| (i as f32 * 0.11).cos()).collect();
+        let mut out = vec![0f32; len];
+
+        for _ in 0..20 {
+            unsafe {
+                ker(input.as_ptr().add(center), out.as_mut_ptr(), &taps, &offsets, bias, len, 1)
+            };
+        }
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            unsafe {
+                ker(input.as_ptr().add(center), out.as_mut_ptr(), &taps, &offsets, bias, len, 1)
+            };
+            std::hint::black_box(&out);
+        }
+        let simd = t0.elapsed().as_secs_f64() / iters as f64 * 1e9;
+
+        for _ in 0..20 {
+            scalar_walk(&input, center, &mut out, &taps, &offsets, bias);
+        }
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            scalar_walk(&input, center, &mut out, &taps, &offsets, bias);
+            std::hint::black_box(&out);
+        }
+        let scalar = t0.elapsed().as_secs_f64() / iters as f64 * 1e9;
+
+        let points = len * taps_n;
+        eprintln!(
+            "{label} taps={taps_n} len={len}: scalar={scalar:.0} ns simd={simd:.0} ns \
+             ({:.2}x, {:.2} vs {:.2} GFMA/s)",
+            scalar / simd,
+            points as f64 / scalar,
+            points as f64 / simd,
+        );
+    }
+
+    pub fn run() {
+        for (label, taps_n) in
+            [("1x1", 1usize), ("1x3", 3), ("2x2", 4), ("3x3", 9), ("5x5", 25), ("7x7", 49)]
+        {
+            for len in [100usize, 256, 481, 1024] {
+                bench(label, taps_n, len, 2_000);
+            }
+        }
     }
 }
 

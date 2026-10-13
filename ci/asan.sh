@@ -1,0 +1,42 @@
+#!/bin/sh
+
+set -ex
+
+# RUSTFLAGS=-Zsanitizer=address cargo +nightly test -Zbuild-std --target $(rustc -vV | sed -n 's|host: ||p')
+
+TARGET=$(rustc -vV | sed -n 's|host: ||p')
+
+rustup toolchain add nightly
+rustup component add rust-src --toolchain nightly-$TARGET
+
+export RUSTFLAGS=-Zsanitizer=address
+export RUSTUP_TOOLCHAIN=nightly
+export RUST_VERSION=nightly
+export CARGO_EXTRA="--target $TARGET --profile opt-test"
+
+# asan's global redzones break the __DATA,__mod_init_func entries `inventory`
+# writes: ld-prime rejects them with "initializer pointer has no target", and
+# the classic linker takes them and silently registers nothing, which leaves
+# every registry empty and the tests reading them vacuously green. Leave
+# globals uninstrumented; heap and stack checking are unaffected.
+if [ $(uname) == "Darwin" ]
+then
+    RUSTFLAGS="$RUSTFLAGS -Cllvm-args=-asan-globals=0"
+fi
+export RUSTDOCFLAGS=$RUSTFLAGS
+
+cargo -q test -q -p tract-linalg $CARGO_EXTRA
+
+# inventory, asan and macos liner are not playing nice, so we have to stop there 
+if [ $(uname) == "Darwin" ]
+then
+    exit 0
+fi
+
+./ci/regular-tests.sh
+if [ -n "$CI" ]
+then
+    cargo clean
+fi
+
+./ci/cli-tests.sh

@@ -16,6 +16,7 @@ fn gate_mode_code(gate: &GateMode) -> u32 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn dispatch_route_topk_f32(
     stream: &MetalStream,
     x: &DeviceTensor,
@@ -96,25 +97,18 @@ pub fn dispatch_route_topk_f32(
     // prefill chunk, exactly what the graph-level cast used to do. The
     // predicate mirrors GgmlGemm::dispatch_eval's gemv-vs-gemm choice.
     let d = d_model as usize;
-    let takes_gemm_path = d % 32 == 0 && d >= 64 && token_count as usize > 4;
+    let takes_gemm_path = d.is_multiple_of(32) && d >= 64 && token_count as usize > 4;
     if x2.datum_type() == DatumType::F16 && takes_gemm_path {
-        let x32 = unsafe {
-            DeviceTensor::uninitialized_dt(
-                f32::datum_type(),
-                &[token_count as usize, d],
-            )?
-        };
+        let x32 = DeviceTensor::uninitialized_dt(f32::datum_type(), &[token_count as usize, d])?;
         crate::kernels::array::Cast.dispatch_eval(stream, &x2, &x32)?;
         stream.retain_tensor(&x32);
         x2 = x32;
     }
     let wg2 = wg.reshaped(tvec![num_experts as usize, d_model as usize])?;
-    let scores = unsafe {
-        DeviceTensor::uninitialized_dt(
-            f32::datum_type(),
-            &[token_count as usize, num_experts as usize],
-        )?
-    };
+    let scores = DeviceTensor::uninitialized_dt(
+        f32::datum_type(),
+        &[token_count as usize, num_experts as usize],
+    )?;
     GemmImpl::<GgmlGemm>::new(false, true).dispatch_eval(stream, &x2, &wg2, &scores)?;
 
     // Phase 2: tiny per-token top-k over the score rows, one simdgroup per
@@ -168,8 +162,7 @@ pub fn dispatch_clamped_swiglu_f32(
 
     let len = gate.len() as u32;
     let pipeline = stream.load_pipeline(LibraryName::MoeOps, "clamped_swiglu_f32")?;
-    let group_width =
-        (pipeline.max_total_threads_per_threadgroup() as u64).min(256).min(len as u64).max(1);
+    let group_width = pipeline.max_total_threads_per_threadgroup().min(256).min(len as u64).max(1);
     let grid_width = (len as u64).div_ceil(group_width);
     let command_buffer = stream.command_buffer();
     command_buffer.encode(|encoder| {
@@ -223,7 +216,7 @@ pub fn dispatch_routed_combine_f32(
     );
 
     // Only trust the token-major fast path when the counts line up.
-    let rpt = if routes_per_token > 0 && token_count * routes_per_token == route_count as usize {
+    let rpt = if routes_per_token > 0 && token_count * routes_per_token == route_count {
         routes_per_token as u32
     } else {
         0
@@ -233,8 +226,7 @@ pub fn dispatch_routed_combine_f32(
     let d_model = d_model as u32;
     let pipeline = stream.load_pipeline(LibraryName::MoeOps, "routed_combine_f32")?;
     let total = output.len() as u64;
-    let group_width =
-        (pipeline.max_total_threads_per_threadgroup() as u64).min(256).min(total).max(1);
+    let group_width = pipeline.max_total_threads_per_threadgroup().min(256).min(total).max(1);
     let grid_width = total.div_ceil(group_width);
     let command_buffer = stream.command_buffer();
     command_buffer.encode(|encoder| {
@@ -285,7 +277,7 @@ pub fn dispatch_routed_bias_add_f32(
         encoder.set_metal_tensor(3, out, metal::MTLResourceUsage::Write);
         encoder.set_slice(4, &[route_count as u32]);
         encoder.set_slice(5, &[n as u32]);
-        let group_width = total.min(256).max(1);
+        let group_width = total.clamp(1, 256);
         let grid = MTLSize { width: total.div_ceil(group_width), height: 1, depth: 1 };
         let group = MTLSize { width: group_width, height: 1, depth: 1 };
         encoder.dispatch_thread_groups(grid, group);

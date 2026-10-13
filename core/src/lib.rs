@@ -74,12 +74,17 @@ pub mod macros;
 pub mod ops;
 
 pub mod axes;
+pub mod batchify;
 pub mod broadcast;
+#[cfg(feature = "deploy")]
+pub mod deploy;
 pub mod floats;
 pub mod framework;
+pub mod lanes;
 pub mod model;
 pub mod optim;
 pub mod plan;
+pub mod unbatched;
 #[macro_use]
 pub mod runtime;
 #[macro_use]
@@ -110,6 +115,7 @@ pub mod prelude {
 pub mod internal {
     pub extern crate inventory;
     pub use crate::axes::{AxesMapping, Axis};
+    pub use crate::lanes::{LaneTable, LanedRunnable, LanedStateHandle};
     pub use crate::late_bind::*;
     pub use crate::ops::change_axes::*;
     pub use crate::ops::element_wise::ElementWiseMiniOp;

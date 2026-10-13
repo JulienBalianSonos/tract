@@ -43,11 +43,8 @@ impl EvalOp for MetalRoutedBiasAdd {
             .to_device_tensor()
             .with_context(|| format!("expert ids are not a Metal tensor: {expert_ids_raw:?}"))?;
 
-        let output = tract_gpu::turn_handler::make_tensor_for_node(
-            ctx,
-            f32::datum_type(),
-            value.shape(),
-        )?;
+        let output =
+            tract_gpu::turn_handler::make_tensor_for_node(ctx, f32::datum_type(), value.shape())?;
 
         crate::with_metal_stream(|stream| {
             crate::kernels::moe::dispatch_routed_bias_add_f32(

@@ -52,9 +52,15 @@ fn family(factory: &RoutineFactory) -> (u8, &'static str) {
         }
         RoutineFactory::F32Reduce(_) | RoutineFactory::F16Reduce(_) => (2, "reduction"),
         RoutineFactory::F32MapReduce(_) => (3, "map-reduction"),
-        RoutineFactory::RmsNormF32 { .. } => (4, "fused row-wise"),
+        RoutineFactory::RmsNormF32 { .. } | RoutineFactory::SoftmaxRowsF32 { .. } => {
+            (4, "fused row-wise")
+        }
         RoutineFactory::LutU8 { .. } => (5, "look-up table"),
         RoutineFactory::BinF32 { .. } | RoutineFactory::BinF16 { .. } => (6, "binary"),
+        RoutineFactory::DepthwiseWF32 { .. } | RoutineFactory::DepthwiseCF32 { .. } => {
+            (7, "depthwise")
+        }
+        RoutineFactory::ConvW4F32 { .. } => (8, "convolution"),
     }
 }
 

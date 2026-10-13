@@ -19,6 +19,11 @@ DeconvSum      (N) (G) O   H'  W'
 
 // f32, ndarray::indices in order
 
+/// Scatters a deconvolution's `(N) C HkWk HW` gemm into its output and adds the bias.
+///
+/// The bias has the output's rank and broadcasts to it, unit or full on each axis: a
+/// scalar or per-channel bias is never materialised to the output shape when every output
+/// pixel receives exactly one tap.
 #[derive(Clone, Debug, new, Hash, PartialEq, Eq)]
 pub struct DeconvSum {
     pub pool_spec: PoolSpec,
@@ -64,7 +69,6 @@ impl DeconvSum {
             &self.pool_spec.strides(),
             &self.adjustments,
         )?;
-        let mut tensor = bias.into_tensor();
         let hw = *gemm.shape().last().unwrap();
         let n = *output_shape.n().unwrap_or(&1);
         let n_o_hkwk_hw = gemm.into_tensor().into_shape(&[
@@ -73,17 +77,43 @@ impl DeconvSum {
             self.pool_spec.kernel_shape.iter().product(),
             hw,
         ])?;
-        if !self.pool_spec.data_format.has_n() {
-            tensor.insert_axis(0)?;
-        }
-        eval(
-            self,
-            &input_shape,
-            &output_shape,
-            &spatial_output_details,
-            &n_o_hkwk_hw,
-            &mut tensor,
-        )?;
+        let per_channel_bias = bias.len() == 1 || bias.len() == *output_shape.c();
+        let geometry =
+            non_overlapping_geometry(self, &input_shape, &output_shape, &spatial_output_details);
+        let mut tensor = if let (Some((input_hw, strides)), true) = (geometry, per_channel_bias) {
+            let mut tensor = Tensor::zero_dt(n_o_hkwk_hw.datum_type(), &output_shape.shape)?;
+            if !self.pool_spec.data_format.has_n() {
+                tensor.insert_axis(0)?;
+            }
+            eval_non_overlapping(
+                &n_o_hkwk_hw,
+                &bias,
+                &mut tensor,
+                *output_shape.c(),
+                input_hw,
+                strides,
+                self.pool_spec.data_format.c_is_last(),
+            )?;
+            tensor
+        } else {
+            let mut tensor = if bias.shape() == &*output_shape.shape {
+                bias.into_tensor()
+            } else {
+                bias.broadcast_to_shape(&output_shape.shape)?
+            };
+            if !self.pool_spec.data_format.has_n() {
+                tensor.insert_axis(0)?;
+            }
+            eval(
+                self,
+                &input_shape,
+                &output_shape,
+                &spatial_output_details,
+                &n_o_hkwk_hw,
+                &mut tensor,
+            )?;
+            tensor
+        };
         if !self.pool_spec.data_format.has_n() {
             tensor.remove_axis(0)?;
         }
@@ -95,7 +125,13 @@ impl TypedOp for DeconvSum {
     fn output_facts(&self, inputs: &[&TypedFact]) -> TractResult<TVec<TypedFact>> {
         ensure!(inputs.len() == 2);
         let shape = super::output_shape(&self.pool_spec, &self.input_shape, &self.adjustments)?;
-        ensure!(*inputs[1].shape == *shape);
+        ensure!(inputs[1].rank() == shape.len());
+        ensure!(
+            inputs[1].shape.iter().zip(shape.iter()).all(|(b, o)| b.is_one() || b == o),
+            "DeconvSum bias {:?} does not broadcast to output {:?}",
+            inputs[1].shape,
+            shape
+        );
         Ok(tvec!(inputs[0].datum_type.fact(shape)))
     }
 
@@ -115,6 +151,132 @@ impl TypedOp for DeconvSum {
     }
 
     as_op!();
+}
+
+/// The input extents and strides, rank 1 padded to rank 2 with a leading unit axis, of a
+/// deconvolution whose kernel taps never share an output pixel: on every spatial axis the
+/// kernel extent equals the stride, with no dilation, no leading padding and an output
+/// exactly `input * stride` long. Each output pixel is then one gemm value plus bias.
+fn non_overlapping_geometry(
+    op: &DeconvSum,
+    input_shape: &DataShape,
+    output_shape: &DataShape,
+    spatial_output_details: &[ComputedPaddedDim<usize>],
+) -> Option<([usize; 2], [usize; 2])> {
+    let rank = input_shape.hw_rank();
+    if rank == 0 || rank > 2 {
+        return None;
+    }
+    let strides = op.pool_spec.strides();
+    let dilations = op.pool_spec.dilations();
+    let input_hw = input_shape.hw_dims();
+    for ax in 0..rank {
+        if op.pool_spec.kernel_shape[ax] != strides[ax]
+            || dilations[ax] != 1
+            || spatial_output_details[ax].pad_before != 0
+            || output_shape.hw_dims()[ax] != input_hw[ax] * strides[ax]
+        {
+            return None;
+        }
+    }
+    Some(if rank == 1 {
+        ([1, input_hw[0]], [1, strides[0]])
+    } else {
+        ([input_hw[0], input_hw[1]], [strides[0], strides[1]])
+    })
+}
+
+/// Write the output of a deconvolution [`non_overlapping_geometry`] accepts from its
+/// `N C HkWk HW` gemm and a bias of one value or one per channel, each pixel once.
+/// `output` carries the N axis and is fully overwritten.
+fn eval_non_overlapping(
+    gemm: &Tensor,
+    bias: &Tensor,
+    output: &mut Tensor,
+    channels: usize,
+    input_hw: [usize; 2],
+    strides: [usize; 2],
+    c_is_last: bool,
+) -> TractResult<()> {
+    ensure!(bias.len() == 1 || bias.len() == channels);
+    let dt = output.datum_type();
+    dispatch_floatlike!(write_non_overlapping(dt)(
+        gemm,
+        bias,
+        output,
+        channels,
+        input_hw,
+        strides,
+        c_is_last,
+        |a, b| a + b
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_non_overlapping<T: Datum + Copy>(
+    gemm: &Tensor,
+    bias: &Tensor,
+    output: &mut Tensor,
+    channels: usize,
+    input_hw: [usize; 2],
+    strides: [usize; 2],
+    c_is_last: bool,
+    add: impl Fn(T, T) -> T + Copy,
+) -> TractResult<()> {
+    let gemm_view = gemm.try_as_plain_ram()?;
+    let gemm = gemm_view.as_slice::<T>()?;
+    let bias_view = bias.try_as_plain_ram()?;
+    let bias = bias_view.as_slice::<T>()?;
+    let mut output_view = output.try_as_plain_ram_mut()?;
+    let output = output_view.as_slice_mut::<T>()?;
+    let bias_at = |c: usize| if bias.len() == 1 { bias[0] } else { bias[c] };
+    let [ih, iw] = input_hw;
+    let [sh, sw] = strides;
+    let (oh, ow) = (ih * sh, iw * sw);
+    let plane = ih * iw;
+    let taps = sh * sw;
+    if c_is_last {
+        for (gemm_n, output_n) in gemm
+            .chunks_exact(channels * taps * plane)
+            .zip(output.chunks_exact_mut(oh * ow * channels))
+        {
+            for (oy, row) in output_n.chunks_exact_mut(ow * channels).enumerate() {
+                let (iy, ky) = (oy / sh, oy % sh);
+                for (ox, pixel) in row.chunks_exact_mut(channels).enumerate() {
+                    let (ix, kx) = (ox / sw, ox % sw);
+                    let tap = (ky * sw + kx) * plane + iy * iw + ix;
+                    for (c, out) in pixel.iter_mut().enumerate() {
+                        *out = add(gemm_n[c * taps * plane + tap], bias_at(c));
+                    }
+                }
+            }
+        }
+    } else {
+        for (nc, (gemm_nc, output_nc)) in
+            gemm.chunks_exact(taps * plane).zip(output.chunks_exact_mut(oh * ow)).enumerate()
+        {
+            let b = bias_at(nc % channels);
+            for (oy, row) in output_nc.chunks_exact_mut(ow).enumerate() {
+                let (iy, ky) = (oy / sh, oy % sh);
+                let tap_row = |kx: usize| &gemm_nc[(ky * sw + kx) * plane + iy * iw..][..iw];
+                if sw == 2 {
+                    for (pair, (&even, &odd)) in
+                        row.chunks_exact_mut(2).zip(tap_row(0).iter().zip(tap_row(1)))
+                    {
+                        pair[0] = add(even, b);
+                        pair[1] = add(odd, b);
+                    }
+                } else {
+                    for kx in 0..sw {
+                        for (out, &g) in row[kx..].iter_mut().step_by(sw).zip(tap_row(kx)) {
+                            *out = add(g, b);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn eval(
@@ -164,7 +326,7 @@ macro_rules! impl_eval {
                         output: &mut Tensor,
                         add: impl Fn(T, T) -> T + Copy + 'static,
                         ) -> TractResult<()> {
-                        let mut output_plain = output.try_as_plain_mut()?;
+                        let mut output_plain = output.try_as_plain_ram_mut()?;
                         let output = output_plain.to_array_view_mut::<T>()?;
                         let n_o_hkwk_hw: ArrayView4<T> = n_o_hkwk_hw.to_plain_array_view::<T>()?.into_dimensionality()?;
                         match input_shape.hw_rank() {
@@ -277,6 +439,59 @@ macro_rules! impl_eval {
                     let iy_len = input_shape.hw_dims()[1];
                     let kx_len = op.pool_spec.kernel_shape[0];
                     let ky_len = op.pool_spec.kernel_shape[1];
+                    if !op.pool_spec.data_format.c_is_last()
+                        && iy_len >= 16
+                        && let Some(temp) = n_o_hkwk_hw.as_slice()
+                        && let Some(output) = output.as_slice_mut()
+                    {
+                        for n in 0..n {
+                            for o in 0..output_c {
+                                let output_base = n * *output_shape.n_stride().unwrap_or(&0)
+                                    + o * output_c_stride as usize;
+                                let temp_base = n * temp_n_stride as usize + o * temp_o_stride as usize;
+                                for kx in 0..kx_len {
+                                    let x_base = (kx * x_dil) as isize - x_pad;
+                                    let ix_start = ((-x_base).max(0) as usize).div_ceil(x_stride);
+                                    let ix_end = ((ox_len as isize - x_base).max(0) as usize).div_ceil(x_stride).min(ix_len);
+                                    for ky in 0..ky_len {
+                                        let y_base = (ky * y_dil) as isize - y_pad;
+                                        let iy_start = ((-y_base).max(0) as usize).div_ceil(y_stride);
+                                        let iy_end = ((oy_len as isize - y_base).max(0) as usize).div_ceil(y_stride).min(iy_len);
+                                        if iy_start >= iy_end {
+                                            continue;
+                                        }
+                                        for ix in ix_start..ix_end {
+                                            let ox = (x_base + (ix * x_stride) as isize) as usize;
+                                            let oy = (y_base + (iy_start * y_stride) as isize) as usize;
+                                            let input_start = temp_base + (kx * ky_len + ky) * temp_k_stride as usize
+                                                + ix * iy_len + iy_start;
+                                            let output_start = output_base + ox * output_x_stride as usize + oy;
+                                            let input = &temp[input_start..input_start + iy_end - iy_start];
+                                            let output = &mut output[output_start..output_start + (input.len() - 1) * y_stride + 1];
+                                            if y_stride == 1 {
+                                                for (output, &input) in output.iter_mut().zip(input) {
+                                                    *output = add(*output, input);
+                                                }
+                                            } else {
+                                                let blocks = (input.len() - 1) / 8;
+                                                let (input_head, input_tail) = input.split_at(blocks * 8);
+                                                let (output_head, output_tail) = output.split_at_mut(blocks * 8 * y_stride);
+                                                for (output, input) in output_head.chunks_exact_mut(8 * y_stride).zip(input_head.chunks_exact(8)) {
+                                                    for i in 0..8 {
+                                                        output[i * y_stride] = add(output[i * y_stride], input[i]);
+                                                    }
+                                                }
+                                                for (output, &input) in output_tail.iter_mut().step_by(y_stride).zip(input_tail) {
+                                                    *output = add(*output, input);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        return Ok(());
+                    }
                     unsafe {
                         for n in 0..n {
                             let output = output.as_mut_ptr().add(n * *output_shape.n_stride().unwrap_or(&0));
@@ -495,7 +710,7 @@ impl_eval! {
     }
 
 crate::declare_knob!(
-    TRACT_DISABLE_DEPTHWISE_DECONV,
+    scopable TRACT_DISABLE_DEPTHWISE_DECONV,
     bool,
     false,
     "Disable the fused depthwise-deconvolution path, falling back to einsum + DeconvSum."
@@ -674,7 +889,7 @@ impl DepthwiseDeconv {
         }
         let strides = self.pool_spec.strides();
         let dilations = self.pool_spec.dilations();
-        let mut output_plain = output.try_as_plain_mut()?;
+        let mut output_plain = output.try_as_plain_ram_mut()?;
         let mut output = output_plain.to_array_view_mut::<T>()?;
         for n in 0..n {
             for o in 0..c {

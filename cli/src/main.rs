@@ -4,6 +4,9 @@
 #[macro_use]
 extern crate log;
 
+#[cfg(all(any(target_os = "macos", target_os = "ios"), feature = "metal"))]
+extern crate tract_metal;
+
 #[macro_use]
 mod macros;
 pub(crate) mod runtimes;
@@ -47,6 +50,7 @@ mod plan_options;
 mod routines;
 mod run;
 mod selection;
+mod streams;
 mod tensor;
 mod utils;
 
@@ -108,7 +112,7 @@ fn main() -> TractResult<()> {
         .arg(arg!(-f --format [format]
                   "Hint the model format ('onnx', 'nnef', 'tflite' or 'tf') instead of guess from extension."))
         .arg(Arg::new("input").long("input").short('i').num_args(1).action(clap::ArgAction::Append).long_help(
-                "Set input shape and type (@file.pb or @file.npz:thing.npy or 3,4,i32)."))
+                "Set input shape and type, optionally by name and with a value (3,4,i32 or name:3,4,i32 or name:2,f32=1,2)."))
         .arg(Arg::new("constantize").long("constantize").num_args(1).action(clap::ArgAction::Append).long_help(
                 "Transorm an input into a Constant"))
 
@@ -151,8 +155,9 @@ fn main() -> TractResult<()> {
         .arg(arg!(--"cuda").long_help("Convert supported operators to CUDA equivalent"))
         .arg(arg!(-r --runtime [runtime] "Run on alternative runtime (cuda, metal, ...)"))
         .arg(Arg::new("transform").short('t').long("transform").num_args(1).action(clap::ArgAction::Append).help("Apply a built-in transformation to the model"))
-        .arg(Arg::new("set").long("set").num_args(1).action(clap::ArgAction::Append).long_help("Set a symbol to a concrete value after decluttering"))
+        .arg(Arg::new("set").long("set").num_args(1).action(clap::ArgAction::Append).long_help("Set a model symbol before analysis for inferred models or after decluttering for typed models"))
         .arg(Arg::new("hint").long("hint").num_args(1).action(clap::ArgAction::Append).long_help("Provide a typical value to a symbol to be used during planning (--hint S=12)"))
+        .arg(Arg::new("autobatch-sessions").long("autobatch-sessions").num_args(1).long_help("Autobatch the model: serve that many concurrent sessions off one prepared copy of it, batching whatever turns arrive together. Needs a batch axis on axis 0, and wants a hint on its symbol for the memory arena to size the widest turn (--autobatch-sessions 4 --hint B=4)"))
 
         .arg(arg!(--"causal-llm-hints" "Figures out P and S and gives them suitable hints"))
         .arg(arg!(--llm "Shortcut setting --opl (aka all nnef extensions) --causal-llm-hints -t transformers_detect_all"))
@@ -291,7 +296,8 @@ fn main() -> TractResult<()> {
                 .arg(arg!(--out <DIR> "bench-data checkout root"))
                 .arg(arg!(--triple <TRIPLE> "Target triple"))
                 .arg(arg!(--device <DEVICE> "Device key"))
-                .arg(arg!(--day [DATE] "Run day YYYY-MM-DD (default: today)")),
+                .arg(arg!(--day [DATE] "Run day YYYY-MM-DD (default: today)"))
+                .arg(arg!(--commit [SHA] "Benched commit, recorded against the run day")),
         );
         app = app.subcommand(bench_suite::diff_command());
         app = app.subcommand(
@@ -302,7 +308,7 @@ fn main() -> TractResult<()> {
                 .arg(arg!(--thresholds <PATH> "Threshold config TOML"))
                 .arg(arg!(--"pr-sha" <SHA> "PR commit sha"))
                 .arg(arg!(--out <PATH> "PR comment markdown output path"))
-                .arg(arg!(--templates [DIR] "Template dir (default: .travis)"))
+                .arg(arg!(--templates [DIR] "Template dir (default: ci)"))
                 .arg(arg!(--today [DATE] "Override today's date YYYY-MM-DD (for reproducible output)")),
         );
         app = app.subcommand(
@@ -355,6 +361,30 @@ fn main() -> TractResult<()> {
                 .long("assert-sane-floats")
                 .action(ArgAction::SetTrue)
                 .help("Check float for NaN and infinites at each step"),
+        )
+        .arg(
+            Arg::new("streams")
+                .long("streams")
+                .num_args(1)
+                .help("Run that many concurrent streams, a state each, and check every one of them against the same stream run alone"),
+        )
+        .arg(
+            Arg::new("turns")
+                .long("turns")
+                .num_args(1)
+                .help("Turns each stream feeds, cycling the input (default: what the input holds)"),
+        )
+        .arg(
+            Arg::new("assert-occupancy")
+                .long("assert-occupancy")
+                .num_args(1)
+                .help("Fail unless the autobatched turns carried that many sessions on average"),
+        )
+        .arg(
+            Arg::new("per-turn-diff")
+                .long("per-turn-diff")
+                .action(ArgAction::SetTrue)
+                .help("Print the worst diff against running alone, turn by turn"),
         );
     let run = run_options(run);
     let run = output_options(run);
@@ -614,7 +644,13 @@ fn bench_options(command: clap::Command) -> clap::Command {
                  arg!(--"warmup-time" [warmup_time] "Time to run (approx.) before starting the clock."),
                  arg!(--"warmup-loops" [warmup_loops] "Number of loops to run before starting the clock."),
                  arg!(--"max-loops" [max_iters] "Sets the maximum number of iterations for each node [default: 100_000].").alias("max-iters"),
-                 arg!(--"max-time" [max_time] "Sets the maximum execution time for each node (in ms) [default: 5000].") ])
+                 arg!(--"max-time" [max_time] "Sets the maximum execution time for each node (in ms) [default: 5000]."),
+                 arg!(--"streams" [streams] "Saturate that many concurrent streams, one thread and one state each, instead of benching a single one. Under --turn-period, the load offered instead; under --capacity, the ceiling the search stops at."),
+                 arg!(--"turn-period" [turn_period] "Wall-clock milliseconds one turn's input covers, pacing the streams against real time instead of saturating them."),
+                 arg!(--"deadline" [deadline] "Milliseconds a turn may add over the arrival of its input before it counts as late [default: the turn period]."),
+                 arg!(--"deadline-quantile" [quantile] "Quantile of added latency the deadline is read at [default: 0.99]."),
+                 arg!(--"capacity" "Search the largest paced load which meets the deadline, doubling then bisecting up to the ceiling.").action(ArgAction::SetTrue),
+                 arg!(--"session-duration" [session_duration] "Mean milliseconds a session is held before it leaves and another is admitted in its place, keeping the population steady. Off by default: sessions last the whole trial.") ])
 }
 
 fn run_options(command: clap::Command) -> clap::Command {
@@ -632,7 +668,7 @@ fn run_options(command: clap::Command) -> clap::Command {
                 .long("set")
                 .action(clap::ArgAction::Append)
                 .number_of_values(1)
-                .help("Bind a symbol before running the model.  RHS is a TDim expression \
+                .help("Bind a runtime symbol before running the model. RHS is a TDim expression \
                        reduced to i64 against symbols set so far (--set S=12, --set T=2*S)."),
         )
         .arg(
@@ -808,7 +844,12 @@ fn handle(matches: clap::ArgMatches, probe: Option<&Probe>) -> TractResult<()> {
                 let default = shown((k.default)());
                 let suffix =
                     if current != default { format!(", default {default}") } else { String::new() };
-                println!("{} = {current}  [{}{suffix}]", name_style.paint(k.name), k.type_name);
+                let scopable = if k.scopable { ", scopable" } else { "" };
+                println!(
+                    "{} = {current}  [{}{scopable}{suffix}]",
+                    name_style.paint(k.name),
+                    k.type_name
+                );
                 println!("    {}\n", k.doc);
             }
             return Ok(());

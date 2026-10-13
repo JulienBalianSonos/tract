@@ -39,8 +39,8 @@ impl MetalRouteTopK {
         }
         let route_count = Self::token_count_dim(&inputs[0].shape) * self.k;
         Ok(tvec![
-            i64::datum_type().fact(&[route_count.clone()]),
-            i64::datum_type().fact(&[route_count.clone()]),
+            i64::datum_type().fact(std::slice::from_ref(&route_count)),
+            i64::datum_type().fact(std::slice::from_ref(&route_count)),
             f32::datum_type().fact(&[route_count]),
         ])
     }
@@ -192,7 +192,6 @@ mod tests {
         input: Tensor,
         weights_approx: Approximation,
     ) -> TractResult<()> {
-
         let mut transformed = model.clone();
         MetalTransform::default().transform(&mut transformed)?;
         let has_metal_route = transformed.nodes().iter().any(|node| node.op_is::<MetalRouteTopK>());

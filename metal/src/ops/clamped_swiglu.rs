@@ -51,11 +51,8 @@ impl EvalOp for MetalClampedSwiGlu {
             .to_device_tensor()
             .with_context(|| format!("up is not a Metal tensor: {up_raw:?}"))?;
 
-        let output = tract_gpu::turn_handler::make_tensor_for_node(
-            ctx,
-            f32::datum_type(),
-            gate.shape(),
-        )?;
+        let output =
+            tract_gpu::turn_handler::make_tensor_for_node(ctx, f32::datum_type(), gate.shape())?;
 
         crate::with_metal_stream(|stream| {
             crate::kernels::moe::dispatch_clamped_swiglu_f32(
@@ -80,3 +77,9 @@ impl TypedOp for MetalClampedSwiGlu {
 
     as_op!();
 }
+
+crate::register_metal_op!(tract_core::ops::nn::ClampedSwiGlu, |source, node, op| {
+    let facts = source.node_input_facts(node.id)?;
+    rule_if!(facts.iter().all(|f| f.datum_type == f32::datum_type()));
+    Ok(Some(Box::new(MetalClampedSwiGlu::new(op.alpha, op.limit))))
+});

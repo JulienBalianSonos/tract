@@ -113,6 +113,7 @@ impl<'mb> ModelBuilder<'mb> {
         self.model.select_output_outlets(&outputs)?;
 
         self.parse_properties().context("Parsing properties")?;
+        self.adopt_graph_id();
 
         for (ix, name) in self.proto_model.doc.graph_def.results.iter().enumerate() {
             self.model.set_outlet_label(outputs[ix], name.0.to_string())?;
@@ -152,6 +153,15 @@ impl<'mb> ModelBuilder<'mb> {
         match self.translate().context("In ModelBuilder::translate") {
             Ok(()) => Ok(self.model),
             Err(e) => Err((self.model, e)),
+        }
+    }
+
+    /// Name the model after the NNEF graph id, unless it is the anonymous
+    /// default or the file already carried a [`TRACT_NAME`] property.
+    fn adopt_graph_id(&mut self) {
+        let id = self.proto_model.doc.graph_def.id.0.clone();
+        if id != crate::ser::DEFAULT_GRAPH_ID && self.model.name().is_none() {
+            self.model.set_name(id);
         }
     }
 
@@ -627,7 +637,7 @@ impl RValue {
                             Value::Wire(outlet) => {
                                 let fact = builder.model.outlet_fact(outlet)?;
                                 if let Some(konst) = &fact.konst {
-                                    let plain = konst.try_as_plain()?;
+                                    let plain = konst.try_as_plain_ram()?;
                                     if konst.datum_type() == TDim::datum_type() {
                                         let dim = plain.as_slice::<TDim>()?[idx].clone();
                                         Ok(Value::Dim(dim))
@@ -792,7 +802,7 @@ impl CoerceFrom<Value> for i64 {
     fn coerce(builder: &mut ModelBuilder, from: &Value) -> TractResult<Self> {
         match from {
             Value::Dim(d) => Ok(d.to_i64()?),
-            Value::Tensor(t) => Ok(*t.try_as_plain()?.to_scalar::<i64>()?),
+            Value::Tensor(t) => Ok(*t.try_as_plain_ram()?.to_scalar::<i64>()?),
             Value::Wire(_) => Ok(from.to::<Arc<Tensor>>(builder)?.cast_to_scalar::<i64>()?),
             _ => bail!("Can not build a i64 from {:?}", from),
         }
@@ -803,11 +813,11 @@ impl CoerceFrom<Value> for TDim {
     fn coerce(builder: &mut ModelBuilder, from: &Value) -> TractResult<Self> {
         match from {
             Value::Dim(d) => Ok(d.clone()),
-            Value::Tensor(t) => Ok(t.try_as_plain()?.to_scalar::<TDim>()?.clone()),
+            Value::Tensor(t) => Ok(t.try_as_plain_ram()?.to_scalar::<TDim>()?.clone()),
             Value::Wire(_) => Ok(from
                 .to::<Arc<Tensor>>(builder)?
                 .cast_to::<TDim>()?
-                .try_as_plain()?
+                .try_as_plain_ram()?
                 .to_scalar::<TDim>()?
                 .clone()),
             _ => bail!("Can not build a TDim from {:?}", from),
@@ -819,11 +829,11 @@ impl CoerceFrom<Value> for String {
     fn coerce(builder: &mut ModelBuilder, from: &Value) -> TractResult<Self> {
         match from {
             Value::String(s) => Ok(s.to_string()),
-            Value::Tensor(t) => Ok(t.try_as_plain()?.to_scalar::<String>()?.clone()),
+            Value::Tensor(t) => Ok(t.try_as_plain_ram()?.to_scalar::<String>()?.clone()),
             Value::Wire(_) => Ok(from
                 .to::<Arc<Tensor>>(builder)?
                 .cast_to::<String>()?
-                .try_as_plain()?
+                .try_as_plain_ram()?
                 .to_scalar::<String>()?
                 .clone()),
             _ => bail!("Can not build a String from {:?}", from),
@@ -835,11 +845,11 @@ impl CoerceFrom<Value> for bool {
     fn coerce(builder: &mut ModelBuilder, from: &Value) -> TractResult<Self> {
         match from {
             Value::Bool(b) => Ok(*b),
-            Value::Tensor(t) => Ok(*t.try_as_plain()?.to_scalar::<bool>()?),
+            Value::Tensor(t) => Ok(*t.try_as_plain_ram()?.to_scalar::<bool>()?),
             Value::Wire(_) => Ok(*from
                 .to::<Arc<Tensor>>(builder)?
                 .cast_to::<bool>()?
-                .try_as_plain()?
+                .try_as_plain_ram()?
                 .to_scalar::<bool>()?),
             Value::Dim(n) => Ok(!n.is_zero()),
             _ => bail!("Can not build a boolean from {:?}", from),
@@ -864,11 +874,11 @@ impl CoerceFrom<Value> for f32 {
         match from {
             Value::Scalar(f) => Ok(*f),
             Value::Dim(d) => Ok(d.to_i64()? as f32),
-            Value::Tensor(t) => Ok(*t.try_as_plain()?.to_scalar::<f32>()?),
+            Value::Tensor(t) => Ok(*t.try_as_plain_ram()?.to_scalar::<f32>()?),
             Value::Wire(_) => Ok(*from
                 .to::<Arc<Tensor>>(builder)?
                 .cast_to::<f32>()?
-                .try_as_plain()?
+                .try_as_plain_ram()?
                 .to_scalar::<f32>()?),
             _ => bail!("Can not build a f32 from {:?}", from),
         }
@@ -892,7 +902,7 @@ impl CoerceFrom<Value> for ShapeFact {
             Value::Tuple(vec) => vec.iter().map(|item| TDim::coerce(builder, item)).collect(),
             _ => {
                 let t = from.to::<Arc<Tensor>>(builder)?;
-                Ok(t.cast_to::<TDim>()?.try_as_plain()?.as_slice::<TDim>()?.into())
+                Ok(t.cast_to::<TDim>()?.try_as_plain_ram()?.as_slice::<TDim>()?.into())
             }
         }
     }

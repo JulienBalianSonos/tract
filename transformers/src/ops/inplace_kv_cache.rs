@@ -15,10 +15,9 @@
 //! kernel (reading buffer + length) would use.
 
 use tract_nnef::internal::*;
-use tract_nnef::tract_core::transform::ModelTransform;
-use tract_nnef::tract_ndarray::Ix4;
+use tract_nnef::tract_ndarray::{Array4, Ix4};
 
-use crate::ops::dyn_kv_cache::DynKeyValueCache;
+use crate::ops::dyn_kv_cache::{DynKeyValueCache, DynKeyValueCacheState};
 use crate::ops::flash_sdpa::FlashSdpaOp;
 use crate::ops::sdpa::Sdpa;
 
@@ -83,6 +82,13 @@ impl InPlaceKvCache {
         Ok(())
     }
 
+    /// Shape of the live `[0..len]` region, `None` before the first push.
+    pub fn valid_shape(&self) -> Option<TVec<usize>> {
+        let mut shape: TVec<usize> = self.buffer.as_ref()?.shape().into();
+        shape[self.axis] = self.len;
+        Some(shape)
+    }
+
     /// Zero-copy ndarray view of the valid `[0..len]` region. This is the path
     /// that realizes the win — a length-aware consumer attends over this without
     /// ever copying the past.
@@ -128,10 +134,15 @@ fn grow(src: &Tensor, len: usize, new_cap: usize, axis: usize) -> TractResult<Te
 // ===================================================================================
 
 /// Fused in-place KV-cache + scaled-dot-product-attention (decode-oriented).
-/// Inputs: `[Q, K_new, V_new]`, each `[B, H, S, D]` (K/V at `num_kv_heads`).
+/// Inputs: `[Q, K_new, V_new]`, each `[B, H, S, D]` (K/V at `num_kv_heads`), plus an
+/// optional additive mask `[B, H | 1, S_q, S_kv]` over the whole accumulated cache.
 /// Output: attention of `Q` over the whole accumulated cache, shape of `Q`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct InPlaceKvSdpa {
+    /// The cache this op grew out of: the state name it answers for, and the fact off
+    /// which the past-length symbol resolves, as `DynKeyValueCache` resolves it.
+    pub name: String,
+    pub past_sequence_fact: TypedFact,
     /// Sequence axis to grow (2 for `[B, H, S, D]`).
     pub axis: usize,
     pub causal: bool,
@@ -153,6 +164,8 @@ impl EvalOp for InPlaceKvSdpa {
     not_out_of_plan!();
     fn state(&self, _ctx: &EvalContext) -> TractResult<Option<Box<dyn OpState>>> {
         Ok(Some(Box::new(InPlaceKvSdpaState {
+            name: self.name.clone(),
+            past_sequence_fact: self.past_sequence_fact.clone(),
             axis: self.axis,
             causal: self.causal,
             scale: self.scale,
@@ -164,7 +177,10 @@ impl EvalOp for InPlaceKvSdpa {
 
 impl TypedOp for InPlaceKvSdpa {
     fn output_facts(&self, inputs: &[&TypedFact]) -> TractResult<TVec<TypedFact>> {
-        ensure!(inputs.len() == 3, "InPlaceKvSdpa expects [Q, K_new, V_new]");
+        ensure!(
+            matches!(inputs.len(), 3 | 4),
+            "InPlaceKvSdpa expects [Q, K_new, V_new] and an optional mask"
+        );
         // Attention output has Q's shape and dtype.
         Ok(tvec!(inputs[0].without_value()))
     }
@@ -173,6 +189,8 @@ impl TypedOp for InPlaceKvSdpa {
 
 #[derive(Clone, Debug)]
 pub struct InPlaceKvSdpaState {
+    name: String,
+    past_sequence_fact: TypedFact,
     axis: usize,
     causal: bool,
     scale: Option<f32>,
@@ -181,13 +199,32 @@ pub struct InPlaceKvSdpaState {
 }
 
 impl OpState for InPlaceKvSdpaState {
+    fn init_tensor_fact(&self) -> Option<(String, TypedFact)> {
+        Some((self.name.clone(), self.past_sequence_fact.clone()))
+    }
+
+    fn has_init_tensor_fact(&self) -> bool {
+        true
+    }
+
+    fn resolve_symbols(&mut self, state: &mut TurnState) -> TractResult<()> {
+        DynKeyValueCacheState::resolve_symbols(
+            state,
+            self.past_sequence_fact.clone(),
+            self.k.valid_shape().as_deref(),
+        )
+    }
+
     fn eval(
         &mut self,
         _ctx: &EvalContext,
         _op: &dyn Op,
         inputs: TVec<TValue>,
     ) -> TractResult<TVec<TValue>> {
-        ensure!(inputs.len() == 3, "InPlaceKvSdpa expects [Q, K_new, V_new]");
+        ensure!(
+            matches!(inputs.len(), 3 | 4),
+            "InPlaceKvSdpa expects [Q, K_new, V_new] and an optional mask"
+        );
         let input_dt = inputs[0].datum_type();
 
         // Cache K/V in f32 (the dtype FlashSdpaOp computes in); append in place.
@@ -202,8 +239,11 @@ impl OpState for InPlaceKvSdpaState {
         let kview = self.k.valid_view::<f32>()?.into_dimensionality::<Ix4>()?;
         let vview = self.v.valid_view::<f32>()?.into_dimensionality::<Ix4>()?;
 
+        let mask =
+            inputs.get(3).map(|m| mask_as_4d(m, qv.shape()[2], kview.shape()[2])).transpose()?;
+
         let flash = FlashSdpaOp { causal: self.causal, scale: self.scale };
-        let o = flash.flash_attention_gqa(qv, kview, vview, None);
+        let o = flash.flash_attention_gqa(qv, kview, vview, mask.as_ref().map(|m| m.view()));
 
         Ok(tvec!(o.into_tensor().cast_to_dt(input_dt)?.into_owned().into_tvalue()))
     }
@@ -224,7 +264,7 @@ impl OpState for InPlaceKvSdpaState {
     /// saved cache). With no initializers the caches stay empty (fresh decode).
     fn load_from(
         &mut self,
-        _state: &mut TurnState,
+        state: &mut TurnState,
         states: &mut dyn Iterator<Item = TValue>,
     ) -> TractResult<()> {
         if let Some(k) = states.next() {
@@ -234,7 +274,7 @@ impl OpState for InPlaceKvSdpaState {
             self.k.push(k.cast_to::<f32>()?.as_ref())?;
             self.v.push(v.cast_to::<f32>()?.as_ref())?;
         }
-        Ok(())
+        self.resolve_symbols(state)
     }
 
     fn reset_lanes(&mut self, _lanes: &[LaneId]) -> TractResult<()> {
@@ -242,27 +282,41 @@ impl OpState for InPlaceKvSdpaState {
     }
 }
 
-/// Rewrite rule: fuse `{DynKeyValueCache(K), DynKeyValueCache(V), Sdpa(Q,K,V)}` into a
-/// single stateful `InPlaceKvSdpa`, so existing decode models adopt the in-place cache
-/// transparently. Fires on the 3-input pattern where each of Sdpa's K/V inputs is the
-/// output of a single-consumer `DynKeyValueCache` on the same axis. Intended to run
-/// AFTER `fuse_kv_cache_broadcast_rule` strips the GQA unsqueeze/broadcast/reshape chain
-/// (so the cache feeds Sdpa directly) — `InPlaceKvSdpa` does the GQA expansion itself, so
-/// the fusion also removes those broadcast ops.
+/// Read an attention mask as the `[B, H, S_q, S_kv]` array `flash_attention_gqa` takes,
+/// giving a rank-3 mask the single head it broadcasts over.
+fn mask_as_4d(mask: &TValue, q_len: usize, kv_len: usize) -> TractResult<Array4<f32>> {
+    let heads = if mask.rank() == 3 { 1 } else { mask.shape()[1] };
+    Ok(mask.cast_to::<f32>()?.into_owned().into_plain_array::<f32>()?.into_shape_with_order((
+        mask.shape()[0],
+        heads,
+        q_len,
+        kv_len,
+    ))?)
+}
+
+/// Fuse `{DynKeyValueCache(K), DynKeyValueCache(V), Sdpa(Q,K,V[,mask])}` into a single
+/// stateful `InPlaceKvSdpa`, so a decode grows its cache in place instead of copying the
+/// whole past into a fresh buffer every turn. Fires where each of Sdpa's K/V inputs is
+/// the output of a single-consumer `DynKeyValueCache` on the same axis; an explicit mask
+/// rides along as the fused op's fourth input.
+///
+/// Called from [`Sdpa::codegen`], so it never touches the decluttered form NNEF
+/// serializes, and a backend that claimed the pattern earlier — every GPU transform runs
+/// before optimize — leaves nothing here to match. `fuse_kv_cache_broadcast_rule` has
+/// stripped the GQA unsqueeze/broadcast/reshape chain by then, and `InPlaceKvSdpa` does
+/// the GQA expansion itself.
 ///
 /// Note: the fused op self-initializes an empty cache, so this replaces the
 /// `DynKeyValueCache` state-init/restore contract with the op's own state — equivalent
 /// for fresh inference; a model that restores a pre-seeded cache would need that state
 /// threaded into the op (follow-up).
-pub fn fuse_inplace_kv_sdpa_rule(
-    _ctx: &(),
+pub fn fuse_inplace_kv_sdpa(
     model: &TypedModel,
     node: &TypedNode,
-    node_name: &str,
     op: &Sdpa,
 ) -> TractResult<Option<TypedModelPatch>> {
-    // plain (Q, K, V) — no explicit mask input
-    if node.inputs.len() != 3 {
+    // (Q, K, V), with or without an explicit mask
+    if !matches!(node.inputs.len(), 3 | 4) {
         return Ok(None);
     }
     let k_node = model.node(node.inputs[1].node);
@@ -285,32 +339,24 @@ pub fn fuse_inplace_kv_sdpa_rule(
     let k_new = k_node.inputs[0];
     let v_new = v_node.inputs[0];
 
+    let mut inputs: TVec<OutletId> = tvec!(q_outlet, k_new, v_new);
+    inputs.extend(node.inputs.get(3).copied());
+
     let mut patch = TypedModelPatch::default();
-    let taps = patch.taps(model, &[q_outlet, k_new, v_new])?;
+    let taps = patch.taps(model, &inputs)?;
     let fused = patch.wire_node(
-        format!("{node_name}.inplace_kv_sdpa"),
-        InPlaceKvSdpa { axis: kc.axis, causal: op.is_causal, scale },
+        format!("{}.inplace_kv_sdpa", node.name),
+        InPlaceKvSdpa {
+            name: kc.name.clone(),
+            past_sequence_fact: kc.past_sequence_fact.clone(),
+            axis: kc.axis,
+            causal: op.is_causal,
+            scale,
+        },
         &taps,
     )?;
     patch.shunt_outside(model, node.id.into(), fused[0])?;
     Ok(Some(patch))
-}
-
-/// Strip the GQA broadcast chain, then fuse `cache -> Sdpa` into `InPlaceKvSdpa`.
-#[derive(Debug, Default)]
-pub struct InPlaceKvSdpaTransform;
-
-impl ModelTransform for InPlaceKvSdpaTransform {
-    fn name(&self) -> StaticName {
-        "fuse_inplace_kv_sdpa".into()
-    }
-    fn transform(&self, model: &mut TypedModel) -> TractResult<()> {
-        Rewriter::default()
-            .with_rule_for("fuse-kv-broadcast", crate::ops::sdpa::fuse_kv_cache_broadcast_rule)
-            .with_rule_for("fuse-inplace-kv-sdpa", fuse_inplace_kv_sdpa_rule)
-            .rewrite(&(), model)?;
-        model.compact()
-    }
 }
 
 #[cfg(test)]
@@ -324,6 +370,27 @@ mod tests {
         let n: usize = shape.iter().product();
         let data: Vec<f32> = (0..n).map(|i| start + i as f32 * 0.5).collect();
         Tensor::from_shape(shape, &data).unwrap()
+    }
+
+    // The op as the tests drive it: a concrete past fact, so the past-length symbol it
+    // declares has nothing left to resolve. The rewrite tests cover the symbolic case.
+    fn fused_sdpa(causal: bool) -> InPlaceKvSdpa {
+        InPlaceKvSdpa {
+            name: "kv".to_string(),
+            past_sequence_fact: f32::fact([1usize, 2, 0, 16].as_ref()),
+            axis: 2,
+            causal,
+            scale: None,
+        }
+    }
+
+    // Additive mask over [B, 1, S_q, S_kv] hiding every third key, so a consumer that
+    // dropped the mask could not match a consumer that applied it.
+    fn attn_mask(b: usize, q_len: usize, kv_len: usize) -> Tensor {
+        let data: Vec<f32> = (0..b * q_len * kv_len)
+            .map(|i| if (i % kv_len).is_multiple_of(3) { -1e4 } else { 0.0 })
+            .collect();
+        Tensor::from_shape(&[b, 1, q_len, kv_len], &data).unwrap()
     }
 
     // ---- Correctness: in-place buffer[0..len] == concat-grow, bit-exact ----
@@ -562,9 +629,9 @@ mod tests {
     //      FlashSdpaOp} baseline subgraph, driven step-by-step (prefill + decode), GQA.
     //      Same attention kernel + identical K/V => bit-identical, proving the fused op
     //      is a correct drop-in for the cache->Sdpa path. ----
-    fn drive_fused_vs_baseline(causal: bool) -> TractResult<()> {
+    fn drive_fused_vs_baseline(causal: bool, masked: bool) -> TractResult<()> {
         let (bsz, hq, hkv, d) = (1usize, 4usize, 2usize, 16usize); // GQA: 4 q-heads / 2 kv-heads
-        let op = InPlaceKvSdpa { axis: 2, causal, scale: None };
+        let op = fused_sdpa(causal);
         let turn = TurnState::default();
         let mut state = op.state(&EvalContext::out_of_plan())?.unwrap();
         let _turn = turn;
@@ -572,6 +639,7 @@ mod tests {
 
         let mut kc: Option<Tensor> = None;
         let mut vc: Option<Tensor> = None;
+        let mut kv_len = 0usize;
 
         // prefill 3 tokens, then 12 single-token decode steps
         let mut snews = vec![3usize];
@@ -582,14 +650,14 @@ mod tests {
             let knew = seq_tensor(&[bsz, hkv, snew, d], 5.0 + t as f32 * 0.3);
             let vnew = seq_tensor(&[bsz, hkv, snew, d], 9.0 - t as f32 * 0.2);
 
-            let o_fused = state
-                .eval(
-                    &EvalContext::out_of_plan(),
-                    &op,
-                    tvec![q.clone().into(), knew.clone().into(), vnew.clone().into()],
-                )?
-                .remove(0)
-                .into_tensor();
+            let mut ins = tvec![q.clone().into(), knew.clone().into(), vnew.clone().into()];
+            if masked {
+                ins.push(attn_mask(bsz, snew, kv_len + snew).into());
+            }
+            kv_len += snew;
+
+            let o_fused =
+                state.eval(&EvalContext::out_of_plan(), &op, ins.clone())?.remove(0).into_tensor();
 
             kc = Some(match kc.take() {
                 None => knew.clone(),
@@ -605,29 +673,31 @@ mod tests {
                     .remove(0)
                     .into_tensor(),
             });
-            let o_base = flash
-                .eval(
-                    &EvalContext::out_of_plan(),
-                    tvec![q.into(), kc.clone().unwrap().into(), vc.clone().unwrap().into()],
-                )?
-                .remove(0)
-                .into_tensor();
+            let mut base_ins =
+                tvec![q.into(), kc.clone().unwrap().into(), vc.clone().unwrap().into()];
+            base_ins.extend(ins.into_iter().nth(3));
+            let o_base = flash.eval(&EvalContext::out_of_plan(), base_ins)?.remove(0).into_tensor();
 
-            o_fused
-                .close_enough(&o_base, Approximation::Approximate)
-                .with_context(|| format!("fused != baseline at step {t} (causal={causal})"))?;
+            o_fused.close_enough(&o_base, Approximation::Approximate).with_context(|| {
+                format!("fused != baseline at step {t} (causal={causal}, masked={masked})")
+            })?;
         }
         Ok(())
     }
 
     #[test]
     fn fused_op_matches_cache_plus_flash_noncausal() -> TractResult<()> {
-        drive_fused_vs_baseline(false)
+        drive_fused_vs_baseline(false, false)
     }
 
     #[test]
     fn fused_op_matches_cache_plus_flash_causal() -> TractResult<()> {
-        drive_fused_vs_baseline(true)
+        drive_fused_vs_baseline(true, false)
+    }
+
+    #[test]
+    fn fused_op_matches_cache_plus_flash_masked() -> TractResult<()> {
+        drive_fused_vs_baseline(false, true)
     }
 
     // True runtime integration: build a real TypedModel with the op, run it through
@@ -644,11 +714,7 @@ mod tests {
         let q = model.add_source("q", f32::fact(&qshape))?;
         let k = model.add_source("k", f32::fact(&kshape))?;
         let v = model.add_source("v", f32::fact(&kshape))?;
-        let o = model.wire_node(
-            "fused_attn",
-            InPlaceKvSdpa { axis: 2, causal: false, scale: None },
-            &[q, k, v],
-        )?;
+        let o = model.wire_node("fused_attn", fused_sdpa(false), &[q, k, v])?;
         model.select_output_outlets(&o)?;
 
         let runnable = model.into_runnable()?;
@@ -699,22 +765,33 @@ mod tests {
         Ok(())
     }
 
-    // Auto-rewrite: a model with the {DynKeyValueCache(K), DynKeyValueCache(V), Sdpa}
-    // pattern is transparently fused to InPlaceKvSdpa, and the rewritten model runs and
-    // matches the concat-cache + FlashSdpaOp baseline.
+    // Optimizing a model with the {DynKeyValueCache(K), DynKeyValueCache(V), Sdpa}
+    // pattern fuses it to InPlaceKvSdpa, and the optimized model runs and matches the
+    // concat-cache + FlashSdpaOp baseline.
     #[test]
-    fn rewrite_fuses_cache_sdpa() -> TractResult<()> {
+    fn codegen_fuses_cache_sdpa() -> TractResult<()> {
+        drive_codegen(false)
+    }
+
+    #[test]
+    fn codegen_fuses_masked_cache_sdpa() -> TractResult<()> {
+        drive_codegen(true)
+    }
+
+    fn drive_codegen(masked: bool) -> TractResult<()> {
         let (b, hq, hkv, d) = (1usize, 4usize, 2usize, 16usize);
         let mut model = TypedModel::default();
         let s = model.sym("S");
         let p = model.sym("P");
         let dim = |x: usize| x.to_dim();
         let qf: TVec<TDim> = tvec![dim(b), dim(hq), s.clone().into(), dim(d)];
-        let newf: TVec<TDim> = tvec![dim(b), dim(hkv), s.into(), dim(d)];
-        let pastf: TVec<TDim> = tvec![dim(b), dim(hkv), p.into(), dim(d)];
+        let newf: TVec<TDim> = tvec![dim(b), dim(hkv), s.clone().into(), dim(d)];
+        let pastf: TVec<TDim> = tvec![dim(b), dim(hkv), p.clone().into(), dim(d)];
+        let maskf: TVec<TDim> = tvec![dim(b), dim(1), s.clone().into(), s.to_dim() + p];
         let q = model.add_source("q", f32::fact(&qf))?;
         let knew = model.add_source("k", f32::fact(&newf))?;
         let vnew = model.add_source("v", f32::fact(&newf))?;
+        let mask = masked.then(|| model.add_source("mask", f32::fact(&maskf))).transpose()?;
         let mkcache = |nm: &str| DynKeyValueCache {
             name: nm.to_string(),
             axis: 2,
@@ -723,6 +800,8 @@ mod tests {
         };
         let kc = model.wire_node("kc", mkcache("kc"), &[knew])?;
         let vc = model.wire_node("vc", mkcache("vc"), &[vnew])?;
+        let mut sdpa_inputs = tvec!(q, kc[0], vc[0]);
+        sdpa_inputs.extend(mask);
         let o = model.wire_node(
             "sdpa",
             Sdpa {
@@ -731,21 +810,25 @@ mod tests {
                 acc_datum_type: f32::datum_type(),
                 is_causal: false,
             },
-            &[q, kc[0], vc[0]],
+            &sdpa_inputs,
         )?;
         model.select_output_outlets(&o)?;
 
         assert!(model.nodes().iter().any(|n| n.op_is::<DynKeyValueCache>()));
-        InPlaceKvSdpaTransform.transform(&mut model)?;
+        let model = model.into_optimized()?;
 
         // Structural: fused op present, caches + sdpa gone.
         assert!(model.nodes().iter().any(|n| n.op_is::<InPlaceKvSdpa>()), "fused op present");
         assert!(!model.nodes().iter().any(|n| n.op_is::<DynKeyValueCache>()), "caches removed");
         assert!(!model.nodes().iter().any(|n| n.op_is::<Sdpa>()), "sdpa removed");
         let fused = model.nodes().iter().find(|n| n.op_is::<InPlaceKvSdpa>()).unwrap();
-        assert_eq!(fused.inputs.len(), 3, "fused op takes [Q, K_new, V_new]");
+        assert_eq!(
+            fused.inputs.len(),
+            if masked { 4 } else { 3 },
+            "fused op takes [Q, K_new, V_new] and the mask it was given"
+        );
 
-        // Behavioral: the rewritten model runs and matches the baseline over decode.
+        // Behavioral: the optimized model runs and matches the baseline over decode.
         let runnable = model.into_runnable()?;
         let mut rt = runnable.spawn()?;
         let flash = FlashSdpaOp { causal: false, scale: None };
@@ -753,14 +836,16 @@ mod tests {
         let mut vacc: Option<Tensor> = None;
         let mut snews = vec![3usize];
         snews.extend(std::iter::repeat_n(1usize, 6));
+        let mut kv_len = 0usize;
         for (t, &snew) in snews.iter().enumerate() {
             let qi = seq_tensor(&[b, hq, snew, d], 2.0 + t as f32);
             let ki = seq_tensor(&[b, hkv, snew, d], 3.0 + t as f32 * 0.2);
             let vi = seq_tensor(&[b, hkv, snew, d], 8.0 - t as f32 * 0.1);
-            let o_model = rt
-                .run(tvec![qi.clone().into(), ki.clone().into(), vi.clone().into()])?
-                .remove(0)
-                .into_tensor();
+            kv_len += snew;
+            let mi = masked.then(|| attn_mask(b, snew, kv_len));
+            let mut ins = tvec![qi.clone().into(), ki.clone().into(), vi.clone().into()];
+            ins.extend(mi.clone().map(|m| m.into()));
+            let o_model = rt.run(ins)?.remove(0).into_tensor();
             kacc = Some(match kacc.take() {
                 None => ki.clone(),
                 Some(c) => TypedConcat { axis: 2 }
@@ -775,16 +860,13 @@ mod tests {
                     .remove(0)
                     .into_tensor(),
             });
-            let o_base = flash
-                .eval(
-                    &EvalContext::out_of_plan(),
-                    tvec![qi.into(), kacc.clone().unwrap().into(), vacc.clone().unwrap().into()],
-                )?
-                .remove(0)
-                .into_tensor();
-            o_model
-                .close_enough(&o_base, Approximation::Approximate)
-                .with_context(|| format!("rewritten model != baseline at step {t}"))?;
+            let mut base_ins =
+                tvec![qi.into(), kacc.clone().unwrap().into(), vacc.clone().unwrap().into()];
+            base_ins.extend(mi.map(|m| m.into()));
+            let o_base = flash.eval(&EvalContext::out_of_plan(), base_ins)?.remove(0).into_tensor();
+            o_model.close_enough(&o_base, Approximation::Approximate).with_context(|| {
+                format!("optimized model != baseline at step {t} (masked={masked})")
+            })?;
         }
         Ok(())
     }
@@ -805,7 +887,7 @@ mod tests {
         );
         println!("   T     baseline(ms)  fused(ms)   speedup");
         for &steps in &[256usize, 512, 1024, 2048] {
-            let op = InPlaceKvSdpa { axis: 2, causal: false, scale: None };
+            let op = fused_sdpa(false);
             let turn = TurnState::default();
             let mut state = op.state(&EvalContext::out_of_plan())?.unwrap();
             let _turn = turn;
@@ -885,7 +967,7 @@ mod tests {
     // going — bit-identical to a straight run.
     #[test]
     fn resume_via_clone() -> TractResult<()> {
-        let op = InPlaceKvSdpa { axis: 2, causal: true, scale: None };
+        let op = fused_sdpa(true);
         let _turn = TurnState::default();
         let mut straight = op.state(&EvalContext::out_of_plan())?.unwrap();
         let mut split = op.state(&EvalContext::out_of_plan())?.unwrap();
@@ -909,7 +991,7 @@ mod tests {
     // (load_from), then continue — bit-identical to a straight run.
     #[test]
     fn resume_via_save_load() -> TractResult<()> {
-        let op = InPlaceKvSdpa { axis: 2, causal: true, scale: None };
+        let op = fused_sdpa(true);
         let mut turn = TurnState::default();
         let mut straight = op.state(&EvalContext::out_of_plan())?.unwrap();
         let mut split = op.state(&EvalContext::out_of_plan())?.unwrap();
@@ -941,7 +1023,7 @@ mod tests {
     fn bench_resume_snapshot() -> TractResult<()> {
         use std::time::Instant;
         let (b, hq, hkv, d) = (1usize, 8usize, 8usize, 128usize);
-        let op = InPlaceKvSdpa { axis: 2, causal: false, scale: None };
+        let op = fused_sdpa(false);
         let _turn = TurnState::default();
         let q = seq_tensor(&[b, hq, 1, d], 7.0);
         let kv = seq_tensor(&[b, hkv, 1, d], 1.0);

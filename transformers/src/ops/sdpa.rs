@@ -177,7 +177,7 @@ impl Sdpa {
         let scale = self
             .scale
             .as_ref()
-            .map(|t| *t.try_as_plain().unwrap().to_scalar::<f32>().unwrap())
+            .map(|t| *t.try_as_plain_ram().unwrap().to_scalar::<f32>().unwrap())
             .unwrap_or_else(|| (num_kd as f32).sqrt().recip());
 
         if self.is_causal {
@@ -249,7 +249,7 @@ impl Sdpa {
 }
 
 tract_core::declare_knob!(
-    TRACT_FLASH_SDPA_MIN_SEQ_LEN,
+    scopable TRACT_FLASH_SDPA_MIN_SEQ_LEN,
     usize,
     0,
     "Minimum K/V sequence length for head-parallel flash SDPA on CPU; below it the decomposed matmul+softmax path is used."
@@ -394,6 +394,13 @@ impl TypedOp for Sdpa {
             let kv_len = k_fact.shape.get(k_fact.rank() - 2).and_then(|d| d.to_usize().ok());
             let too_short = kv_len.is_some_and(|n| n < flash_min_seq_len());
             if q_head_dim == v_head_dim && !too_short {
+                // A cache feeding this attention and nothing else is grown in place
+                // instead, the fused op running the same kernel over its own buffers.
+                if let Some(patch) =
+                    crate::ops::inplace_kv_cache::fuse_inplace_kv_sdpa(model, node, self)?
+                {
+                    return Ok(Some(patch));
+                }
                 let scale = self.scale.as_ref().map(|t| t.cast_to_scalar()).transpose()?;
                 let op = FlashSdpaOp { causal: self.is_causal, scale };
                 TypedModelPatch::replace_single_op(model, node, &node.inputs, op).map(Some)

@@ -1,7 +1,7 @@
 use crate::internal::*;
 use downcast_rs::Downcast;
-use dyn_eq::DynEq;
 use std::fmt::{self, Debug};
+use tract_data::dyn_eq::DynEq;
 use tract_data::itertools::izip;
 use tract_itertools::Itertools;
 use tract_linalg::multithread::BShare;
@@ -12,7 +12,7 @@ use super::{cast::cast, math::SubF};
 use tract_linalg::routines::Func;
 
 pub trait BinMiniOp:
-    fmt::Debug + dyn_clone::DynClone + dyn_eq::DynEq + Send + Sync + 'static + Downcast
+    fmt::Debug + dyn_clone::DynClone + DynEq + Send + Sync + 'static + Downcast
 {
     fn name(&self) -> &'static str;
     fn validation(&self) -> Validation {
@@ -161,7 +161,7 @@ impl TypedBinOp {
         let b = tensor0(b.clone()).into_tvalue();
         let result = self.0.eval(a, b, TDim::datum_type()).ok()?;
         result
-            .try_as_plain()
+            .try_as_plain_ram()
             .ok()
             .and_then(|d| d.as_slice::<TDim>().ok())
             .and_then(|s| s.first())
@@ -777,6 +777,10 @@ impl TypedOp for OptBinByScalar {
             .collect())
     }
 
+    fn fuse(&self, model: &TypedModel, node: &TypedNode) -> TractResult<Option<TypedModelPatch>> {
+        fuse_elementwise_chain(model, node)
+    }
+
     as_op!();
 }
 
@@ -909,7 +913,299 @@ impl TypedOp for OptBinUnicast {
             .collect())
     }
 
+    fn fuse(&self, model: &TypedModel, node: &TypedNode) -> TractResult<Option<TypedModelPatch>> {
+        fuse_elementwise_chain(model, node)
+    }
+
     as_op!();
+}
+
+/// One step of an [`OptBinChain`] pass: an `OptBinUnicast` ([`BShare::Lockstep`])
+/// or `OptBinByScalar` ([`BShare::PerBlock`]) reduced to its kernel, operand
+/// sharing pattern and mini-op for fallback eval and cost.
+#[derive(Clone)]
+pub struct OptBinChainStep {
+    pub linalg_op: BinOp,
+    pub binop: Box<dyn BinMiniOp>,
+    eval_fn: Arc<BinFn>,
+    pub share: BShare,
+}
+
+impl Debug for OptBinChainStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        write!(f, "{}@{:?}", self.binop.name(), self.share)
+    }
+}
+
+impl PartialEq for OptBinChainStep {
+    fn eq(&self, other: &Self) -> bool {
+        *self.binop == *other.binop && self.share == other.share
+    }
+}
+impl Eq for OptBinChainStep {}
+
+/// Elementwise binary ops folded into a single pass over one accumulator.
+/// Input 0 is `a`; input `i + 1` is step `i`'s `b` operand. Each step streams
+/// the same `a`, so evaluating them back to back per chunk — which
+/// [`tract_linalg::multithread::par_bin_chain`] does — replaces one full memory
+/// pass per step by one pass total, with a bit-identical result. Formed by the
+/// `fuse` pass on `OptBinUnicast`/`OptBinByScalar`/`OptBinChain` chains where
+/// every step keeps `a`'s datum type.
+#[derive(Clone)]
+pub struct OptBinChain {
+    pub steps: TVec<OptBinChainStep>,
+}
+
+impl Debug for OptBinChain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        f.debug_tuple("OptBinChain").field(&self.steps).finish()
+    }
+}
+
+impl PartialEq for OptBinChain {
+    fn eq(&self, other: &Self) -> bool {
+        self.steps == other.steps
+    }
+}
+impl Eq for OptBinChain {}
+
+fn linalg_op_for_binop(binop: &dyn BinMiniOp) -> Option<BinOp> {
+    if binop.is::<Min>() {
+        Some(BinOp::Min)
+    } else if binop.is::<Max>() {
+        Some(BinOp::Max)
+    } else if binop.is::<Add>() {
+        Some(BinOp::Add)
+    } else if binop.is::<Mul>() {
+        Some(BinOp::Mul)
+    } else if binop.is::<Sub>() {
+        Some(BinOp::Sub)
+    } else if binop.is::<SubF>() {
+        Some(BinOp::SubF)
+    } else {
+        None
+    }
+}
+
+/// Evaluate one chain step with the same fast-path discipline the source op
+/// would have used alone: `par_bin` on natural strides, `repeat_broadcast`
+/// under a short PerBlock period, generic `binop.eval` otherwise.
+fn eval_bin_chain_step(step: &OptBinChainStep, a: TValue, b: TValue) -> TractResult<TValue> {
+    let natural = |t: &Tensor| {
+        t.len() == t.shape().iter().product::<usize>()
+            && t.strides() == &*Tensor::natural_strides(t.shape())
+    };
+    if !natural(&a) || !natural(&b) {
+        let c_dt = step.binop.result_datum_type(a.datum_type(), b.datum_type())?;
+        return Ok(step.binop.eval(a, b, c_dt)?.into_tvalue());
+    }
+    let mut a = a.into_tensor();
+    match step.share {
+        BShare::Lockstep => {
+            tract_linalg::multithread::par_bin(
+                &*step.eval_fn,
+                &mut a,
+                &b,
+                b.len(),
+                BShare::Lockstep,
+            )?;
+        }
+        BShare::PerBlock => {
+            let period = a.len().checked_div(b.len().max(1)).unwrap_or(0);
+            if period > 1 && period < 16 && repeat_broadcast(step.linalg_op, &mut a, &b, period)? {
+                return Ok(a.into_tvalue());
+            }
+            tract_linalg::multithread::par_bin(
+                &*step.eval_fn,
+                &mut a,
+                &b,
+                period,
+                BShare::PerBlock,
+            )?;
+        }
+    }
+    Ok(a.into_tvalue())
+}
+
+impl Op for OptBinChain {
+    fn name(&self) -> StaticName {
+        format!("OptBinChain({})", self.steps.iter().map(|s| s.binop.name()).join("+")).into()
+    }
+
+    op_as_typed_op!();
+}
+
+impl EvalOp for OptBinChain {
+    op_out_of_plan!();
+
+    fn eval(&self, _ctx: &EvalContext, mut inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+        let natural = |t: &Tensor| {
+            t.len() == t.shape().iter().product::<usize>()
+                && t.strides() == &*Tensor::natural_strides(t.shape())
+        };
+        let all_natural = inputs.iter().all(|t| natural(t));
+        let acc = inputs.remove(0);
+        let operands = inputs;
+        let sequential = |acc: TValue| -> TractResult<TValue> {
+            self.steps
+                .iter()
+                .zip(operands.iter())
+                .try_fold(acc, |acc, (step, b)| eval_bin_chain_step(step, acc, b.clone()))
+        };
+        if !all_natural {
+            return Ok(tvec!(sequential(acc)?));
+        }
+        let mut a = acc.into_tensor();
+        // A PerBlock operand sharing one scalar with fewer than a vector's
+        // worth of elements belongs on `repeat_broadcast`; run the chain one
+        // step at a time so that step can take it.
+        let tiny_period = self.steps.iter().zip(operands.iter()).any(|(s, b)| {
+            s.share == BShare::PerBlock && {
+                let period = a.len() / b.len().max(1);
+                period > 1 && period < 16
+            }
+        });
+        if tiny_period {
+            return Ok(tvec!(sequential(a.into_tvalue())?));
+        }
+        let steps: Vec<tract_linalg::multithread::BinChainStep> = self
+            .steps
+            .iter()
+            .zip(operands.iter())
+            .map(|(s, b)| tract_linalg::multithread::BinChainStep {
+                eval_fn: &*s.eval_fn,
+                b,
+                period: match s.share {
+                    BShare::Lockstep => b.len(),
+                    BShare::PerBlock => a.len() / b.len().max(1),
+                },
+                share: s.share,
+            })
+            .collect();
+        tract_linalg::multithread::par_bin_chain(&steps, &mut a)?;
+        Ok(tvec!(a.into_tvalue()))
+    }
+}
+
+impl TypedOp for OptBinChain {
+    fn output_facts(&self, inputs: &[&TypedFact]) -> TractResult<TVec<TypedFact>> {
+        ensure!(inputs.len() == self.steps.len() + 1);
+        for (step, fact) in self.steps.iter().zip(inputs[1..].iter()) {
+            ensure!(
+                step.binop.result_datum_type(inputs[0].datum_type, fact.datum_type)?
+                    == inputs[0].datum_type
+            );
+        }
+        Ok(tvec!(inputs[0].without_value()))
+    }
+
+    fn cost(&self, inputs: &[&TypedFact]) -> TractResult<TVec<(Cost, TDim)>> {
+        let count: TDim = self.output_facts(inputs)?[0].shape.iter().product();
+        Ok(self
+            .steps
+            .iter()
+            .flat_map(|s| s.binop.cost_per_element(inputs[0].datum_type))
+            .map(|(c, n)| (c, count.clone() * n))
+            .collect())
+    }
+
+    fn fuse(&self, model: &TypedModel, node: &TypedNode) -> TractResult<Option<TypedModelPatch>> {
+        fuse_elementwise_chain(model, node)
+    }
+
+    as_op!();
+}
+
+/// Collapse a run of `OptBinUnicast`, `OptBinByScalar` and `OptBinChain` nodes
+/// passing one tensor through each other into a single [`OptBinChain`]. Only
+/// fires on the head of a run — when the `a` producer could itself absorb this
+/// node, defer to its `fuse` instead — and only while every step's operand has
+/// the accumulator's datum type and the step maps it back to that type, which
+/// is what keeps the pass in place on `a`.
+fn fuse_elementwise_chain(
+    model: &TypedModel,
+    node: &TypedNode,
+) -> TractResult<Option<TypedModelPatch>> {
+    fn steps_of(op: &dyn Op) -> Option<TVec<OptBinChainStep>> {
+        if let Some(o) = op.downcast_ref::<OptBinUnicast>() {
+            Some(tvec![OptBinChainStep {
+                linalg_op: linalg_op_for_binop(&*o.binop)?,
+                binop: o.binop.clone(),
+                eval_fn: o.eval_fn.clone(),
+                share: BShare::Lockstep,
+            }])
+        } else if let Some(o) = op.downcast_ref::<OptBinByScalar>() {
+            Some(tvec![OptBinChainStep {
+                linalg_op: o.linalg_op,
+                binop: o.binop.clone(),
+                eval_fn: o.eval_fn.clone(),
+                share: BShare::PerBlock,
+            }])
+        } else {
+            op.downcast_ref::<OptBinChain>().map(|o| o.steps.clone())
+        }
+    }
+
+    rule_if_some!(mut steps = steps_of(&*node.op));
+    // Defer to the producer when it could absorb this node itself: only the
+    // head of the run builds the patch.
+    let pred_out = node.inputs[0];
+    let pred = model.node(pred_out.node);
+    if pred.outputs[pred_out.slot].successors.len() == 1
+        && !model.output_outlets()?.contains(&pred_out)
+        && (steps_of(&*pred.op).is_some() || pred.op.fuse(model, pred)?.is_some())
+    {
+        return Ok(None);
+    }
+    let a_dt = model.outlet_fact(node.inputs[0])?.datum_type;
+    rule_if!(a_dt.is_float());
+    let mut inlets: TVec<OutletId> = node.inputs.iter().cloned().collect();
+    let mut last = node.id;
+    let mut cursor = node.id;
+    loop {
+        let current = model.node(cursor);
+        if current.outputs.len() != 1 {
+            break;
+        }
+        let outlet = OutletId::new(cursor, 0);
+        if current.outputs[0].successors.len() != 1 || model.output_outlets()?.contains(&outlet) {
+            break;
+        }
+        let succ_inlet = current.outputs[0].successors[0];
+        // our value must be the successor's accumulator, not its operand.
+        if succ_inlet.slot != 0 {
+            break;
+        }
+        let succ = model.node(succ_inlet.node);
+        let Some(mut more) = steps_of(&*succ.op) else { break };
+        let keep_dt = more.iter().enumerate().all(|(ix, s)| {
+            model
+                .outlet_fact(succ.inputs[ix + 1])
+                .ok()
+                .filter(|f| f.datum_type == a_dt)
+                .and_then(|_| s.binop.result_datum_type(a_dt, a_dt).ok())
+                == Some(a_dt)
+        });
+        if !keep_dt {
+            break;
+        }
+        inlets.extend(succ.inputs[1..].iter().cloned());
+        steps.append(&mut more);
+        last = succ.id;
+        cursor = succ.id;
+        if steps.len() >= 16 {
+            break;
+        }
+    }
+    rule_if!(last != node.id);
+    let mut patch = TypedModelPatch::new("fusing elementwise chain");
+    let wires = inlets
+        .iter()
+        .map(|i| patch.tap_model(model, *i))
+        .collect::<TractResult<Vec<OutletId>>>()?;
+    let wire = patch.wire_node(&model.node(last).name, OptBinChain { steps }, &wires)?[0];
+    patch.shunt_outside(model, last.into(), wire)?;
+    Ok(Some(patch))
 }
 
 #[macro_export]
@@ -947,11 +1243,11 @@ macro_rules! bin_to_super_type {
                         $(
                             $(if c.datum_type() == $typ::datum_type() {
                                 let cab: fn(&mut $typ, &$typ, &$typ) -> () = $cab;
-                                let a_plain = a.try_as_plain()?;
+                                let a_plain = a.try_as_plain_ram()?;
                                 let a_slice = a_plain.as_slice::<$typ>()?;
-                                let b_plain = b.try_as_plain()?;
+                                let b_plain = b.try_as_plain_ram()?;
                                 let b_slice = b_plain.as_slice::<$typ>()?;
-                                let mut c_plain = c.try_as_plain_mut()?;
+                                let mut c_plain = c.try_as_plain_ram_mut()?;
                                 let c_slice = c_plain.as_slice_mut::<$typ>()?;
                                 debug_assert_eq!(c_slice.len(), a_slice.len());
                                 debug_assert_eq!(c_slice.len(), b_slice.len());
@@ -973,11 +1269,11 @@ macro_rules! bin_to_super_type {
                                 $(if a.datum_type().unquantized() == <$typ_dt>::datum_type().unquantized() {
                                     let cab: fn(&mut $typ_dt, &$typ_dt, &$typ_dt, i32, f32) -> () = $cab_dt;
                                     let (zp, scale) = a.datum_type().qparams().map(|q| q.zp_scale()).unwrap_or((0, 1.));
-                                    let a_plain = a.try_as_plain()?;
+                                    let a_plain = a.try_as_plain_ram()?;
                                     let a_slice = a_plain.as_slice::<$typ_dt>()?;
-                                    let b_plain = b.try_as_plain()?;
+                                    let b_plain = b.try_as_plain_ram()?;
                                     let b_slice = b_plain.as_slice::<$typ_dt>()?;
-                                    let mut c_plain = c.try_as_plain_mut()?;
+                                    let mut c_plain = c.try_as_plain_ram_mut()?;
                                     let c_slice = c_plain.as_slice_mut::<$typ_dt>()?;
                                     for ((cv, av), bv) in c_slice.iter_mut().zip(a_slice.iter()).zip(b_slice.iter()) {
                                         cab(cv, av, bv, zp, scale);
@@ -991,7 +1287,7 @@ macro_rules! bin_to_super_type {
                         $(if c.datum_type() == $typ::datum_type() {
                             let a = a.to_plain_array_view::<$typ>()?;
                             let b = b.to_plain_array_view::<$typ>()?;
-                            let mut c_plain = c.try_as_plain_mut()?;
+                            let mut c_plain = c.try_as_plain_ram_mut()?;
                             let mut c = c_plain.to_array_view_mut::<$typ>()?;
                             $crate::ndarray::Zip::from(&mut c).and_broadcast(a).and_broadcast(b).for_each($cab);
                             return Ok(())
@@ -1004,7 +1300,7 @@ macro_rules! bin_to_super_type {
                                 let (zp, scale) = a.datum_type().qparams().map(|q| q.zp_scale()).unwrap_or((0, 1.));
                                 let a = a.to_plain_array_view::<$typ_dt>()?;
                                 let b = b.to_plain_array_view::<$typ_dt>()?;
-                                let mut c_plain = c.try_as_plain_mut()?;
+                                let mut c_plain = c.try_as_plain_ram_mut()?;
                                 let mut c = c_plain.to_array_view_mut::<$typ_dt>()?;
                                 $crate::ndarray::Zip::from(&mut c).and_broadcast(a).and_broadcast(b).for_each(|c, a, b| cab(c, a, b, zp, scale));
                                 return Ok(())
@@ -1033,9 +1329,9 @@ macro_rules! bin_to_super_type {
                     $(
                         $(if b.datum_type() == $typ::datum_type() {
                             let cab: fn(&mut $typ, &$typ, &$typ) -> () = $cab;
-                            let b_plain = b.try_as_plain()?;
+                            let b_plain = b.try_as_plain_ram()?;
                             let b_slice = b_plain.as_slice::<$typ>()?;
-                            let mut a_plain = a.try_as_plain_mut()?;
+                            let mut a_plain = a.try_as_plain_ram_mut()?;
                             let a_slice = a_plain.as_slice_mut::<$typ>()?;
                             debug_assert_eq!(a_slice.len(), b_slice.len());
                             let len = a_slice.len();
@@ -1055,9 +1351,9 @@ macro_rules! bin_to_super_type {
                             $(if a.datum_type().unquantized() == <$typ_dt>::datum_type().unquantized() {
                                 let cab: fn(&mut $typ_dt, &$typ_dt, &$typ_dt, i32, f32) -> () = $cab_dt;
                                 let (zp, scale) = a.datum_type().qparams().map(|q| q.zp_scale()).unwrap_or((0, 1.));
-                                let b_plain = b.try_as_plain()?;
+                                let b_plain = b.try_as_plain_ram()?;
                                 let b_slice = b_plain.as_slice::<$typ_dt>()?;
-                                let mut a_plain = a.try_as_plain_mut()?;
+                                let mut a_plain = a.try_as_plain_ram_mut()?;
                                 let a_slice = a_plain.as_slice_mut::<$typ_dt>()?;
                                 for (av, bv) in a_slice.iter_mut().zip(b_slice.iter()) {
                                     cab(av, &(av.clone()), bv, zp, scale);
@@ -1071,7 +1367,7 @@ macro_rules! bin_to_super_type {
                     $(if b.datum_type() == $typ::datum_type() {
                         let cab: fn(&mut $typ, &$typ, &$typ) -> () = $cab;
                         let b = b.to_plain_array_view::<$typ>()?;
-                        let mut a_plain = a.try_as_plain_mut()?;
+                        let mut a_plain = a.try_as_plain_ram_mut()?;
                         let mut a = a_plain.to_array_view_mut::<$typ>()?;
                         $crate::ndarray::Zip::from(&mut a).and_broadcast(b).for_each(|a, b| cab(a, &a.clone(), b));
                         return Ok(())
@@ -1082,7 +1378,7 @@ macro_rules! bin_to_super_type {
                         $(if a.datum_type().unquantized() == <$typ_dt>::datum_type().unquantized() {
                             let cab: fn(&mut $typ_dt, &$typ_dt, &$typ_dt, i32, f32) -> () = $cab_dt;
                             let (zp, scale) = a.datum_type().qparams().map(|q| q.zp_scale()).unwrap_or((0, 1.));
-                            let mut a_plain = a.try_as_plain_mut()?;
+                            let mut a_plain = a.try_as_plain_ram_mut()?;
                             let mut a = a_plain.to_array_view_mut::<$typ_dt>()?;
                             let b = b.to_plain_array_view::<$typ_dt>()?;
                             $crate::ndarray::Zip::from(&mut a).and_broadcast(b).for_each(|a, b| {
@@ -1180,7 +1476,7 @@ macro_rules! bin_to_super_type {
                             let b = b.to_plain_array_view::<u8>()?;
                             let c_shape = $crate::broadcast::multi_broadcast(&[a.shape(), b.shape()])?;
                             let mut c = Tensor::zero_dt(*c_dt, &c_shape)?;
-                            let mut c_plain = c.try_as_plain_mut()?;
+                            let mut c_plain = c.try_as_plain_ram_mut()?;
                             let view = c_plain.to_array_view_mut::<u8>()?;
                             $crate::ndarray::Zip::from(view).and_broadcast(a).and_broadcast(b).for_each(|c, a, b| {
                                 *c = (scale_by($q_op_on_f32(
@@ -1211,9 +1507,9 @@ macro_rules! bin_to_super_type {
                             let mut c = Tensor::zero_dt(accumulator_dt, &c_shape)?;
                             match accumulator_dt {
                                 DatumType::F32 => {
-                                    let mut c_plain = c.try_as_plain_mut()?;
+                                    let mut c_plain = c.try_as_plain_ram_mut()?;
                                     let view = c_plain.to_array_view_mut::<f32>()?;
-                                    $crate::ndarray::Zip::from(view).and_broadcast(a.try_as_plain()?.to_array_view()?).and_broadcast(b.try_as_plain()?.to_array_view()?).for_each(|c, a, b| {
+                                    $crate::ndarray::Zip::from(view).and_broadcast(a.try_as_plain_ram()?.to_array_view()?).and_broadcast(b.try_as_plain_ram()?.to_array_view()?).for_each(|c, a, b| {
                                         *c = $q_op_on_f32(*a,*b);
                                     })
                                 },
@@ -1315,7 +1611,7 @@ mod tests {
             op.eval(&EvalContext::out_of_plan(), tvec!(a.into_tvalue(), b.into_tvalue())).unwrap();
         let out = &out[0];
         assert_eq!(out.shape(), &[1, 1, 640]);
-        let plain = out.try_as_plain().unwrap();
+        let plain = out.try_as_plain_ram().unwrap();
         let out_slice = plain.as_slice::<f32>().unwrap();
         for (i, v) in out_slice.iter().enumerate() {
             assert_eq!(*v, i as f32 + 1.0, "mismatch at {i}");
@@ -1373,7 +1669,7 @@ mod tests {
         model.select_output_outlets(&[add])?;
 
         let mut input = Tensor::zero_dt(x_dt, &[4])?;
-        input.try_as_plain_mut()?.as_slice_mut::<u8>()?.copy_from_slice(&[10, 35, 60, 200]);
+        input.try_as_plain_ram_mut()?.as_slice_mut::<u8>()?.copy_from_slice(&[10, 35, 60, 200]);
         let input = tvec!(input.into_tvalue());
 
         let before = model.clone().into_runnable()?.run(input.clone())?;

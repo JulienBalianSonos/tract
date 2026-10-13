@@ -80,69 +80,6 @@ pub struct TensorValues {
     pub only_output: bool,
 }
 
-fn parse_dt(dt: &str) -> TractResult<DatumType> {
-    Ok(match dt.to_lowercase().as_ref() {
-        "bool" => DatumType::Bool,
-        "f16" => DatumType::F16,
-        "f32" => DatumType::F32,
-        "f64" => DatumType::F64,
-        "i8" => DatumType::I8,
-        "i16" => DatumType::I16,
-        "i32" => DatumType::I32,
-        "i64" => DatumType::I64,
-        "u8" => DatumType::U8,
-        "u16" => DatumType::U16,
-        "u32" => DatumType::U32,
-        "u64" => DatumType::U64,
-        "tdim" => DatumType::TDim,
-        _ => bail!(
-            "Type of the input should be f16, f32, f64, i8, i16, i16, i32, u8, u16, u32, u64, TDim."
-        ),
-    })
-}
-
-pub fn parse_spec(symbol_table: &SymbolScope, size: &str) -> TractResult<InferenceFact> {
-    if size.is_empty() {
-        return Ok(InferenceFact::default());
-    }
-    parse_coma_spec(symbol_table, size)
-}
-
-pub fn parse_coma_spec(symbol_table: &SymbolScope, size: &str) -> TractResult<InferenceFact> {
-    let splits = size.split(',').collect::<Vec<_>>();
-
-    #[allow(clippy::literal_string_with_formatting_args)]
-    if splits.is_empty() {
-        bail!("The <size> argument should be formatted as {{size}},{{...}},{{type}}.");
-    }
-
-    let last = splits.last().unwrap();
-    let (datum_type, shape) = if let Ok(dt) = parse_dt(last) {
-        (Some(dt), &splits[0..splits.len() - 1])
-    } else {
-        (None, &*splits)
-    };
-
-    let shape = ShapeFactoid::closed(
-        shape
-            .iter()
-            .map(|&s| {
-                Ok(if s == "_" {
-                    GenericFactoid::Any
-                } else {
-                    GenericFactoid::Only(parse_tdim(symbol_table, s)?)
-                })
-            })
-            .collect::<TractResult<TVec<DimFact>>>()?,
-    );
-
-    if let Some(dt) = datum_type {
-        Ok(InferenceFact::dt_shape(dt, shape))
-    } else {
-        Ok(InferenceFact::shape(shape))
-    }
-}
-
 fn parse_values<T: Datum + FromStr>(shape: &[usize], it: Vec<&str>) -> TractResult<Tensor> {
     let values = it
         .into_iter()
@@ -160,7 +97,7 @@ fn tensor_for_text_data(
     reader.read_to_string(&mut data)?;
 
     let mut lines = data.lines();
-    let proto = parse_spec(symbol_table, lines.next().context("Empty data file")?)?;
+    let proto = InferenceFact::from_spec(symbol_table, lines.next().context("Empty data file")?)?;
     let shape = proto.shape.concretize().unwrap();
 
     let values = lines.flat_map(|l| l.split_whitespace()).collect::<Vec<&str>>();
@@ -249,6 +186,11 @@ pub fn for_string(
     symbol_table: &SymbolScope,
     value: &str,
 ) -> TractResult<(Option<String>, InferenceFact)> {
+    if let Some(path) = value.strip_prefix('@') {
+        bail!(
+            "Tensor specs do not read files (got @{path}): use --input-facts-from-bundle for shapes and types, or run --input-from-npz for values"
+        );
+    }
     let (name, value) = if value.contains(':') {
         let mut splits = value.split(':');
         (Some(splits.next().unwrap().to_string()), splits.next().unwrap())
@@ -257,7 +199,7 @@ pub fn for_string(
     };
     if value.contains('=') {
         let mut split = value.split('=');
-        let spec = parse_spec(symbol_table, split.next().unwrap())?;
+        let spec = InferenceFact::from_spec(symbol_table, split.next().unwrap())?;
         let value = split.next().unwrap().split(',');
         let dt =
             spec.datum_type.concretize().context("Must specify type when giving tensor value")?;
@@ -270,7 +212,7 @@ pub fn for_string(
             let values =
                 value.map(|v| parse_tdim(symbol_table, v)).collect::<TractResult<Vec<_>>>()?;
             tensor
-                .try_as_plain_mut()?
+                .try_as_plain_ram_mut()?
                 .as_slice_mut::<TDim>()?
                 .iter_mut()
                 .zip(values)
@@ -281,7 +223,7 @@ pub fn for_string(
         };
         Ok((name, tensor.into()))
     } else {
-        Ok((name, parse_spec(symbol_table, value)?))
+        Ok((name, InferenceFact::from_spec(symbol_table, value)?))
     }
 }
 
@@ -313,6 +255,25 @@ pub struct RunTensors {
     /// resolve `end_input` correctly at end-of-stream.  `None` for
     /// non-pulse runs.
     pub streaming_input_len: Option<usize>,
+}
+
+#[cfg(not(feature = "transformers"))]
+fn chunk_fact(
+    fact: &TypedFact,
+    _params: &RunParams,
+    _model: &Arc<dyn Model>,
+) -> TractResult<Vec<TypedFact>> {
+    Ok(vec![fact.clone()])
+}
+
+#[cfg(not(feature = "transformers"))]
+fn chunk_tensor(
+    tensor: Tensor,
+    _fact: &TypedFact,
+    _params: &RunParams,
+    _model: &Arc<dyn Model>,
+) -> TractResult<Vec<TValue>> {
+    Ok(vec![tensor.into_tvalue()])
 }
 
 #[cfg(feature = "transformers")]
@@ -411,6 +372,11 @@ fn get_or_make_tensors(
     target: &mut TVec<Vec<TValue>>,
     streaming_input_len: &mut Option<usize>,
 ) -> TractResult<()> {
+    // What the caller feeds is not what the model runs: an autobatched model keeps its
+    // batch axis symbolic while every stream feeds one row, so the shapes here
+    // come from `--set` rather than from the facts.
+    let mut fact = fact;
+    fact.shape = fact.shape.iter().map(|dim| dim.eval(&params.symbols)).collect();
     if let Some(mut value) = params
         .tensors_values
         .by_name(name)
@@ -463,7 +429,7 @@ fn get_or_make_tensors(
                 .get("pulse.input_axes")
                 .context("Expect pulse.input_axes property")?
                 .cast_to::<i64>()?
-                .try_as_plain()?
+                .try_as_plain_ram()?
                 .as_slice::<i64>()?[input_idx] as usize;
             let input_pulse = fact.shape.get(input_pulse_axis).unwrap().to_usize().unwrap();
             let mut input_len = value.shape()[input_pulse_axis];
@@ -492,19 +458,23 @@ fn get_or_make_tensors(
                 .get("pulse.output_axes")
                 .context("Expect pulse.output_axes property")?
                 .cast_to::<i64>()?
-                .try_as_plain()?
+                .try_as_plain_ram()?
                 .as_slice::<i64>()?[0] as usize;
             let output_fact = model.outlet_typedfact(model.output_outlets()[0])?;
             let output_pulse =
                 output_fact.shape.get(output_pulse_axis).unwrap().to_usize().unwrap();
             let output_len = input_len * output_pulse / input_pulse;
-            let output_delay =
-                model.properties()["pulse.delay"].try_as_plain()?.as_slice::<i64>()?[0] as usize;
+            let output_delay = model.properties()["pulse.delay"]
+                .try_as_plain_ram()?
+                .as_slice::<i64>()?[0] as usize;
             let last_frame = output_len + output_delay;
             let needed_pulses = last_frame.divceil(output_pulse);
             let mut values = vec![];
             for ix in 0..needed_pulses {
-                let mut t = Tensor::zero_dt(fact.datum_type, fact.shape.as_concrete().unwrap())?;
+                let shape = fact.shape.as_concrete().with_context(|| {
+                    format!("Input {name} pulses into {fact:?}, bind its free symbols with --set")
+                })?;
+                let mut t = Tensor::zero_dt(fact.datum_type, shape)?;
                 let start = ix * input_pulse;
                 let end = (start + input_pulse).min(input_len);
                 if end > start {
@@ -540,7 +510,6 @@ fn get_or_make_tensors(
 
         let mut chunked_tensors = Vec::with_capacity(chunked_facts.len());
         for fact in &mut chunked_facts {
-            fact.shape = fact.shape.iter().map(|dim| dim.eval(&params.symbols)).collect();
             chunked_tensors.push(tensor_for_fact(fact, None, tv)?.into());
         }
         target.push(chunked_tensors);
@@ -621,7 +590,7 @@ pub fn random(sizes: &[usize], datum_type: DatumType, tv: Option<&TensorValues>)
     use rand::{RngExt, SeedableRng};
     let mut rng = rand::rngs::StdRng::seed_from_u64(21242);
     let mut tensor = Tensor::zero::<f32>(sizes).unwrap();
-    let mut tensor_plain = tensor.try_as_plain_mut().unwrap();
+    let mut tensor_plain = tensor.try_as_plain_ram_mut().unwrap();
     let slice = tensor_plain.as_slice_mut::<f32>().unwrap();
     if let Some(range) = tv.and_then(|tv| tv.random_range.as_ref()) {
         slice.iter_mut().for_each(|x| *x = rng.random_range(range.clone()))
@@ -629,4 +598,22 @@ pub fn random(sizes: &[usize], datum_type: DatumType, tv: Option<&TensorValues>)
         slice.iter_mut().for_each(|x| *x = rng.random())
     };
     tensor.cast_to_dt(datum_type).unwrap().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn named_spec_with_value() {
+        let (name, fact) = for_string(&SymbolScope::default(), "x:2,f32=1,2").unwrap();
+        assert_eq!(name.as_deref(), Some("x"));
+        assert_eq!(fact.value.concretize().unwrap().into_tensor(), tensor1(&[1f32, 2.]));
+    }
+
+    #[test]
+    fn file_spec_is_rejected() {
+        let err = for_string(&SymbolScope::default(), "@inputs.npz:x.npy").unwrap_err();
+        assert!(err.to_string().contains("do not read files"), "{err}");
+    }
 }

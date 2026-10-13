@@ -1,11 +1,13 @@
 #![allow(clippy::missing_safety_doc)]
 #![allow(clippy::missing_transmute_annotations)]
 
-mod arena_view;
+mod lazy;
 mod owned;
+mod view;
 
-pub use arena_view::*;
+pub use lazy::*;
 pub use owned::*;
+pub use view::*;
 
 use num_traits::AsPrimitive;
 use std::ffi::c_void;
@@ -14,13 +16,14 @@ use tract_core::internal::*;
 use tract_data::itertools::Itertools;
 
 use crate::device::{DeviceBuffer, get_context};
+use crate::utils::MAX_COPY_RANK;
+use crate::utils::merge_copy_axes;
 
-/// This struct represents a GPU tensor that can be either a owned tensor
-/// or an arena view.
+/// A GPU tensor: either a buffer of its own, or a window into someone else's.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum DeviceTensor {
     Owned(Box<dyn OwnedDeviceTensor>),
-    ArenaView(DeviceArenaView),
+    View(DeviceView),
 }
 
 impl DeviceTensor {
@@ -81,7 +84,7 @@ impl DeviceTensor {
     pub fn datum_type(&self) -> DatumType {
         match self {
             Self::Owned(owned) => owned.datum_type(),
-            Self::ArenaView(view) => view.datum_type(),
+            Self::View(view) => view.datum_type(),
         }
     }
 
@@ -96,7 +99,7 @@ impl DeviceTensor {
     pub fn shape(&self) -> &[usize] {
         match self {
             Self::Owned(t) => t.shape(),
-            Self::ArenaView(t) => t.shape(),
+            Self::View(t) => t.shape(),
         }
     }
 
@@ -106,7 +109,7 @@ impl DeviceTensor {
     pub fn len(&self) -> usize {
         match self {
             Self::Owned(t) => t.len(),
-            Self::ArenaView(t) => t.len(),
+            Self::View(t) => t.len(),
         }
     }
 
@@ -115,7 +118,7 @@ impl DeviceTensor {
     pub fn strides(&self) -> &[isize] {
         match self {
             Self::Owned(t) => t.strides(),
-            Self::ArenaView(t) => t.strides(),
+            Self::View(t) => t.strides(),
         }
     }
 
@@ -123,7 +126,7 @@ impl DeviceTensor {
     pub fn device_buffer(&self) -> &dyn DeviceBuffer {
         match self {
             Self::Owned(t) => t.device_buffer(),
-            Self::ArenaView(t) => t.device_buffer(),
+            Self::View(t) => t.device_buffer(),
         }
     }
 
@@ -134,14 +137,14 @@ impl DeviceTensor {
     {
         match self {
             Self::Owned(_) => 0.as_(),
-            Self::ArenaView(t) => t.buffer_offset(),
+            Self::View(t) => t.buffer_offset(),
         }
     }
 
     pub fn device_buffer_ptr(&self) -> *const c_void {
         match self {
             Self::Owned(t) => t.device_buffer().ptr(),
-            Self::ArenaView(t) => t.device_buffer().ptr(),
+            Self::View(t) => t.device_buffer().ptr(),
         }
     }
 
@@ -154,14 +157,14 @@ impl DeviceTensor {
     pub fn reshaped(&self, shape: TVec<usize>) -> TractResult<Self> {
         match self {
             Self::Owned(t) => Ok(t.reshaped(shape)?),
-            Self::ArenaView(t) => Ok(Self::ArenaView(t.reshaped(shape)?)),
+            Self::View(t) => Ok(Self::View(t.reshaped(shape)?)),
         }
     }
 
     pub fn restrided(&self, strides: TVec<isize>) -> TractResult<Self> {
         match self {
             Self::Owned(t) => Ok(t.restrided(strides)?),
-            Self::ArenaView(t) => Ok(Self::ArenaView(t.restrided(strides)?)),
+            Self::View(t) => Ok(Self::View(t.restrided(strides)?)),
         }
     }
 
@@ -175,6 +178,88 @@ impl DeviceTensor {
         Tensor::from_storage(dt, &shape, self)
     }
 
+    /// The first `len` along `axis`, as a view keeping this tensor's strides.
+    ///
+    /// What a buffer holding spare capacity hands out: the live prefix costs
+    /// nothing to describe, and the tail it leaves behind is simply not part of
+    /// the shape. A [`DeviceView`] is turn-scoped, so this is for a reader
+    /// downstream of the producer, never for the application.
+    ///
+    /// The result is strided wherever `axis` is not the outermost: a consumer
+    /// has to read shape and strides rather than assume a packed tensor.
+    pub fn prefix_window(&self, axis: usize, len: usize) -> TractResult<DeviceTensor> {
+        ensure!(axis < self.rank(), "axis {axis} out of rank {}", self.rank());
+        ensure!(
+            len <= self.shape()[axis],
+            "window of {len} on axis {axis} of extent {}",
+            self.shape()[axis]
+        );
+        ensure!(!self.is_exotic(), "an exotic tensor carries no shape to window");
+        let mut shape: TVec<usize> = self.shape().into();
+        shape[axis] = len;
+        let (buffer, offset_bytes) = match self {
+            Self::Owned(owned) => (Arc::new(tract_core::dyn_clone::clone_box(&**owned)), 0),
+            Self::View(view) => (Arc::clone(&view.buffer), view.offset_bytes),
+        };
+        Ok(DeviceView {
+            buffer,
+            dt: self.datum_type(),
+            len: shape.iter().product(),
+            shape,
+            strides: self.strides().into(),
+            offset_bytes,
+            exotic_fact: None,
+        }
+        .into())
+    }
+
+    /// Slice `[start, end)` along `axis` by a copy made on the device, or `None`
+    /// where the backends' `copy_nd` kernels cannot serve the case and the
+    /// caller has to fall back.
+    ///
+    /// `dt` and `shape` are the owning tensor's, and storage whose geometry has
+    /// drifted from them is refused rather than sliced on stale dimensions.
+    ///
+    /// A copy rather than a view: a view would alias what it was cut from, which
+    /// outlives neither an arena's turn nor a later write to the source. The
+    /// result owns its buffer, and only the source of the copy is strided, which
+    /// is what lets any axis be sliced and not just a dense one.
+    ///
+    /// The copy is ordered on the stream behind whatever produced the source and
+    /// waits for nothing of its own; a caller that needs the bytes now is the
+    /// one that synchronizes.
+    pub(crate) fn slice_on_device(
+        &self,
+        dt: DatumType,
+        shape: &[usize],
+        axis: usize,
+        start: usize,
+        end: usize,
+    ) -> TractResult<Option<DeviceTensor>> {
+        ensure!(
+            axis < shape.len() && start < end && end <= shape[axis],
+            "Invalid slicing range {start}..{end} on axis {axis} of {shape:?}"
+        );
+        let mut sliced: TVec<usize> = shape.into();
+        sliced[axis] = end - start;
+        let servable = dt == self.datum_type()
+            && shape == self.shape()
+            && !self.is_exotic()
+            && Self::is_supported_dt(dt)
+            && self.strides().iter().all(|s| *s > 0)
+            && (1..=MAX_COPY_RANK).contains(
+                &merge_copy_axes(self.strides(), &sliced, &Tensor::natural_strides(&sliced))
+                    .shape
+                    .len(),
+            );
+        if !servable {
+            return Ok(None);
+        }
+        let output = DeviceTensor::uninitialized_dt(dt, &sliced)?;
+        get_context()?.assign_slice(&output, 0..end - start, self, start..end, axis)?;
+        Ok(Some(output))
+    }
+
     /// Synchronize the GPU Tensor by completing all current
     /// commands on GPU and returns the inner tensor.
     pub fn to_host(&self) -> TractResult<Arc<Tensor>> {
@@ -182,7 +267,7 @@ impl DeviceTensor {
 
         Ok(match self {
             Self::Owned(o) => o.to_host()?,
-            Self::ArenaView(v) => v.to_host()?.into(),
+            Self::View(v) => v.to_host()?.into(),
         })
     }
 
@@ -215,13 +300,13 @@ impl DeviceTensor {
         let dt = self.datum_type();
         let natural = Tensor::natural_strides(shape);
         match self {
-            Self::ArenaView(v) => {
+            Self::View(v) => {
                 if v.exotic_fact.is_some() {
                     return Ok(None);
                 }
                 Ok(Some(
-                    DeviceArenaView {
-                        arena: Arc::clone(&v.arena),
+                    DeviceView {
+                        buffer: Arc::clone(&v.buffer),
                         dt,
                         len: shape.iter().product(),
                         shape: shape.into(),
@@ -239,7 +324,7 @@ impl DeviceTensor {
                 // Owned device tensors clone as cheap buffer handles.
                 let arc: Arc<Box<dyn OwnedDeviceTensor>> =
                     Arc::new(tract_core::dyn_clone::clone_box(&**o));
-                Ok(Some(DeviceTensor::ArenaView(DeviceArenaView::from_owned(
+                Ok(Some(DeviceTensor::View(DeviceView::from_owned(
                     arc,
                     dt,
                     shape.into(),
@@ -255,10 +340,10 @@ impl Display for DeviceTensor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Owned(o) => o.fmt(f),
-            Self::ArenaView(v) => {
+            Self::View(v) => {
                 let content =
                     v.to_host().unwrap().dump(false).unwrap_or_else(|e| format!("Error : {e:?}"));
-                write!(f, "ArenaView: {{ {content} }}")
+                write!(f, "View: {{ {content} }}")
             }
         }
     }
@@ -293,20 +378,42 @@ impl TensorStorage for DeviceTensor {
         Box::new(self.clone())
     }
 
-    fn as_plain(&self) -> Option<&PlainStorage> {
+    fn as_plain_ram(&self) -> Option<&PlainStorage> {
         None
     }
 
-    fn as_plain_mut(&mut self) -> Option<&mut PlainStorage> {
+    fn as_plain_ram_mut(&mut self) -> Option<&mut PlainStorage> {
         None
     }
 
-    fn into_plain(self: Box<Self>) -> Option<PlainStorage> {
+    fn into_plain_ram(self: Box<Self>) -> Option<PlainStorage> {
         None
     }
 
     fn dyn_hash(&self, _state: &mut dyn std::hash::Hasher) {
         // no meaningful hash for device memory
+    }
+
+    fn is_exotic(&self) -> bool {
+        match self {
+            Self::Owned(owned) => owned.exotic_fact().is_some(),
+            Self::View(view) => view.exotic_fact().is_some(),
+        }
+    }
+
+    fn in_ram(&self) -> bool {
+        false
+    }
+
+    fn slice(
+        &self,
+        dt: DatumType,
+        shape: &[usize],
+        axis: usize,
+        start: usize,
+        end: usize,
+    ) -> TractResult<Option<Tensor>> {
+        Ok(self.slice_on_device(dt, shape, axis, start, end)?.map(|t| t.into_tensor()))
     }
 
     fn exotic_fact(&self, _shape: &[usize]) -> TractResult<Option<Box<dyn ExoticFact>>> {
@@ -316,9 +423,9 @@ impl TensorStorage for DeviceTensor {
     }
 }
 
-impl From<DeviceArenaView> for DeviceTensor {
-    fn from(view: DeviceArenaView) -> Self {
-        Self::ArenaView(view)
+impl From<DeviceView> for DeviceTensor {
+    fn from(view: DeviceView) -> Self {
+        Self::View(view)
     }
 }
 

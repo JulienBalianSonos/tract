@@ -659,6 +659,14 @@ impl Conv {
         let ConcretePoolGeometry { input_shape, patch, output_shape } =
             self.pool_spec.compute_geo(&x_fact.shape)?.to_concrete(x_shape)?.into_owned();
         let kernel = self.wire_kernel_as_g_o_ihw(model, name, kernel)?;
+        // Channel-last DepthWise reads the kernel tap-major, [G, HW, O]: one channel vector per tap.
+        let kernel = if self.pool_spec.data_format.c_is_last()
+            && !model.outlet_fact(kernel[0])?.is_exotic()
+        {
+            model.wire_node(format!("{name}.kernel_c_inner"), AxisOp::Move(0, 2), &kernel)?
+        } else {
+            kernel
+        };
         let c_axis = self.pool_spec.data_format.shape(x_shape)?.c_axis();
         bias = wire_reshape_bias_for_bin(
             model,
@@ -669,6 +677,72 @@ impl Conv {
             self.output_channels(),
         )?[0];
         let op = DepthWise::new(patch, input_shape, output_shape);
+        Ok(model.wire_node(name, op, &[x, kernel[0], bias])?[0])
+    }
+
+    /// Whether this convolution becomes a [`super::DirectSpatialConv`] on this host: group-1 f32
+    /// NCHW over two spatial axes, at least two kernel taps, at most 64 inputs per output point
+    /// where AMX runs im2col's matrix products and 576 elsewhere, the kernels it needs, and an
+    /// output row of at least `MIN_DIRECT_SPATIAL_W` points.
+    fn can_direct_spatial(&self, input_fact: &TypedFact) -> bool {
+        if self.q_params.is_some()
+            || input_fact.datum_type != f32::datum_type()
+            || self.pool_spec.data_format != crate::ops::nn::DataFormat::NCHW
+            || self.group != 1
+            || self.pool_spec.rank() != 2
+            || TRACT_DISABLE_DIRECT_SPATIAL.get()
+        {
+            return false;
+        }
+        let kvol = self.pool_spec.kernel_shape.iter().product::<usize>();
+        let k_limit = if amx_owns_fat_spatial() { 64 } else { 576 };
+        if kvol < 2 || self.input_channels() * kvol > k_limit {
+            return false;
+        }
+        if tract_linalg::routines::conv_w4_f32().is_none()
+            || (!self.output_channels().is_multiple_of(4)
+                && tract_linalg::routines::depthwise_w_f32().is_none())
+        {
+            return false;
+        }
+        let Some(shape) = input_fact.shape.as_concrete() else {
+            return false;
+        };
+        // Only padding wider than the kernel's reach makes the output row longer than the input
+        // one, so the input row turns most candidates down before the output shape is computed.
+        let w_in =
+            self.pool_spec.data_format.shape(shape).ok().and_then(|s| s.hw_dims().last().copied());
+        if w_in.is_some_and(|w| w < MIN_DIRECT_SPATIAL_W) {
+            return false;
+        }
+        let Ok(output) = self.pool_spec.output_shape(shape) else {
+            return false;
+        };
+        output.hw_dims().last().is_some_and(|w| *w >= MIN_DIRECT_SPATIAL_W)
+    }
+
+    fn wire_as_direct_spatial(
+        &self,
+        model: &mut TypedModel,
+        name: &str,
+        wire: &[OutletId],
+    ) -> TractResult<OutletId> {
+        let &[x, kernel, mut bias] = wire else { bail!("Wrong number of inputs") };
+        let x_fact = model.outlet_fact(x)?.clone();
+        let x_shape = x_fact.shape.as_concrete().unwrap();
+        let ConcretePoolGeometry { input_shape, patch, output_shape } =
+            self.pool_spec.compute_geo(&x_fact.shape)?.to_concrete(x_shape)?.into_owned();
+        let kernel = self.wire_kernel_as_g_o_ihw(model, name, kernel)?;
+        let c_axis = self.pool_spec.data_format.shape(x_shape)?.c_axis();
+        bias = wire_reshape_bias_for_bin(
+            model,
+            name,
+            bias,
+            x_fact.rank(),
+            c_axis,
+            self.output_channels(),
+        )?[0];
+        let op = super::DirectSpatialConv::new(patch, input_shape, output_shape);
         Ok(model.wire_node(name, op, &[x, kernel[0], bias])?[0])
     }
 
@@ -1173,6 +1247,31 @@ impl TypedOp for Conv {
         )))
     }
 
+    /// Depthwise convs run faster channel-last (channel-inner vectorised path),
+    /// so they advertise a c-to-last axis move on their input. `ChangeAxes`
+    /// applies it only if the whole graph can carry the layout — the format
+    /// swap is absorbed by `Conv::change_axes` and moves fold into neighbours;
+    /// when propagation is blocked (locked interfaces, ops without
+    /// `change_axes`), nothing changes. Below 16 channels the channel-inner
+    /// path cannot fill a vector, so W-inner stays the better default. Hosts
+    /// without a `depthwise_c_f32` kernel get no suggestion: their channel-last
+    /// path is scalar.
+    fn suggested_axis_changes(&self) -> TractResult<TVec<(InOut, AxisOp)>> {
+        if tract_linalg::routines::depthwise_c_f32().is_none() {
+            return Ok(tvec!());
+        }
+        let fmt = self.pool_spec.data_format;
+        let depthwise = self.group > 1
+            && self.group == self.input_channels()
+            && self.group == self.output_channels();
+        if !depthwise || self.q_params.is_some() || self.input_channels() < 16 || fmt.c_is_last() {
+            return Ok(tvec!());
+        }
+        let rank = self.pool_spec.rank() + 1 + fmt.has_n() as usize;
+        let c_axis = if fmt.has_n() { 1 } else { 0 };
+        Ok(tvec!((InOut::In(0), AxisOp::Move(c_axis, rank - 1))))
+    }
+
     fn change_axes(
         &self,
         model: &TypedModel,
@@ -1191,6 +1290,18 @@ impl TypedOp for Conv {
         }
         let full_input_shape = model.outlet_fact(node.inputs[0])?.shape.to_tvec();
         let shape = self.pool_spec.data_format.shape(full_input_shape.clone())?;
+        // an export collapsed to one stream carries no batch axis, and hosting
+        // one is the inverse of disposing of it: the format gains its n.
+        if shape.n_axis().is_none() && change == &AxisOp::Add(0) {
+            let op = Conv { pool_spec: self.pool_spec.with_n_axis(), ..self.clone() };
+            return Ok(Some(AxisChangeConsequence {
+                substitute_op: Some(Box::new(op)),
+                wire_changes: tvec!(
+                    (InOut::In(0), change.clone()),
+                    (InOut::Out(0), change.clone())
+                ),
+            }));
+        }
         // remove n
         if let Some(n) = shape.n_axis() {
             assert_eq!(n, 0);
@@ -1290,6 +1401,15 @@ impl TypedOp for Conv {
                 patch.shunt_outside(model, OutletId::new(node.id, 0), wire)?;
                 patch.obliterate(node.id)?;
                 Ok(Some(patch))
+            } else if self.can_direct_spatial(input_fact) {
+                let mut patch = TypedModelPatch::new("direct-spatial");
+                let inputs = patch.taps(model, &node.inputs)?;
+                let wire = self
+                    .wire_as_direct_spatial(&mut patch, &node.name, &inputs)
+                    .context("wire_as_direct_spatial")?;
+                patch.shunt_outside(model, OutletId::new(node.id, 0), wire)?;
+                patch.obliterate(node.id)?;
+                Ok(Some(patch))
             } else if input_fact
                 .shape
                 .as_concrete()
@@ -1343,26 +1463,50 @@ impl TypedOp for Conv {
 /// `TRACT_LAZY_IM2COL_MIN_KERNEL` env var to experiment with lower thresholds.
 const DEFAULT_LAZY_IM2COL_MIN_KERNEL: usize = 6;
 
+/// The shortest output row a direct spatial convolution takes: its taps are repacked per zone and
+/// per four output channels, which a shorter row does not pay back against im2col.
+const MIN_DIRECT_SPATIAL_W: usize = 128;
+
+/// Whether AMX runs im2col's matrix products here: it wins the wide convolutions, so the direct
+/// spatial one only takes thin ones.
+fn amx_owns_fat_spatial() -> bool {
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    {
+        tract_linalg::arm64::has_amx()
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+    {
+        false
+    }
+}
+
 crate::declare_knob!(
-    TRACT_ENABLE_BLOCKED_CONV,
+    scopable TRACT_DISABLE_DIRECT_SPATIAL,
+    bool,
+    false,
+    "Disable the direct spatial convolution, falling back to im2col and a matrix product."
+);
+
+crate::declare_knob!(
+    scopable TRACT_ENABLE_BLOCKED_CONV,
     bool,
     false,
     "Force-enable the direct blocked convolution on native targets (on by default on wasm)."
 );
 crate::declare_knob!(
-    TRACT_DISABLE_BLOCKED_CONV,
+    scopable TRACT_DISABLE_BLOCKED_CONV,
     bool,
     false,
     "Force-disable the direct blocked convolution on wasm targets (off by default on native)."
 );
 crate::declare_knob!(
-    TRACT_LAZY_IM2COL_MIN_KERNEL,
+    scopable TRACT_LAZY_IM2COL_MIN_KERNEL,
     usize,
     DEFAULT_LAZY_IM2COL_MIN_KERNEL,
     "Minimum convolution kernel volume before lazy im2col is preferred over eager."
 );
 crate::declare_knob!(
-    TRACT_LAZY_IM2COL_MAX_EAGER_BYTES,
+    scopable TRACT_LAZY_IM2COL_MAX_EAGER_BYTES,
     usize,
     DEFAULT_LAZY_IM2COL_MAX_EAGER_BYTES,
     "Eager-im2col scratch-size ceiling, in bytes, above which lazy im2col is preferred."

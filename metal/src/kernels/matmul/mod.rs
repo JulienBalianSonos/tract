@@ -471,6 +471,7 @@ mod tests {
     //   cargo test -p tract-metal bench_skinny_gemm -- --ignored --nocapture
     #[test]
     #[ignore]
+    #[allow(unexpected_cfgs)]
     fn bench_skinny_gemm() -> TractResult<()> {
         use std::time::Instant;
         with_borrowed_metal_stream(|stream| {

@@ -1,10 +1,12 @@
-#[cfg(target_vendor = "apple")]
+#[cfg(all(target_vendor = "apple", feature = "metal"))]
 extern crate tract_metal;
 
 #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
 extern crate tract_cuda;
+#[cfg(feature = "transformers")]
 extern crate tract_transformers;
 
+#[cfg(feature = "onnx")]
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 use std::io::Cursor;
@@ -13,17 +15,27 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tract_extra::WithTractExtra;
+#[cfg(feature = "profile")]
 use tract_libcli::annotations::Annotations;
+#[cfg(feature = "profile")]
 use tract_libcli::profile::BenchLimits;
+#[cfg(feature = "profile")]
 use tract_libcli::tensor::RunTensors;
 use tract_nnef::internal::Runtime as _;
 use tract_nnef::prelude::{
     Framework, IntoArcTensor, IntoTValue, SymbolValues, TDim, TValue, TVec,
-    Tensor as InternalTensor, TractResult, TypedFact, TypedModel, TypedSimplePlan,
+    Tensor as InternalTensor, TypedFact, TypedModel,
 };
+#[cfg(feature = "profile")]
+use tract_nnef::prelude::{TractResult, TypedSimplePlan};
+#[cfg(feature = "onnx")]
 use tract_onnx::prelude::InferenceModelExt;
 use tract_onnx_opl::WithOnnx;
+#[cfg(feature = "pulse")]
 use tract_pulse::WithPulse;
+#[cfg(not(feature = "pulse"))]
+use tract_pulse_opl::WithPulse;
+#[cfg(feature = "transformers")]
 use tract_transformers::WithTractTransformers;
 
 use tract_api::*;
@@ -34,9 +46,10 @@ pub use ndarray_interop::__ndarray_interop;
 pub mod prelude {
     // Concrete types
     pub use crate::{
-        Dim, Fact, InferenceFact, InferenceModel, Model, Nnef, Onnx, Runnable, Runtime, State,
-        Tensor, nnef, onnx, runtime_for_name,
+        Dim, Fact, Model, Nnef, Runnable, Runtime, State, Tensor, nnef, runtime_for_name,
     };
+    #[cfg(feature = "onnx")]
+    pub use crate::{InferenceFact, InferenceModel, Onnx, onnx};
 
     // User-facing API types
     pub use tract_api::{
@@ -46,9 +59,12 @@ pub mod prelude {
 
     // Traits needed for method resolution — hidden from namespace
     pub use tract_api::{
-        DimInterface as _, FactInterface as _, InferenceFactInterface as _,
-        InferenceModelInterface as _, ModelInterface as _, NnefInterface as _, OnnxInterface as _,
+        DimInterface as _, FactInterface as _, ModelInterface as _, NnefInterface as _,
         RunnableInterface as _, RuntimeInterface as _, StateInterface as _, TensorInterface as _,
+    };
+    #[cfg(feature = "onnx")]
+    pub use tract_api::{
+        InferenceFactInterface as _, InferenceModelInterface as _, OnnxInterface as _,
     };
 }
 
@@ -57,12 +73,13 @@ pub fn nnef() -> Result<Nnef> {
     Ok(Nnef(tract_nnef::nnef()))
 }
 
+#[cfg(feature = "onnx")]
 pub fn onnx() -> Result<Onnx> {
     Ok(Onnx(tract_onnx::onnx()))
 }
 
 pub fn runtime_for_name(name: &str) -> Result<Runtime> {
-    if let Some(rt) = tract_onnx::tract_core::runtime::runtime_for_name(name)? {
+    if let Some(rt) = tract_core::runtime::runtime_for_name(name)? {
         Ok(Runtime(rt))
     } else {
         anyhow::bail!("Unknown runtime {name} (not compiled in tract?)")
@@ -105,8 +122,13 @@ impl NnefInterface for Nnef {
     }
 
     fn enable_tract_transformers(&mut self) -> Result<()> {
-        self.0.enable_tract_transformers();
-        Ok(())
+        #[cfg(not(feature = "transformers"))]
+        anyhow::bail!("Cannot enable tract-transformers without the transformers feature enabled.");
+        #[cfg(feature = "transformers")]
+        {
+            self.0.enable_tract_transformers();
+            Ok(())
+        }
     }
 
     fn enable_onnx(&mut self) -> Result<()> {
@@ -135,15 +157,25 @@ impl NnefInterface for Nnef {
     }
 
     fn write_model_to_tar_gz(&self, path: impl AsRef<Path>, model: &Model) -> Result<()> {
-        let file = std::fs::File::create(path)?;
-        let gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
-        self.0.write_to_tar(&model.0, gz)?;
-        Ok(())
+        #[cfg(not(feature = "flate2"))]
+        {
+            let _ = (path, model);
+            anyhow::bail!("Cannot write gzip file without the flate2 feature enabled.")
+        }
+        #[cfg(feature = "flate2")]
+        {
+            let file = std::fs::File::create(path)?;
+            let gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+            self.0.write_to_tar(&model.0, gz)?;
+            Ok(())
+        }
     }
 }
 
+#[cfg(feature = "onnx")]
 pub struct Onnx(tract_onnx::Onnx);
 
+#[cfg(feature = "onnx")]
 impl Debug for Onnx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Onnx")
@@ -155,6 +187,7 @@ impl Debug for Onnx {
 /// They are applied after the parse on purpose: an assertion only has to hold
 /// before shapes are unified, which happens later, so nothing needs threading a
 /// SymbolScope into the ONNX parser.
+#[cfg(feature = "onnx")]
 fn apply_assertions(
     model: &tract_onnx::prelude::InferenceModel,
     assertions: &[String],
@@ -168,6 +201,7 @@ fn apply_assertions(
     Ok(())
 }
 
+#[cfg(feature = "onnx")]
 impl Onnx {
     /// The loader to parse with.
     ///
@@ -187,6 +221,7 @@ impl Onnx {
     }
 }
 
+#[cfg(feature = "onnx")]
 impl OnnxInterface for Onnx {
     type InferenceModel = InferenceModel;
 
@@ -213,14 +248,17 @@ impl OnnxInterface for Onnx {
     }
 }
 
+#[cfg(feature = "onnx")]
 pub struct InferenceModel(tract_onnx::prelude::InferenceModel);
 
+#[cfg(feature = "onnx")]
 impl Debug for InferenceModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "InferenceModel")
     }
 }
 
+#[cfg(feature = "onnx")]
 impl InferenceModelInterface for InferenceModel {
     type Model = Model;
     type InferenceFact = InferenceFact;
@@ -334,11 +372,11 @@ impl ModelInterface for Model {
             let mut params = v.clone();
             params.as_object_mut().unwrap().remove("name");
             let mut erased = <dyn erased_serde::Deserializer>::erase(params);
-            tract_onnx::tract_core::transform::get_transform_with_params(&name, &mut erased)?
+            tract_core::transform::get_transform_with_params(&name, &mut erased)?
                 .with_context(|| format!("transform `{name}' could not be found"))?
         } else {
             // Plain name (no params)
-            tract_onnx::tract_core::transform::get_transform(&transform)?
+            tract_core::transform::get_transform(&transform)?
                 .with_context(|| format!("transform `{transform}' could not be found"))?
         };
         transform_obj.transform(&mut self.0)?;
@@ -395,14 +433,14 @@ impl Model {
 /// Metal dispatch (i.e. before `Runtime::prepare`); fails afterwards. No-op
 /// on non-Apple targets.
 pub fn hint_metal_commit_cadence(every_n_dispatches: usize) -> Result<()> {
-    #[cfg(target_vendor = "apple")]
+    #[cfg(all(target_vendor = "apple", feature = "metal"))]
     {
         tract_metal::set_tuning_overrides(tract_metal::MetalTuningOverrides {
             commit_every_n_dispatches: Some(every_n_dispatches),
             ..Default::default()
         })
     }
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(not(all(target_vendor = "apple", feature = "metal")))]
     {
         let _ = every_n_dispatches;
         Ok(())
@@ -420,11 +458,11 @@ pub fn hint_metal_commit_cadence(every_n_dispatches: usize) -> Result<()> {
 /// runtime's first Metal dispatch (i.e. before `Runtime::prepare`); fails
 /// afterwards. No-op on non-Apple targets.
 pub fn hint_metal_autotune(enable: bool) -> Result<()> {
-    #[cfg(target_vendor = "apple")]
+    #[cfg(all(target_vendor = "apple", feature = "metal"))]
     {
         tract_metal::set_autotune(enable)
     }
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(not(all(target_vendor = "apple", feature = "metal")))]
     {
         let _ = enable;
         Ok(())
@@ -509,6 +547,7 @@ impl RunnableInterface for Runnable {
         self.profile_json(input)
     }
 
+    #[cfg(feature = "profile")]
     fn profile_json<I, IV, IE>(&self, inputs: Option<I>) -> Result<String>
     where
         I: IntoIterator<Item = IV>,
@@ -539,6 +578,32 @@ impl RunnableInterface for Runnable {
         };
         let export = tract_libcli::export::GraphPerfInfo::from(model, &annotations);
         Ok(serde_json::to_string(&export)?)
+    }
+
+    #[cfg(not(feature = "profile"))]
+    fn profile_json<I, IV, IE>(&self, _inputs: Option<I>) -> Result<String>
+    where
+        I: IntoIterator<Item = IV>,
+        IV: TryInto<Self::Tensor, Error = IE>,
+        IE: Into<anyhow::Error> + Debug,
+    {
+        anyhow::bail!("tract was built without the `profile` feature")
+    }
+}
+
+#[cfg(feature = "unstable-autobatch")]
+impl Runnable {
+    /// Serve up to `max_sessions` concurrent sessions off this one prepared
+    /// model, batching the turns which arrive together into one run. Each
+    /// `spawn_state` is then one session.
+    ///
+    /// The model must carry a batch axis: one symbol, on axis 0, on at least
+    /// one input and one output. A session feeds one row of it per turn, and how
+    /// many rows a run carries is the load's business, not the caller's. A model
+    /// which cannot be served that way fails here.
+    pub fn autobatch(&self, max_sessions: usize) -> Result<Runnable> {
+        let laned = tract_core::lanes::LanedRunnable::wrap(self.0.clone(), max_sessions)?;
+        Ok(Runnable(Arc::new(laned)))
     }
 }
 
@@ -598,7 +663,14 @@ impl TensorInterface for Tensor {
 
     fn as_bytes(&self) -> Result<(DatumType, &[usize], &[u8])> {
         let dt = from_internal_dt(self.0.datum_type())?;
-        Ok((dt, self.0.shape(), self.0.try_as_plain()?.as_bytes()))
+        Ok((dt, self.0.shape(), self.0.try_as_plain_ram()?.as_bytes()))
+    }
+
+    /// Metadata only: the default reads it out of `as_bytes`, which brings a
+    /// tensor still living on a device all the way back just to be asked its
+    /// shape.
+    fn shape(&self) -> Result<&[usize]> {
+        Ok(self.0.shape())
     }
 
     fn convert_to(&self, to: DatumType) -> Result<Self> {
@@ -612,49 +684,11 @@ impl TensorInterface for Tensor {
 }
 
 impl Tensor {
-    /// Slice `[start, end)` along `axis`. Plain host tensors are sliced by
-    /// copy; tensors backed by device storage (e.g. in-place KV-cache views)
-    /// are sliced as metadata only when possible, without synchronizing or
-    /// copying, keeping the backing device buffer alive.
+    /// Slice `[start, end)` along `axis`.
+    ///
+    /// A device-backed tensor is sliced on the device, without a round-trip
+    /// through the host. The result owns its data either way.
     pub fn sliced(&self, axis: usize, start: usize, end: usize) -> Result<Tensor> {
-        use tract_gpu::tensor::{
-            DeviceArenaView, DeviceTensor, DeviceTensorExt, OwnedDeviceTensor,
-        };
-        if let Some(dev) = self.0.as_device_tensor() {
-            let sliced = match dev {
-                DeviceTensor::ArenaView(view) => {
-                    DeviceTensor::ArenaView(view.sliced(axis, start, end)?)
-                }
-                DeviceTensor::Owned(o)
-                    if o.exotic_fact().is_none() && o.strides().iter().all(|&s| s >= 0) =>
-                {
-                    // Owned device tensors clone as cheap buffer handles:
-                    // wrap one in a metadata-only view and slice that,
-                    // keeping the data on device without synchronizing.
-                    let arc: Arc<Box<dyn OwnedDeviceTensor>> =
-                        Arc::new(tract_nnef::tract_core::dyn_clone::clone_box(&**o));
-                    let view = DeviceArenaView::from_owned(
-                        arc,
-                        dev.datum_type(),
-                        o.shape().into(),
-                        o.strides().into(),
-                        0,
-                    )?;
-                    DeviceTensor::ArenaView(view.sliced(axis, start, end)?)
-                }
-                DeviceTensor::Owned(_) => {
-                    // Exotic or negatively-strided layouts cannot be viewed:
-                    // go through the host. Correct, but synchronizes.
-                    log::debug!(
-                        "Tensor::sliced: owned device tensor with exotic/negative-stride \
-                         layout falls back to a host copy"
-                    );
-                    let host = dev.to_host()?;
-                    return Ok(Tensor(host.slice(axis, start, end)?.into_arc_tensor()));
-                }
-            };
-            return Ok(Tensor(sliced.into_tensor().into_arc_tensor()));
-        }
         Ok(Tensor(self.0.slice(axis, start, end)?.into_arc_tensor()))
     }
 }
@@ -695,9 +729,7 @@ impl FactInterface for Fact {
 
 impl Fact {
     fn new(model: &Model, spec: impl ToString) -> Result<Fact> {
-        let fact = tract_libcli::tensor::parse_spec(&model.0.symbols, &spec.to_string())?;
-        let fact = tract_onnx::prelude::Fact::to_typed_fact(&fact)?.into_owned();
-        Ok(Fact(fact))
+        Ok(Fact(TypedFact::from_spec(&model.0.symbols, &spec.to_string())?))
     }
 }
 
@@ -717,22 +749,27 @@ impl Display for Fact {
     }
 }
 
+#[cfg(feature = "onnx")]
 #[derive(Default, Clone, Debug)]
 pub struct InferenceFact(tract_onnx::prelude::InferenceFact);
 
+#[cfg(feature = "onnx")]
 impl InferenceFactInterface for InferenceFact {
     fn empty() -> Result<InferenceFact> {
         Ok(InferenceFact(Default::default()))
     }
 }
 
+#[cfg(feature = "onnx")]
 impl InferenceFact {
     fn new(model: &InferenceModel, spec: impl ToString) -> Result<InferenceFact> {
-        let fact = tract_libcli::tensor::parse_spec(&model.0.symbols, &spec.to_string())?;
+        let fact =
+            tract_onnx::prelude::InferenceFact::from_spec(&model.0.symbols, &spec.to_string())?;
         Ok(InferenceFact(fact))
     }
 }
 
+#[cfg(feature = "onnx")]
 impl Display for InferenceFact {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = self.0.format_dt_shape();
@@ -748,6 +785,7 @@ impl Display for InferenceFact {
     }
 }
 
+#[cfg(feature = "onnx")]
 as_inference_fact_impl!(InferenceModel, InferenceFact);
 as_fact_impl!(Model, Fact);
 
@@ -851,31 +889,4 @@ fn from_internal_dt(it: tract_nnef::prelude::DatumType) -> Result<DatumType> {
             anyhow::bail!("Unsupported DatumType in the public API {:?}", it)
         }
     })
-}
-
-#[cfg(all(test, target_vendor = "apple"))]
-mod device_tensor_tests {
-    use super::*;
-
-    /// Finding: Tensor::sliced used to fall back to to_host() for owned
-    /// device tensors, defeating zero-copy for device-resident outputs. The
-    /// owned case must slice as a device-side metadata view.
-    #[test]
-    fn owned_device_tensor_slices_as_device_view() -> Result<()> {
-        use tract_gpu::tensor::{DeviceTensor, DeviceTensorExt, IntoDevice};
-        // Initializes (and registers) the Metal device context.
-        tract_metal::with_metal_stream(|_| anyhow::Ok(()))?;
-        let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
-        let dev = InternalTensor::from_shape(&[4, 6], &data)?.into_device()?;
-        assert!(matches!(dev, DeviceTensor::Owned(_)));
-        let tensor = Tensor(dev.into_tensor().into_arc_tensor());
-        let sliced = tensor.sliced(0, 1, 3)?;
-        let inner = sliced.0.as_device_tensor().context("slice must stay on device")?;
-        assert!(matches!(inner, DeviceTensor::ArenaView(_)));
-        assert_eq!(inner.shape(), &[2, 6]);
-        let host = inner.to_host()?;
-        let expected = InternalTensor::from_shape(&[2, 6], &data[6..18])?;
-        assert_eq!(host.as_ref(), &expected);
-        Ok(())
-    }
 }

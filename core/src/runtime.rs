@@ -38,6 +38,13 @@ pub trait Runnable: Any + Downcast + Debug + Send + Sync + 'static {
         self.spawn()?.run(inputs)
     }
     fn spawn(&self) -> TractResult<Box<dyn State>>;
+
+    /// The mnemonic this runnable is known by, from its model's [`TRACT_NAME`]
+    /// property.
+    fn name(&self) -> Option<&str> {
+        self.typed_model()?.name()
+    }
+
     fn input_count(&self) -> usize {
         self.typed_model().context("Fallback implementation on typed_model()").unwrap().inputs.len()
     }
@@ -81,6 +88,20 @@ pub trait State: Any + Downcast + Debug + Send + DynClone + 'static {
     fn resolve_symbol(&mut self, symbol: &Symbol, value: i64) -> TractResult<()> {
         let _ = (symbol, value);
         bail!("{self:?} can not resolve a symbol")
+    }
+
+    /// Seat the lanes carrying the coming turn's streams, one lane per seat of
+    /// axis 0 of its tensors. A turn seating more than one lane needs axis 0 of
+    /// every stateful node to be the model's batch axis.
+    fn seat(&mut self, seating: Seating) -> TractResult<()> {
+        let _ = seating;
+        bail!("{self:?} can not seat lanes")
+    }
+
+    /// Drop the session state `lanes` hold, handing them to new streams.
+    fn reset_lanes(&mut self, lanes: &[LaneId]) -> TractResult<()> {
+        let _ = lanes;
+        bail!("{self:?} can not reset lanes")
     }
 
     fn runnable(&self) -> &dyn Runnable;
@@ -155,6 +176,15 @@ impl State for TypedSimpleState {
     fn resolve_symbol(&mut self, symbol: &Symbol, value: i64) -> TractResult<()> {
         self.turn_state.resolved_symbols.set(symbol, value);
         Ok(())
+    }
+
+    fn seat(&mut self, seating: Seating) -> TractResult<()> {
+        self.seat(seating);
+        Ok(())
+    }
+
+    fn reset_lanes(&mut self, lanes: &[LaneId]) -> TractResult<()> {
+        self.reset_lanes(lanes)
     }
 
     fn runnable(&self) -> &dyn Runnable {

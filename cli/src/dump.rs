@@ -155,12 +155,22 @@ pub fn handle(
             #[cfg(not(all(any(target_os = "linux", target_os = "windows"), feature = "cuda")))]
             let is_cuda = false;
 
+            #[cfg(all(any(target_os = "macos", target_os = "ios"), feature = "metal"))]
+            let is_metal = matches.get_flag("metal");
+            #[cfg(not(all(any(target_os = "macos", target_os = "ios"), feature = "metal")))]
+            let is_metal = false;
+
             if is_cuda {
                 #[cfg(all(any(target_os = "linux", target_os = "windows"), feature = "cuda"))]
                 tract_cuda::with_cuda_stream(|s| {
                     s.enable_profiling();
                     Ok(())
                 })?;
+            }
+
+            if is_metal {
+                #[cfg(all(any(target_os = "macos", target_os = "ios"), feature = "metal"))]
+                tract_metal::with_metal_stream(|s| s.enable_profiling())?;
             }
 
             let before_node: Box<dyn Fn(usize)> = if is_cuda {
@@ -178,6 +188,19 @@ pub fn handle(
                     any(target_os = "linux", target_os = "windows"),
                     feature = "cuda"
                 )))]
+                Box::new(|_| {})
+            } else if is_metal {
+                #[cfg(all(any(target_os = "macos", target_os = "ios"), feature = "metal"))]
+                {
+                    Box::new(|node_id| {
+                        tract_metal::with_metal_stream(|s| {
+                            s.set_current_node(node_id);
+                            Ok(())
+                        })
+                        .ok();
+                    })
+                }
+                #[cfg(not(all(any(target_os = "macos", target_os = "ios"), feature = "metal")))]
                 Box::new(|_| {})
             } else {
                 Box::new(|_| {})
@@ -217,6 +240,25 @@ pub fn handle(
                     any(target_os = "linux", target_os = "windows"),
                     feature = "cuda"
                 )))]
+                Box::new(|_, _| Ok(()))
+            } else if is_metal {
+                #[cfg(all(any(target_os = "macos", target_os = "ios"), feature = "metal"))]
+                {
+                    Box::new(|dg, prefix| {
+                        tract_metal::with_metal_stream(|s| {
+                            s.wait_until_completed()?;
+                            for (node_id, dur) in s.drain_profile()? {
+                                let node_id =
+                                    tract_libcli::annotations::NodeQId(prefix.into(), node_id);
+                                *dg.node_mut(node_id)
+                                    .accelerator_profile
+                                    .get_or_insert(std::time::Duration::default()) += dur;
+                            }
+                            Ok(())
+                        })
+                    })
+                }
+                #[cfg(not(all(any(target_os = "macos", target_os = "ios"), feature = "metal")))]
                 Box::new(|_, _| Ok(()))
             } else {
                 Box::new(|_, _| Ok(()))
@@ -418,13 +460,7 @@ pub fn handle(
         }
     }
 
-    if params
-        .tract_model
-        .properties()
-        .get("tract_stage")
-        .and_then(|t| t.try_as_plain().ok()?.to_scalar::<String>().ok().cloned())
-        .is_some_and(|s| s == "optimized")
-    {
+    if stage_is_optimized(params.tract_model.properties()) {
         for n in 0..params.tract_model.nodes_len() {
             if params.tract_model.node_op_name(n) == "EinSum" {
                 let tags = annotations.tags.entry(NodeQId(tvec!(), n)).or_default();
@@ -527,29 +563,30 @@ pub fn mm_report(
                     repack.as_ref().map(|rp| rp.to_string()).unwrap_or("Ø".to_string())
                 })
                 .join(", ");
-            let (pack_a, pack_b) = facts
-                .iter()
-                .take(2)
-                .map(|fact| {
-                    fact.exotic_fact
-                        .as_ref()
-                        .and_then(|of| {
-                            of.downcast_ref::<DynPackedExoticFact>()
-                                .map(|of| of.packers.iter().map(|m| format!("{m}")).join(", "))
-                                .or_else(|| {
-                                    of.downcast_ref::<PackedExoticFact>()
-                                        .map(|pof| format!("{}", pof.format))
-                                })
-                                .or_else(|| {
-                                    of.downcast_ref::<PackedBlockQuantFact>()
-                                        .map(|pof| format!("{}", pof.format))
-                                })
-                        })
-                        .unwrap_or_else(|| format!("{fact:?}"))
-                    //                        .unwrap_or_default()
-                })
-                .collect_tuple()
-                .unwrap();
+            // A matmul can reach the report with fewer than two input facts, so index the pair
+            // rather than collecting it as a tuple: a node reporting none is still a node worth
+            // a line in the table.
+            let pack_of = |fact: Option<&TypedFact>| match fact {
+                Some(fact) => fact
+                    .exotic_fact
+                    .as_ref()
+                    .and_then(|of| {
+                        of.downcast_ref::<DynPackedExoticFact>()
+                            .map(|of| of.packers.iter().map(|m| format!("{m}")).join(", "))
+                            .or_else(|| {
+                                of.downcast_ref::<PackedExoticFact>()
+                                    .map(|pof| format!("{}", pof.format))
+                            })
+                            .or_else(|| {
+                                of.downcast_ref::<PackedBlockQuantFact>()
+                                    .map(|pof| format!("{}", pof.format))
+                            })
+                    })
+                    .unwrap_or_else(|| format!("{fact:?}")),
+                None => "-".to_string(),
+            };
+            let (pack_a, pack_b) =
+                (pack_of(facts.first().copied()), pack_of(facts.get(1).copied()));
             let iters = op
                 .c_fact
                 .shape
@@ -565,7 +602,7 @@ pub fn mm_report(
                     k,
                     n,
                     iters * mult,
-                    facts[0].konst.is_some(),
+                    facts.first().is_some_and(|fact| fact.konst.is_some()),
                     mmm,
                     pack_a,
                     panel_extractor,

@@ -1,6 +1,7 @@
 use crate::command_buffer::TCommandBuffer;
 use crate::func_constants::ConstantValues;
 use crate::kernels::{LibraryContent, LibraryName};
+use crate::profile::{MetalProfile, MetalProfileHandle};
 use crate::tensor::{MValue, MetalTensor};
 
 use metal::NSUInteger;
@@ -14,6 +15,7 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
@@ -375,7 +377,7 @@ impl DeviceContext for MetalContext {
         let host = tensor.into_arc_tensor();
         let device_buffer = MetalBuffer {
             inner: buffer.clone(),
-            pool: if bqf.is_none() {
+            _pool: if bqf.is_none() {
                 Some(Arc::new(BufferPoolGuard { host: host.clone(), buffer }))
             } else {
                 None
@@ -393,7 +395,7 @@ impl DeviceContext for MetalContext {
         if let Some((host, buffer)) = self.pool_take(dt, shape) {
             let device_buffer = MetalBuffer {
                 inner: buffer.clone(),
-                pool: Some(Arc::new(BufferPoolGuard { host: host.clone(), buffer })),
+                _pool: Some(Arc::new(BufferPoolGuard { host: host.clone(), buffer })),
             };
             return Ok(Box::new(MetalTensor {
                 inner: MValue::Natural(host),
@@ -503,6 +505,7 @@ pub struct MetalStream {
     /// maintained when the resolved commit cadence is non-zero
     /// (`MetalTuning::commit_every_n_dispatches`).
     dispatches_since_commit: std::cell::Cell<usize>,
+    profile: RefCell<Option<Rc<MetalProfileHandle>>>,
 }
 
 impl Default for MetalStream {
@@ -525,7 +528,37 @@ impl MetalStream {
             command_buffer_id: AtomicUsize::new(0),
             retained_tensors: RefCell::new(vec![]),
             dispatches_since_commit: std::cell::Cell::new(0),
+            profile: RefCell::new(None),
         }
+    }
+
+    /// Time every dispatch from here on, each against the node that asked for
+    /// it. A profiled turn runs a pass per dispatch, so it is slower than the
+    /// turn it measures.
+    pub fn enable_profiling(&self) -> TractResult<()> {
+        let profile = MetalProfile::new(&self.context.device)?;
+        *self.profile.borrow_mut() =
+            Some(Rc::new(MetalProfileHandle { profile: RefCell::new(profile), node_id: 0.into() }));
+        Ok(())
+    }
+
+    pub fn is_profiling(&self) -> bool {
+        self.profile.borrow().is_some()
+    }
+
+    /// Which node the dispatches that follow belong to.
+    pub fn set_current_node(&self, node_id: usize) {
+        if let Some(handle) = self.profile.borrow().as_ref() {
+            handle.node_id.set(node_id);
+        }
+    }
+
+    /// What each dispatch spent on the device since the last drain. Call once
+    /// the work has completed.
+    pub fn drain_profile(&self) -> TractResult<Vec<(usize, std::time::Duration)>> {
+        let handle = self.profile.borrow().clone();
+        let Some(handle) = handle else { return Ok(vec![]) };
+        handle.profile.borrow_mut().drain(&self.context.device)
     }
 
     pub fn load_library(&self, name: LibraryName) -> TractResult<Library> {
@@ -590,10 +623,11 @@ impl MetalStream {
                 self.dispatches_since_commit.set(n);
             }
         }
+        let profile = self.profile.borrow().clone();
         self.command_buffer
             .borrow_mut()
             .get_or_insert_with(|| {
-                TCommandBuffer::new(self.command_queue.new_command_buffer().to_owned())
+                TCommandBuffer::new(self.command_queue.new_command_buffer().to_owned(), profile)
             })
             .to_owned()
     }
@@ -602,6 +636,7 @@ impl MetalStream {
         Self::log_gpu_time_named(buffer, tag, &[]);
     }
 
+    #[allow(unexpected_cfgs)]
     fn log_gpu_time_named(buffer: &TCommandBuffer, tag: &str, names: &[String]) {
         if log_gpu_time() || profile_kernels() || log_buffer_kernels() {
             // metal-rs does not wrap GPUStartTime/GPUEndTime; go through objc.
@@ -646,7 +681,7 @@ impl MetalStream {
             }
             _ => {}
         }
-        command_buffer.encoder().end_encoding();
+        command_buffer.end_encoding();
         command_buffer.commit();
         let retained = std::mem::take(&mut *self.retained_tensors.borrow_mut());
         let names = std::mem::take(&mut *self.pending_kernel_names.borrow_mut());
@@ -726,7 +761,7 @@ impl MetalStream {
             return Ok(());
         };
 
-        command_buffer.encoder().end_encoding();
+        command_buffer.end_encoding();
 
         match command_buffer.status() {
             metal::MTLCommandBufferStatus::Committed
@@ -758,6 +793,11 @@ impl MetalStream {
         self.flush_recycle_stash();
 
         *self.command_buffer.borrow_mut() = None;
+        anyhow::ensure!(
+            command_buffer.status() != metal::MTLCommandBufferStatus::Error,
+            "Metal command buffer {command_buffer_id:?} failed on the GPU: {}",
+            command_buffer_error(&command_buffer)
+        );
         Ok(())
     }
 
@@ -803,7 +843,7 @@ impl Drop for MetalStream {
                 _ => {}
             }
 
-            command_buffer.encoder().end_encoding();
+            command_buffer.end_encoding();
             command_buffer.commit();
             command_buffer.wait_until_completed();
         }
@@ -859,7 +899,7 @@ impl Drop for BufferPoolGuard {
 pub struct MetalBuffer {
     pub inner: Buffer,
     /// Shared across clones of the owning tensor; the last drop recycles.
-    pub(crate) pool: Option<Arc<BufferPoolGuard>>,
+    pub(crate) _pool: Option<Arc<BufferPoolGuard>>,
 }
 
 impl PartialEq for MetalBuffer {
@@ -912,7 +952,7 @@ mod tests {
             while context.pool_take(dt, &shape).is_some() {}
 
             // Idle stream: a drop recycles immediately (historical behavior).
-            let t = unsafe { DeviceTensor::uninitialized_dt(dt, &shape)? };
+            let t = DeviceTensor::uninitialized_dt(dt, &shape)?;
             drop(t);
             ensure!(
                 context.pool_take(dt, &shape).is_some(),
@@ -920,7 +960,7 @@ mod tests {
             );
 
             // Busy stream: with a command buffer open, the drop must defer.
-            let t = unsafe { DeviceTensor::uninitialized_dt(dt, &shape)? };
+            let t = DeviceTensor::uninitialized_dt(dt, &shape)?;
             let _cb = stream.command_buffer();
             drop(t);
             ensure!(
@@ -944,5 +984,30 @@ mod tests {
             );
             Ok(())
         })
+    }
+}
+
+/// The description of the `NSError` a failed command buffer carries, which the
+/// `metal` crate does not expose.
+// The objc msg_send!/sel! macros expand to a cargo-clippy cfg check that older
+// toolchains report at the call site; the allow covers it.
+#[allow(unexpected_cfgs)]
+fn command_buffer_error(command_buffer: &metal::CommandBufferRef) -> String {
+    use metal::foreign_types::ForeignTypeRef;
+    use objc::runtime::Object;
+    use objc::{msg_send, sel, sel_impl};
+
+    unsafe {
+        let command_buffer = command_buffer.as_ptr() as *mut Object;
+        let error: *mut Object = msg_send![command_buffer, error];
+        if error.is_null() {
+            return "no error reported".to_string();
+        }
+        let description: *mut Object = msg_send![error, description];
+        let chars: *const std::os::raw::c_char = msg_send![description, UTF8String];
+        if chars.is_null() {
+            return "an error without a description".to_string();
+        }
+        std::ffi::CStr::from_ptr(chars).to_string_lossy().into_owned()
     }
 }

@@ -187,6 +187,15 @@ impl CublasDispatchParams {
     }
 }
 
+/// Which axis of a weights ring the kernel turns as it reads: the rows of the
+/// window, or the axis the GEMM contracts. The window's own axis is one or the
+/// other once the layout the ring is held in has been applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RingAxis {
+    Rows,
+    Contracted,
+}
+
 fn kernel_name_mat_vec(dt: DatumType, n_cols: usize, block_size: usize) -> TractResult<String> {
     Ok(format!("ggml_matvec_{}_ncols_{}_bs_{}", DeviceTensor::tname(dt)?, n_cols, block_size))
 }
@@ -197,6 +206,7 @@ fn dispatch_ggml_matvec(
     activs: &DeviceTensor,
     output: &DeviceTensor,
     params: GemmParams,
+    w_ring: Option<(&DeviceTensor, RingAxis)>,
 ) -> TractResult<()> {
     ensure!(params.act_batch % params.w_batch == 0);
 
@@ -226,6 +236,12 @@ fn dispatch_ggml_matvec(
     launch_args.push_i32(params.w_strides[0]);
     launch_args.push_i32(params.act_strides[0]);
     launch_args.push_i32(params.out_strides[0]);
+    let ring_view = w_ring.map(|(table, _)| get_cuda_view(table));
+    match ring_view.as_ref() {
+        Some(view) => launch_args.push_view(view),
+        None => launch_args.push_null_ptr(),
+    }
+    launch_args.push_i32(matches!(w_ring, Some((_, RingAxis::Contracted))) as i32);
 
     let cfg = LaunchConfig {
         grid_dim: (params.n as _, params.act_batch as _, 1),
@@ -233,7 +249,7 @@ fn dispatch_ggml_matvec(
         shared_mem_bytes: (WARP_SIZE * size_of::<f32>()) as u32,
     };
 
-    unsafe { launch_args.launch(cfg) };
+    launch_args.launch(cfg)?;
     Ok(())
 }
 
@@ -347,11 +363,13 @@ fn launch_matmul_q40(
 
     let context = cuda_context();
     let props = context.properties();
-    let func = context.load_pipeline(LibraryName::GgmlQ, kernel_name)?;
-    func.set_attribute(
-        CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-        nbytes_shared as i32,
-    )?;
+    let func = context.load_pipeline_with(LibraryName::GgmlQ, kernel_name, |func| {
+        func.set_attribute(
+            CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            nbytes_shared as i32,
+        )?;
+        Ok(())
+    })?;
     let mut launch_args = TractLaunchArgs::new(stream, &func);
     launch_args.push_view(weights);
     launch_args.push_view(quant_activ);
@@ -375,9 +393,7 @@ fn launch_matmul_q40(
         shared_mem_bytes: nbytes_shared as _,
     };
 
-    unsafe {
-        launch_args.launch(cfg);
-    }
+    launch_args.launch(cfg)?;
     Ok(())
 }
 
@@ -409,9 +425,7 @@ fn launch_fixup_q40(
         shared_mem_bytes: 0,
     };
 
-    unsafe {
-        launch_args.launch(cfg);
-    }
+    launch_args.launch(cfg)?;
     Ok(())
 }
 
@@ -572,6 +586,39 @@ impl GgmlGemm {
         Ok(c)
     }
 
+    /// The weights held as a ring, `w_shape` describing the window one
+    /// activation batch reads: `ring` carries one rotated window per lane, and
+    /// `ring_table` two i32 per activation channel -- the row that channel's
+    /// window starts at within its lane, and the row its lane starts at -- so
+    /// the kernel addresses the weights through the table rather than through
+    /// `w_shape`'s channel stride. Matvec shapes only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_matvec_ring(
+        &self,
+        stream: &TractCudaStream,
+        activs: &DeviceTensor,
+        ring: &DeviceTensor,
+        out: &DeviceTensor,
+        w_shape: &[usize],
+        ring_table: &DeviceTensor,
+        ring_axis: RingAxis,
+    ) -> TractResult<()> {
+        let (act_shape, _) = get_concrete_shapes(activs, ring)?;
+        ensure!(out.shape() == self.output_shape(&act_shape, w_shape).as_slice());
+        let params = GemmParams::compute_gemm_params(
+            [activs.datum_type(), ring.datum_type(), out.datum_type()],
+            w_shape,
+            &act_shape,
+            out.shape(),
+        )?;
+        ensure!(
+            params.k % 2 == 0 && params.m <= 8,
+            "A weights ring needs the matvec kernel, which {w_shape:?}x{act_shape:?} does not reach"
+        );
+        ensure!(params.act_batch == params.w_batch, "A weights ring is addressed per channel");
+        dispatch_ggml_matvec(stream, ring, activs, out, params, Some((ring_table, ring_axis)))
+    }
+
     pub fn dispatch_eval(
         &self,
         stream: &TractCudaStream,
@@ -608,7 +655,7 @@ impl GgmlGemm {
                 dispatch_ggml_matmul_q40(stream, &w_view, &act_view, &out_view, params)?;
             }
         } else if (params.k % 2 == 0) && params.m <= 8 {
-            dispatch_ggml_matvec(stream, weights, activs, out, params)?;
+            dispatch_ggml_matvec(stream, weights, activs, out, params, None)?;
         } else if activs.datum_type() == DatumType::F32 {
             dispatch_cublas_gemm::<f32>(stream, weights, activs, out, params)?;
         } else {
@@ -725,6 +772,160 @@ mod tests {
         Ok(())
     }
 
+    /// The ring dispatch against the plain one: the ring holds `lanes` rotated
+    /// copies of the same window, so whatever rotation and lane a channel is
+    /// given, the result has to be the unrotated window's.
+    fn run_ring_test_case(
+        (seats, per_seat, lanes, m, k, slots, slot_rows): (
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+        ),
+    ) -> TractResult<()> {
+        crate::with_cuda_stream(|stream| {
+            let (channels, n) = (seats * per_seat, slots * slot_rows);
+            let act = Tensor::from_shape(
+                &[channels, m, k],
+                &(0..channels * m * k).map(|f| f as f32 / (channels * m * k) as f32).collect_vec(),
+            )?;
+            let window = Tensor::from_shape(
+                &[channels, n, k],
+                &(0..channels * n * k).map(|f| f as f32 / (channels * n * k) as f32).collect_vec(),
+            )?;
+            let expected = GgmlGemm.eval(
+                stream,
+                &act.clone().into_device()?,
+                &window.clone().into_device()?,
+            )?;
+
+            // Lane `l` holds channel `c`'s window rotated by `rot = l + 1`: ring
+            // slot `rot + s` holds window slot `s`, which is what the table's
+            // rotation means, and the table sends channel `c` to that lane.
+            let window = window.as_plain_ram().unwrap().as_slice::<f32>()?.to_vec();
+            let mut ring = Tensor::zero::<f32>(&[lanes * channels, n, k])?;
+            let mut ring_plain = ring.as_plain_ram_mut().unwrap();
+            let ring_slice = ring_plain.as_slice_mut::<f32>()?;
+            let mut table: Vec<i32> = vec![0; 2 * channels];
+            for c in 0..channels {
+                let lane = c % lanes;
+                let rot = lane + 1;
+                for slot in 0..slots {
+                    for row in 0..slot_rows {
+                        let from = slot * slot_rows + row;
+                        let to = ((slot + rot) % slots) * slot_rows + row;
+                        let from = (c * n + from) * k;
+                        let to = ((lane * channels + c) * n + to) * k;
+                        ring_slice[to..to + k].copy_from_slice(&window[from..from + k]);
+                    }
+                }
+                table[2 * c] = (rot * slot_rows) as i32;
+                table[2 * c + 1] = ((lane * channels + c) * n) as i32;
+            }
+
+            let out = unsafe { DeviceTensor::uninitialized_dt(F32, expected.shape())? };
+            GgmlGemm.dispatch_matvec_ring(
+                stream,
+                &act.into_device()?,
+                &ring.clone().into_device()?,
+                &out,
+                &[channels, n, k],
+                &tensor1(&table).into_device()?,
+                RingAxis::Rows,
+            )?;
+            stream.synchronize()?;
+            out.to_host()?.close_enough(&expected.to_host()?.into_tensor(), true)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_ring_k_test_case(
+        (seats, per_seat, lanes, m, n, slots, slot_cols): (
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+        ),
+    ) -> TractResult<()> {
+        crate::with_cuda_stream(|stream| {
+            let (channels, k) = (seats * per_seat, slots * slot_cols);
+            let act = Tensor::from_shape(
+                &[channels, m, k],
+                &(0..channels * m * k).map(|f| f as f32 / (channels * m * k) as f32).collect_vec(),
+            )?;
+            let window = Tensor::from_shape(
+                &[channels, n, k],
+                &(0..channels * n * k).map(|f| f as f32 / (channels * n * k) as f32).collect_vec(),
+            )?;
+            let expected = GgmlGemm.eval(
+                stream,
+                &act.clone().into_device()?,
+                &window.clone().into_device()?,
+            )?;
+
+            // The ring turns on the contracted axis: lane `l` holds channel
+            // `c`'s window with every row's columns rotated by `rot = l + 1`
+            // whole slots of them, which is what the table's rotation means.
+            let window = window.as_plain_ram().unwrap().as_slice::<f32>()?.to_vec();
+            let mut ring = Tensor::zero::<f32>(&[lanes * channels, n, k])?;
+            let mut ring_plain = ring.as_plain_ram_mut().unwrap();
+            let ring_slice = ring_plain.as_slice_mut::<f32>()?;
+            let mut table: Vec<i32> = vec![0; 2 * channels];
+            for c in 0..channels {
+                let lane = c % lanes;
+                let rot = lane + 1;
+                for row in 0..n {
+                    for slot in 0..slots {
+                        let from = (c * n + row) * k + slot * slot_cols;
+                        let to = ((lane * channels + c) * n + row) * k
+                            + ((slot + rot) % slots) * slot_cols;
+                        ring_slice[to..to + slot_cols]
+                            .copy_from_slice(&window[from..from + slot_cols]);
+                    }
+                }
+                table[2 * c] = (rot * slot_cols / 2) as i32;
+                table[2 * c + 1] = ((lane * channels + c) * n) as i32;
+            }
+
+            let out = unsafe { DeviceTensor::uninitialized_dt(F32, expected.shape())? };
+            GgmlGemm.dispatch_matvec_ring(
+                stream,
+                &act.into_device()?,
+                &ring.clone().into_device()?,
+                &out,
+                &[channels, n, k],
+                &tensor1(&table).into_device()?,
+                RingAxis::Contracted,
+            )?;
+            stream.synchronize()?;
+            out.to_host()?.close_enough(&expected.to_host()?.into_tensor(), true)
+        })
+    }
+
+    #[test]
+    fn test_mat_vec_ring() -> TractResult<()> {
+        run_ring_test_case((1, 1, 1, 1, 2, 2, 1))?;
+        run_ring_test_case((1, 8, 1, 4, 128, 15, 4))?;
+        run_ring_test_case((3, 8, 5, 4, 128, 15, 4))?;
+        run_ring_test_case((2, 2, 3, 8, 64, 7, 1))?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_mat_vec_ring_on_contracted_axis() -> TractResult<()> {
+        run_ring_k_test_case((1, 1, 1, 1, 1, 2, 2))?;
+        run_ring_k_test_case((43, 8, 1, 4, 128, 15, 4))?;
+        run_ring_k_test_case((43, 8, 5, 4, 128, 15, 4))?;
+        run_ring_k_test_case((2, 2, 3, 8, 7, 7, 2))?;
+        Ok(())
+    }
+
     #[test]
     fn test_mat_mul() -> TractResult<()> {
         // f32_f32
@@ -785,6 +986,25 @@ mod tests {
             let output = pb.run().unwrap();
             prop_assert!(output.close_enough(&pb.reference().unwrap(), Approximation::VeryApproximate).is_ok())
         }
+    }
+
+    /// Tiles over 64 rows need more shared memory than a kernel is granted by default.
+    #[test]
+    fn mmm_ggml_q4_tall_tile() -> TractResult<()> {
+        let (b, m, k, n) = (1, 128, 64, 128);
+        let data = |len: usize| (0..len).map(|i| (i % 7) as f32 / 7.0).collect();
+        let pb = MmmProblem::<f32> {
+            b,
+            m,
+            k,
+            n,
+            lhs: data(b * m * k),
+            transpose_lhs: false,
+            rhs: data(b * n * k),
+            transpose_rhs: true,
+            q4_0: true,
+        };
+        pb.run()?.close_enough(&pb.reference()?, Approximation::VeryApproximate)
     }
 
     #[derive(Default, Debug, Clone)]

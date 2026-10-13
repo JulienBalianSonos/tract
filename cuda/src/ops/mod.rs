@@ -1,12 +1,14 @@
 mod conv;
-mod flash_attn;
+pub mod flash_attn;
 mod fused_axis_op;
 mod gemm;
 mod iff;
 mod quant_q81;
+mod ring_gemm;
 pub use conv::{CudaConv, wire_cuda_conv};
 pub use flash_attn::CudaFlashAttention;
 pub use fused_axis_op::CudaFusedAxisOp;
 pub use gemm::CudaGgmlGemm;
 pub use iff::CudaIff;
 pub use quant_q81::{CudaGgmlQuantQ81, GgmlQuantQ81Fact};
+pub use ring_gemm::CudaRingGemm;

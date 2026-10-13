@@ -405,8 +405,7 @@ impl AxisOp {
             Add(ix) => tensor.insert_axis(*ix),
             Rm(ix) => tensor.remove_axis(*ix),
             Move(from, to) => {
-                let mut tmp = tensor.clone().move_axis(*from, *to)?;
-                std::mem::swap(tensor, &mut tmp);
+                *tensor = tensor.moved_axis(*from, *to)?;
                 Ok(())
             }
             Reshape(at, from, to) => {
@@ -543,6 +542,19 @@ impl AxisOp {
             Add(a) => *a,
             Reshape(at, from, _to) => at + from.len(),
             Move(from, to) => *from.max(to),
+        }
+    }
+
+    /// The same op on wires that gained `prefix` axes in front: every axis it
+    /// names moves right by as much, so none of them can land ahead of the new
+    /// axes. Inverse of [`AxisOp::trim_left`], and infallible where that one can
+    /// refuse.
+    pub fn pad_left(&self, prefix: usize) -> AxisOp {
+        match self {
+            Rm(r) => Rm(r + prefix),
+            Add(a) => Add(a + prefix),
+            Reshape(at, from, to) => Reshape(at + prefix, from.clone(), to.clone()),
+            Move(from, to) => Move(from + prefix, to + prefix),
         }
     }
 
@@ -1491,7 +1503,7 @@ mod proptests {
             unsafe {
                 let mut t = Tensor::uninitialized::<i64>(&self.input)?;
                 for i in 0..t.len() {
-                    t.try_as_plain_mut().unwrap().as_slice_mut().unwrap()[i] = i as i64;
+                    t.try_as_plain_ram_mut().unwrap().as_slice_mut().unwrap()[i] = i as i64;
                 }
                 Ok(t)
             }

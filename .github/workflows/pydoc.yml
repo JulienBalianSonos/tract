@@ -25,7 +25,9 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable # zizmor: ignore[unpinned-uses]
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -76,7 +78,7 @@ jobs:
           python3 -c "
           import json, os, re
           dirs = sorted(
-              [d for d in os.listdir('.') if os.path.isdir(d) and d != '.git'],
+              [d for d in os.listdir('.') if os.path.isdir(d) and d not in ('.git', 'bench')],
               key=lambda v: [int(x) if x.isdigit() else x for x in re.split(r'(\d+)', v)],
               reverse=True,
           )

@@ -1,5 +1,5 @@
 use crate::fact::{DeviceFact, DeviceTypedFactExt};
-use crate::tensor::{DeviceTensorExt, IntoDevice};
+use crate::tensor::{DeviceTensor, DeviceTensorExt, IntoDevice, LazyHostStorage};
 use derive_new::new;
 use std::collections::HashMap;
 use std::fmt;
@@ -39,11 +39,27 @@ impl EvalOp for DeviceSync {
         match self.kind {
             DeviceSyncKind::ToHost => {
                 let device_tensor = input.to_device_tensor()?;
-
-                let tensor = device_tensor
-                    .to_host()
-                    .with_context(|| "Error while syncing device tensor to host")?;
-                Ok(tvec![tensor.into_tvalue()])
+                match device_tensor {
+                    // An owned device tensor of plain layout crosses the
+                    // boundary lazily: the result is a host tensor, but the
+                    // bytes only come back if someone reads them. A caller that
+                    // hands it straight to the next run never pays the
+                    // transfer.
+                    DeviceTensor::Owned(_) if !device_tensor.is_exotic() => Ok(tvec![
+                        LazyHostStorage::new(device_tensor.clone())?.into_tensor().into_tvalue()
+                    ]),
+                    // A view borrows a buffer whose contents are only good for
+                    // the turn, so it cannot outlive it; an exotic tensor comes back as its own
+                    // storage -- block-quant weights come back block-quant --
+                    // which a lazy host tensor has no way to stand in for.
+                    // Both copy out now.
+                    _ => {
+                        let tensor = device_tensor
+                            .to_host()
+                            .with_context(|| "Error while syncing device tensor to host")?;
+                        Ok(tvec![tensor.into_tvalue()])
+                    }
+                }
             }
             DeviceSyncKind::ToDevice => {
                 // Already-device tensors (e.g. cache views fed back by the
@@ -51,6 +67,13 @@ impl EvalOp for DeviceSync {
                 // opaque storage as host bytes and panic.
                 if input.to_device_tensor().is_ok() {
                     return Ok(tvec![input]);
+                }
+                // A tensor that came back from a previous run still on device
+                // goes straight back in, with no round trip either way.
+                if let Some(device) =
+                    input.storage_as::<LazyHostStorage>().and_then(|lazy| lazy.device())
+                {
+                    return Ok(tvec![device.clone().into_tensor().into()]);
                 }
                 let device_input = if let Some(t) = input.as_arc_tensor() {
                     Arc::clone(t).into_device()?
@@ -229,6 +252,7 @@ fn parse_device_resident_output_spec(spec: &str) -> TractResult<Vec<(usize, usiz
 /// Resolve the effective device-resident output ranges and their source.
 /// Precedence: env spec (when set, even empty) > model-level declaration >
 /// nothing. Split out from the env read so precedence is unit-testable.
+#[allow(clippy::type_complexity)]
 fn resolve_device_resident_output_ranges(
     env_spec: Option<&str>,
     model: &TypedModel,
@@ -244,7 +268,7 @@ fn resolve_device_resident_output_ranges(
     };
     let ixes = t.cast_to::<i64>()?;
     let mut ranges = vec![];
-    for &ix in ixes.try_as_plain()?.as_slice::<i64>()? {
+    for &ix in ixes.try_as_plain_ram()?.as_slice::<i64>()? {
         ensure!(
             ix >= 0,
             "{DEVICE_RESIDENT_OUTPUTS_PROPERTY}: negative output index {ix} in declaration"

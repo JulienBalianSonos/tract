@@ -4,7 +4,7 @@ use std::fmt;
 use downcast_rs::Downcast;
 
 use dyn_clone;
-use dyn_eq::DynEq;
+use tract_data::dyn_eq::DynEq;
 
 #[macro_use]
 pub mod macros;
@@ -22,6 +22,7 @@ pub mod dummy;
 pub mod einsum;
 pub mod fft;
 pub mod gru_cell;
+pub mod gru_seq;
 pub mod identity;
 pub mod konst;
 pub mod logic;
@@ -126,7 +127,7 @@ pub trait OpState: fmt::Debug + dyn_clone::DynClone + Downcast + Send {
 
     /// Discard what this state carries for `lanes`, so each can be handed to
     /// another stream. Required, with no default: an op holding per-lane state
-    /// clears those rows, one holding none says so with `Ok(())`, and one that
+    /// clears those lanes, one holding none says so with `Ok(())`, and one that
     /// cannot serve several streams at once fails here -- which is where a laned
     /// runtime finds out, since it resets every lane before the first turn.
     fn reset_lanes(&mut self, lanes: &[LaneId]) -> TractResult<()>;
@@ -143,6 +144,14 @@ pub trait EvalOp {
     #[allow(unused_variables)]
     fn eval(&self, ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         bail!("{} has neither eval nor state", std::any::type_name::<Self>())
+    }
+
+    /// The input this op hands straight back as its output when it has nothing
+    /// to do, if any: what reads the output then reads the producer's memory, so
+    /// an allocator pooling node outputs has to keep that region alive as long
+    /// as this op's own output. A wrapper delegates to what it wraps.
+    fn forwards_input(&self) -> Option<usize> {
+        None
     }
 
     /// Evaluate with no plan around the node -- const folding, shape inference,
@@ -170,7 +179,7 @@ pub trait EvalOp {
 
 /// A base operation
 pub trait Op:
-    fmt::Debug + dyn_clone::DynClone + dyn_eq::DynEq + Send + Sync + 'static + Downcast + EvalOp
+    fmt::Debug + dyn_clone::DynClone + DynEq + Send + Sync + 'static + Downcast + EvalOp
 {
     fn name(&self) -> StaticName;
 
@@ -184,6 +193,43 @@ pub trait Op:
     /// important configuration details to be displayed in dumps.
     fn info(&self) -> TractResult<Vec<String>> {
         Ok(vec![])
+    }
+
+    /// Whether evaluating this op can *bind* runtime symbols (symbols that only
+    /// get a value when tensors are produced: the length of a dynamic Range, a
+    /// NonZero count...). The plan's shape-feedback loop resolves such symbols
+    /// as these nodes evaluate, and uses this marker to order other nodes that
+    /// mention them (in their shapes or in symbolic tensor values) after their
+    /// defining node.
+    ///
+    /// Sources must be marked even though `set_input` binds their symbols
+    /// before evaluation: they come first in dataflow, so they claim their
+    /// shape's symbols in the definer map before an over-eager marker (say, a
+    /// Scan propagating a source-defined symbol in its output shape) would.
+    fn mints_runtime_symbols(&self) -> bool {
+        false
+    }
+
+    /// Symbols that must be bound before this op's evaluation can succeed,
+    /// beyond those visible in its output facts. The default collects the
+    /// symbols carried by symbolic tensor *values* on the input side (a TDim
+    /// konst or uniform, e.g. a folded Shape feeding a Cast): the plan's
+    /// static ordering uses these to place the node after whatever binds
+    /// them, so hidden mentions are not missed. Ops whose needs are fully
+    /// covered by their output facts need not override this.
+    fn required_bound_symbols(&self, inputs: &[&TypedFact]) -> TVec<Symbol> {
+        let mut syms: TVec<Symbol> = tvec![];
+        for fact in inputs {
+            for t in [fact.konst.as_deref(), fact.uniform.as_deref()].into_iter().flatten() {
+                if t.datum_type() == TDim::datum_type()
+                    && let Some(slice) =
+                        t.try_as_plain_ram().ok().and_then(|v| v.as_slice::<TDim>().ok())
+                {
+                    syms.extend(slice.iter().flat_map(|d| d.symbols()));
+                }
+            }
+        }
+        syms
     }
 
     fn as_typed(&self) -> Option<&dyn TypedOp>;
