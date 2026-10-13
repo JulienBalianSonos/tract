@@ -478,7 +478,7 @@ impl Clone for MetalFusedSdpaState {
             has_sinks: self.has_sinks,
             k,
             v,
-            flash_scratch: self.flash_scratch.clone(),
+            flash_scratch: None,
             neg_inf_sinks: self.neg_inf_sinks.clone(),
         }
     }
@@ -1144,10 +1144,15 @@ impl DeviceKvBuffer {
     }
 }
 
-crate::register_metal_op!(FusedSdpa, |_source, _node, op| {
+crate::register_metal_op!(FusedSdpa, |source, node, op| {
     if env_flag_with_legacy("TRACT_METAL_DISABLE_FUSED_SDPA", "TRACT_METAL_DISABLE_GPT_OSS_SDPA") {
         return Ok(None);
     }
+    let facts = source.node_input_facts(node.id)?;
+    rule_if!(facts[..5].iter().all(|fact| fact.datum_type == DatumType::F16));
+    rule_if!(facts[0].shape[0].to_usize().ok() == Some(1));
+    rule_if!(facts[5].datum_type == DatumType::F32);
+    rule_if!(!op.has_sinks || facts[6].datum_type == DatumType::F32);
     Ok(Some(Box::new(MetalFusedSdpa {
         scale_bits: op.scale_bits,
         window: op.window,
@@ -1311,6 +1316,41 @@ mod tests {
         let got = buf.valid_view()?.to_host()?.into_tensor();
         let want = Tensor::stack_tensors(2, &[&c1, &c2])?;
         got.close_enough(&want, Approximation::Exact)?;
+        Ok(())
+    }
+
+    #[test]
+    fn f32_attention_keeps_the_cpu_operator() -> TractResult<()> {
+        use tract_core::transform::ModelTransform;
+        let mut model = TypedModel::default();
+        let shape = [1, 2, 1, 64];
+        let q = model.add_source("q", f32::fact(shape))?;
+        let k = model.add_source("k", f32::fact(shape))?;
+        let v = model.add_source("v", f32::fact(shape))?;
+        let empty = model.add_const("empty", Tensor::zero::<f32>(&[1, 2, 0, 64])?)?;
+        let mask = model.add_const("mask", Tensor::zero::<f32>(&[1, 1, 1, 1])?)?;
+        let out = model.wire_node(
+            "attention",
+            FusedSdpa { scale_bits: 0.125f32.to_bits(), window: 0, has_sinks: false },
+            &[q, k, v, empty, empty, mask],
+        )?;
+        model.select_output_outlets(&out)?;
+        let mut transformed = model.clone();
+        crate::MetalTransform::default().transform(&mut transformed)?;
+        ensure!(transformed.nodes().iter().any(|n| n.op_is::<FusedSdpa>()));
+        ensure!(!transformed.nodes().iter().any(|n| n.op_is::<MetalFusedSdpa>()));
+        let values =
+            Tensor::from_shape(&shape, &(0..128).map(|i| i as f32 / 37.0).collect::<Vec<_>>())?;
+        let inputs = tvec![
+            Tensor::zero::<f32>(&shape)?.into_tvalue(),
+            Tensor::zero::<f32>(&shape)?.into_tvalue(),
+            values.into_tvalue()
+        ];
+        let expected = DefaultRuntime.prepare(model.clone())?.run(inputs.clone())?;
+        let actual = crate::MetalRuntime.prepare(model)?.run(inputs)?;
+        for (got, want) in actual.iter().zip(&expected) {
+            got.close_enough(want, Approximation::Exact)?;
+        }
         Ok(())
     }
 

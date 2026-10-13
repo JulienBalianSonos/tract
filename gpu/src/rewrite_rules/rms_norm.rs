@@ -150,6 +150,41 @@ pub fn fuse_rms_norm_scale(
     Ok(Some(patch))
 }
 
+/// Fuses an F32 norm followed by an F16 cast and learned scale, retaining
+/// the source graph's rounding before the scale multiply.
+pub fn fuse_rms_norm_scale_after_cast(
+    _ctx: &(),
+    model: &TypedModel,
+    node: &TypedNode,
+    node_name: &str,
+    op: &RmsNorm,
+) -> TractResult<Option<TypedModelPatch>> {
+    let in_fact = model.node_input_facts(node.id)?[0];
+    rule_if!(in_fact.datum_type == DatumType::F32);
+    rule_if_some!(axis_dim = in_fact.shape[op.axis].to_usize().ok());
+    rule_if_some!(cast_node = model.single_succ(node.id)?);
+    rule_if_some!(cast = cast_node.op_as::<Cast>());
+    rule_if!(cast.to == DatumType::F16);
+    rule_if_some!(mul = model.single_succ(cast_node.id)?);
+    rule_if_some!(w = mul_axis_vector_const(model, mul, in_fact.rank(), op.axis, axis_dim));
+    let scale = w.val().cast_to::<f32>()?.into_owned().into_shape(&[axis_dim])?.into_arc_tensor();
+    let mut patch = TypedModelPatch::default();
+    let input = patch.tap_model(model, node.inputs[0])?;
+    let scale = patch.add_const(format!("{node_name}.scale"), scale)?;
+    let out = patch.wire_node(
+        format!("{node_name}.scaled"),
+        ScaledRmsNorm {
+            axis: op.axis,
+            eps: op.eps.clone(),
+            out_dt: Some(mul.outputs[0].fact.datum_type),
+            scale_dt: Some(cast.to),
+        },
+        &[input, scale],
+    )?;
+    patch.shunt_outside(model, mul.id.into(), out[0])?;
+    Ok(Some(patch))
+}
+
 /// Search pattern => RMS_NORM(A) whose learned weight multiply was split by
 /// declutter's PushSliceUp over a downstream boundary (e.g. a partial-rotary
 /// rope): every successor of the norm is a static `Slice` on the norm axis,

@@ -1226,6 +1226,44 @@ mod tests {
     /// cast/add/exp/mul/silu tree into one MetalFusedElementwise dispatch and
     /// stay numerically on top of the CPU reference.
     #[test]
+    fn norm_cast_scale_fuses_without_removing_rounding() -> TractResult<()> {
+        use tract_core::ops::binary::TypedBinOp;
+        use tract_core::ops::cast::Cast;
+        use tract_core::ops::math::Mul;
+        use tract_transformers::ops::rms_norm::RmsNorm;
+        let mut model = TypedModel::default();
+        let input = model.add_source("x", f32::fact([2, 8]))?;
+        let norm = model.wire_node(
+            "norm",
+            RmsNorm { axis: 1, eps: tensor0(1e-4f32).into_arc_tensor() },
+            &[input],
+        )?;
+        let cast = model.wire_node("round", Cast { to: DatumType::F16 }, &norm)?;
+        let gamma = model.add_const(
+            "gamma",
+            Tensor::from_shape(&[1, 8], &[0.13f32, 0.7, 1.9, 2.3, 0.9, 0.31, 4.7, 0.17])?
+                .cast_to::<f16>()?
+                .into_owned(),
+        )?;
+        let out = model.wire_node("scale", TypedBinOp(Box::new(Mul), None), &[cast[0], gamma])?;
+        model.select_output_outlets(&out)?;
+        let x = Tensor::from_shape(
+            &[2, 8],
+            &(0..16).map(|i| i as f32 / 3.7 - 1.8).collect::<Vec<_>>(),
+        )?;
+        let expected =
+            DefaultRuntime.prepare(model.clone())?.run(tvec![x.clone().into_tvalue()])?;
+        let mut transformed = model.clone();
+        MetalTransform::default().transform(&mut transformed)?;
+        ensure!(transformed.nodes().iter().any(|n| {
+            n.op_as::<tract_gpu::ops::rms_norm::GpuRmsNorm>()
+                .is_some_and(|op| op.has_scale && op.round_scale_f16)
+        }));
+        let actual = crate::MetalRuntime.prepare(model)?.run(tvec![x.into_tvalue()])?;
+        actual[0].close_enough(&expected[0], Approximation::SuperApproximate)
+    }
+
+    #[test]
     fn fused_elementwise_chain_matches_cpu() -> TractResult<()> {
         use tract_core::ops::cast::cast;
         use tract_core::ops::math::exp;
