@@ -3,10 +3,11 @@
 use tract_core::internal::*;
 use tract_core::ops::math::mul;
 use tract_core::transform::ModelTransform;
-use tract_gpu::tensor::{DeviceTensor, IntoDevice};
+use tract_gpu::tensor::{DeviceTensor, DeviceTensorExt, IntoDevice};
 
 use crate::kernels::cast::wgpu_cast_dispatch;
 use crate::kernels::copy::wgpu_copy_nd_dispatch;
+use crate::kernels::element_wise::wgpu_element_wise_dispatch;
 use crate::{WgpuTransform, with_wgpu_queue};
 
 fn close(a: &Tensor, b: &Tensor) -> TractResult<()> {
@@ -33,6 +34,37 @@ fn copy_nd_transposed_matches_cpu() -> TractResult<()> {
         wgpu_copy_nd_dispatch(&src, 0, &[1, 3], &dst, 0, &[3, 2], &[2, 1])?;
         q.flush()?;
         close(&dst.to_host()?.into_tensor(), &t.clone().permute_axes(&[1, 0])?)
+    })
+}
+
+/// Nine axes, more than the shader takes, of which the extent-one ones merge
+/// away.
+#[test]
+fn copy_nd_merges_past_the_shader_rank() -> TractResult<()> {
+    with_wgpu_queue(|q| {
+        let shape = [2, 1, 3, 1, 1, 2, 1, 4, 5];
+        let t = Tensor::from_shape(&shape, &(0..240).map(|i| i as f32).collect::<Vec<_>>())?;
+        let src = t.clone().into_device()?;
+        let dst = DeviceTensor::uninitialized_dt(DatumType::F32, &shape)?;
+        wgpu_copy_nd_dispatch(&src, 0, src.strides(), &dst, 0, &shape, dst.strides())?;
+        q.flush()?;
+        close(&dst.to_host()?.into_tensor(), &t)
+    })
+}
+
+/// A slice of a rank-7 tensor merges down to what the copy addresses, so it
+/// stays on device.
+#[test]
+fn slice_rank_7_device_tensor() -> TractResult<()> {
+    with_wgpu_queue(|_| {
+        let input = Tensor::from_shape(
+            &[2, 1, 3, 1, 4, 5, 6],
+            &(0..720).map(|i| i as f32).collect::<Vec<_>>(),
+        )?;
+        let sliced = input.clone().into_device()?.into_tensor().slice(4, 1, 3)?;
+        let device = sliced.to_device_tensor()?;
+        assert!(matches!(device, DeviceTensor::Owned(_)));
+        close(&device.to_host()?.into_tensor(), &input.slice(4, 1, 3)?)
     })
 }
 
@@ -403,4 +435,238 @@ fn trailing_sum_run_matches_cpu() -> TractResult<()> {
         gpu_vs_cpu(model, Tensor::from_shape(&shape, &fill(7, n))?)?;
     }
     Ok(())
+}
+
+/// WebGPU caps a dispatch dimension at 65535 workgroups, which at 64 threads
+/// each is 4_194_240 values — a feature map a real model reaches. The excess
+/// rides the y axis, so the kernel has to fold it back in.
+#[test]
+fn copy_past_one_grid_dimension() -> TractResult<()> {
+    with_wgpu_queue(|q| {
+        let n = crate::kernels::shaders::GRID_LIMIT as usize
+            * crate::kernels::shaders::WORKGROUP as usize
+            + 1000;
+        let t =
+            Tensor::from_shape(&[2, n / 2], &(0..n).map(|i| (i % 97) as f32).collect::<Vec<_>>())?;
+        let src = t.clone().into_device()?;
+        let dst = DeviceTensor::uninitialized_dt(DatumType::F32, &[n / 2, 2])?;
+        wgpu_copy_nd_dispatch(&src, 0, &[1, (n / 2) as isize], &dst, 0, &[n / 2, 2], &[2, 1])?;
+        q.flush()?;
+        close(&dst.to_host()?.into_tensor(), &t.permute_axes(&[1, 0])?)
+    })
+}
+
+/// The element-wise kernels are the ones a large feature map actually reaches,
+/// and they take four values a thread, so the grid runs out four times later.
+#[test]
+fn element_wise_past_one_grid_dimension() -> TractResult<()> {
+    use tract_core::ops::nn::sigmoid;
+    with_wgpu_queue(|q| {
+        let n = 4
+            * crate::kernels::shaders::GRID_LIMIT as usize
+            * crate::kernels::shaders::WORKGROUP as usize
+            + 4000;
+        let data = (0..n).map(|i| ((i % 17) as f32) - 8.0).collect::<Vec<_>>();
+        let t = Tensor::from_shape(&[n], &data)?;
+        let cpu = sigmoid()
+            .eval_out_of_plan(tvec!(t.clone().into_tvalue()))?
+            .unwrap()
+            .remove(0)
+            .into_tensor();
+        let input = t.into_device()?;
+        let output = DeviceTensor::uninitialized_dt(DatumType::F32, input.shape())?;
+        wgpu_element_wise_dispatch(&*sigmoid().0, &input, &output)?;
+        q.flush()?;
+        close(&output.to_host()?.into_tensor(), &cpu)
+    })
+}
+
+/// A resize over the two trailing axes runs as one launch, two taps unrolled
+/// when it is bilinear and the generic gather otherwise, and matches the CPU.
+#[test]
+fn resize_two_trailing_axes() -> TractResult<()> {
+    use tract_core::ops::nn::resize::{CoordTransformer, Interpolator, Nearest, Resize};
+    for (interp, coord, shape, scales) in [
+        (Interpolator::Linear, CoordTransformer::HalfPixel, [1usize, 3, 9, 16], [1f32, 1., 2., 2.]),
+        (Interpolator::Linear, CoordTransformer::AlignCorners, [2, 5, 7, 11], [1., 1., 3., 1.5]),
+        (Interpolator::Nearest, CoordTransformer::Asymmetric, [1, 2, 6, 6], [1., 1., 2., 2.]),
+        (Interpolator::Cubic, CoordTransformer::HalfPixel, [1, 1, 8, 8], [1., 1., 2., 2.]),
+    ] {
+        let label = format!("{interp:?} {coord:?} {shape:?} x {scales:?}");
+        let mut model = TypedModel::default();
+        let x = model.add_source("x", f32::fact(&shape))?;
+        let s = model.add_const("scales", tensor1(&scales))?;
+        let y = model.wire_node(
+            "resize",
+            Resize {
+                coord_transformer: coord,
+                interpolator: interp,
+                nearest: Nearest::RoundPreferCeil,
+                optional_scales_input: Some(1),
+                optional_sizes_input: None,
+            },
+            &[x, s],
+        )?[0];
+        model.select_output_outlets(&[y])?;
+        let n: usize = shape.iter().product();
+        gpu_vs_cpu(model, Tensor::from_shape(&shape, &fill(7, n))?).with_context(|| label)?;
+    }
+    Ok(())
+}
+
+/// A dense 3x3 convolution takes the per-pixel kernel, every output channel
+/// of a pixel from one thread; the shapes cover the stem, a batch, a stride-1
+/// layer with more input channels, and an odd size, against the CPU.
+#[test]
+fn conv_3x3_per_pixel() -> TractResult<()> {
+    use tract_core::ops::cnn::{Conv, KernelFormat, PaddingSpec, PoolSpec};
+    use tract_core::ops::nn::DataFormat;
+    for (n, ci, co, h, w, stride, pad) in [
+        (1usize, 3usize, 16usize, 144usize, 256usize, 2usize, 1usize),
+        (2, 3, 8, 20, 30, 2, 1),
+        (1, 7, 5, 13, 17, 1, 1),
+        (1, 4, 6, 9, 9, 1, 0),
+    ] {
+        let mut model = TypedModel::default();
+        let x = model.add_source("x", f32::fact([n, ci, h, w]))?;
+        let k =
+            model.add_const("k", Tensor::from_shape(&[co, ci, 3, 3], &fill(3, co * ci * 9))?)?;
+        let b = model.add_const("b", Tensor::from_shape(&[co], &fill(4, co))?)?;
+        let conv = Conv {
+            pool_spec: PoolSpec {
+                data_format: DataFormat::NCHW,
+                kernel_shape: tvec![3, 3],
+                padding: PaddingSpec::Explicit(tvec![pad, pad], tvec![pad, pad]),
+                dilations: None,
+                strides: Some(tvec![stride, stride]),
+                input_channels: ci,
+                output_channels: co,
+            },
+            kernel_fmt: KernelFormat::OIHW,
+            group: 1,
+            q_params: None,
+        };
+        let y = model.wire_node("conv", conv, &[x, k, b])?[0];
+        model.select_output_outlets(&[y])?;
+        gpu_vs_cpu(model, Tensor::from_shape(&[n, ci, h, w], &fill(5, n * ci * h * w))?)
+            .with_context(|| format!("n{n} ci{ci} co{co} {h}x{w} s{stride} p{pad}"))?;
+    }
+    Ok(())
+}
+
+/// The bias and activation after a transposed convolution fold into its
+/// kernel, and the result matches the CPU: the segmenter's last layer.
+#[test]
+fn deconv_bias_activation_matches_cpu() -> TractResult<()> {
+    use tract_core::ops::cnn::{Deconv, KernelFormat, PaddingSpec, PoolSpec};
+    use tract_core::ops::nn::DataFormat;
+    for (ci, co, h, w) in [(16usize, 1usize, 9usize, 16usize), (3, 2, 5, 7)] {
+        let mut model = TypedModel::default();
+        let x = model.add_source("x", f32::fact([1, ci, h, w]))?;
+        let k =
+            model.add_const("k", Tensor::from_shape(&[co, ci, 2, 2], &fill(3, ci * co * 4))?)?;
+        let bias = model.add_const("bias", Tensor::from_shape(&[co], &fill(4, co))?)?;
+        let deconv = Deconv {
+            pool_spec: PoolSpec {
+                data_format: DataFormat::NCHW,
+                kernel_shape: tvec![2, 2],
+                padding: PaddingSpec::Valid,
+                dilations: None,
+                strides: Some(tvec![2, 2]),
+                input_channels: ci,
+                output_channels: co,
+            },
+            kernel_format: KernelFormat::OIHW,
+            adjustments: tvec![0, 0],
+            group: 1,
+        };
+        let y = model.wire_node("deconv", deconv, &[x, k, bias])?[0];
+        let y = model.wire_node("sigmoid", tract_core::ops::nn::sigmoid(), &[y])?[0];
+        model.select_output_outlets(&[y])?;
+        let mut folded = model.clone();
+        WgpuTransform.transform(&mut folded)?;
+        let deconv = folded
+            .nodes()
+            .iter()
+            .find_map(|n| n.op_as::<crate::ops::deconv::WgpuDeconv>())
+            .context("no WgpuDeconv after transform")?;
+        ensure!(
+            deconv.epilogue.len() == 2,
+            "epilogue not folded: {:?}\n{}",
+            deconv.epilogue,
+            folded
+                .nodes()
+                .iter()
+                .map(|n| format!("{} {}", n.op.name(), n.name))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        gpu_vs_cpu(model, Tensor::from_shape(&[1, ci, h, w], &fill(5, ci * h * w))?)
+            .with_context(|| format!("ci{ci} co{co} {h}x{w}"))?;
+    }
+    Ok(())
+}
+
+/// A residual: the operand is another tensor shaped like the product, read
+/// element for element. Two products chained so the residual is an op's
+/// output. With `transposed` every flag is set, as a channels-first pointwise
+/// convolution lowers, and the sizes are multiples of four so the blocked
+/// kernel takes it.
+fn matmul_residual(m: usize, k: usize, n: usize, transposed: bool) -> TractResult<()> {
+    use tract_core::ops::einsum::prefix_matmul::PrefixMatMul;
+    let mut model = TypedModel::default();
+    let op = PrefixMatMul {
+        transpose_a: transposed,
+        transpose_b: transposed,
+        transpose_c: transposed,
+        quantize_output: None,
+        operating_dt: None,
+    };
+    let (a_shape, b_shape, bias_shape, w2_shape) = if transposed {
+        (vec![k, m], vec![n, k], vec![n, 1], vec![n, n])
+    } else {
+        (vec![m, k], vec![k, n], vec![1, n], vec![n, n])
+    };
+    let a = model.add_source("a", f32::fact(&*a_shape))?;
+    let b = model.add_const("b", Tensor::from_shape(&b_shape, &fill(1, k * n))?)?;
+    let bias = model.add_const("bias", Tensor::from_shape(&bias_shape, &fill(2, n))?)?;
+    let first = model.wire_node("first", op, &[a, b])?[0];
+    let first = model.wire_node("first_bias", tract_core::ops::math::add(), &[first, bias])?[0];
+    let w2 = model.add_const("w2", Tensor::from_shape(&w2_shape, &fill(3, n * n))?)?;
+    let second = model.wire_node("second", op, &[first, w2])?[0];
+    let y = model.wire_node("residual", tract_core::ops::math::add(), &[second, first])?[0];
+    model.select_output_outlets(&[y])?;
+    gpu_vs_cpu(model, Tensor::from_shape(&a_shape, &fill(4, m * k))?)
+}
+
+/// `k` a multiple of four but not of eight, so the blocked kernel's unrolled
+/// loop leaves a four-step tail to run.
+#[test]
+fn matmul_blocked_k_tail_matches_cpu() -> TractResult<()> {
+    use tract_core::ops::einsum::prefix_matmul::PrefixMatMul;
+    for (m, k, n) in [(64usize, 12usize, 16usize), (144, 20, 32), (16, 4, 8)] {
+        let mut model = TypedModel::default();
+        let a = model.add_source("a", f32::fact([k, m]))?;
+        let b = model.add_const("b", Tensor::from_shape(&[n, k], &fill(1, n * k))?)?;
+        let op = PrefixMatMul {
+            transpose_a: true,
+            transpose_b: true,
+            transpose_c: true,
+            quantize_output: None,
+            operating_dt: None,
+        };
+        let out = model.wire_node("mm", op, &[a, b])?[0];
+        let bias = model.add_const("bias", Tensor::from_shape(&[n, 1], &fill(2, n))?)?;
+        let y = model.wire_node("bias_add", tract_core::ops::math::add(), &[out, bias])?[0];
+        model.select_output_outlets(&[y])?;
+        gpu_vs_cpu(model, Tensor::from_shape(&[k, m], &fill(3, k * m))?)
+            .with_context(|| format!("m={m} k={k} n={n}"))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn matmul_residual_matches_cpu() -> TractResult<()> {
+    matmul_residual(6, 5, 7, false)?;
+    matmul_residual(8, 8, 16, true)
 }

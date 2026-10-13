@@ -11,6 +11,14 @@ pub fn suite() -> &'static infra::TestSuite {
     &SUITE
 }
 
+/// Serialization cases requiring only the default core NNEF registry.
+pub fn core_suite() -> infra::TestSuite {
+    let mut suite = infra::TestSuite::default()
+        .with("clamped_swiglu", suite_unit::clamped_swiglu::suite().unwrap());
+    suite.skip(&|path| path.last().is_some_and(|name| name == "contract"));
+    suite
+}
+
 #[allow(clippy::needless_update)]
 fn mk_suite() -> infra::TestSuite {
     let mut onnx = suite_onnx::suite().clone();
@@ -43,6 +51,8 @@ test_averagepool_2d_ceil
 test_averagepool_2d_pads_count_include_pad
 test_averagepool_2d_precomputed_pads_count_include_pad
 test_averagepool_2d_same_lower
+test_averagepool_3d_dilations_large_count_include_pad_is_0_ceil_mode_is_True
+test_averagepool_3d_dilations_large_count_include_pad_is_1_ceil_mode_is_True
 test_cast_STRING_to_FLOAT
 test_castlike_STRING_to_FLOAT_expanded
 test_constantlike_ones_with_input
@@ -51,6 +61,10 @@ test_constantlike_zeros_without_input_dtype
 test_cumsum_1d_exclusive
 test_cumsum_1d_reverse_exclusive
 test_cumsum_2d
+test_gelu_default_1
+test_gelu_default_1_expanded
+test_gelu_default_2
+test_gelu_default_2_expanded
 test_dequantizelinear
 test_dropout_random
 test_dynamicquantizelinear
@@ -61,6 +75,7 @@ test_gemm_broadcast
 test_gemm_nobroadcast
 test_maxpool_2d_ceil
 test_maxpool_2d_same_lower
+test_maxpool_3d_dilations_use_ref_impl_large
 test_maxpool_with_argmax_2d_precomputed_pads
 test_maxpool_with_argmax_2d_precomputed_strides
 test_mod_broadcast

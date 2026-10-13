@@ -1,0 +1,66 @@
+#!/bin/sh
+
+WHITE='\033[1;37m'
+NC='\033[0m' # No Color
+
+set -x
+
+ROOT=$(dirname $0)/..
+. $ROOT/ci/ci-system-setup.sh
+
+set -e
+
+if [ `arch` = "x86_64" -a "$RUST_VERSION" = "stable" ]
+then
+    ALL_FEATURES=--all-features
+fi
+
+set +x
+cargo update
+
+echo
+echo "$WHITE ### tract ### $NC"
+echo
+
+cargo -q test $CARGO_EXTRA -q -p tract
+
+for c in data linalg core nnef hir onnx pulse onnx-opl pulse-opl
+do
+    echo
+    echo "$WHITE ### $c ### $NC"
+    echo
+    cargo -q test $CARGO_EXTRA -q -p tract-$c
+done
+
+# The registry declares every architecture's kernels, and its tests -- what each machine picks,
+# and which cells a settlement speaks for -- only see the trees this feature compiles in.
+echo
+echo "$WHITE ### linalg, every tree ### $NC"
+echo
+cargo -q test $CARGO_EXTRA -q -p tract-linalg --features foreign-inventory
+
+if [ `uname` = "Darwin" -a -z "$CI" ]
+then
+    echo
+    echo "$WHITE ### metal ### $NC"
+    echo
+    cargo -q test $CARGO_EXTRA -q -p tract-metal
+fi
+
+if command -v nvcc >/dev/null 2>&1 && [ -z "$CI" ]
+then
+    echo
+    echo "$WHITE ### cuda ### $NC"
+    echo
+    cargo -q test -q -p tract-cuda
+fi
+
+$ROOT/api/proxy/ci.sh
+
+# doc test are not finding libtensorflow.so
+if ! cargo -q test $CARGO_EXTRA -q -p tract-tensorflow --lib $ALL_FEATURES
+then
+    # this crate triggers an incremental bug on nightly.
+    cargo clean -p tract-tensorflow
+    cargo -q test $CARGO_EXTRA -q -p tract-tensorflow --lib $ALL_FEATURES
+fi

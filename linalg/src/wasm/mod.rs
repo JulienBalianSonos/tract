@@ -16,6 +16,8 @@ mod fuse;
 
 mod act;
 mod act_f32;
+mod by_scalar;
+mod depthwise;
 #[cfg(all(test, target_arch = "wasm32", target_feature = "simd128"))]
 mod dispatch_tests;
 mod exp;
@@ -24,14 +26,18 @@ mod mmm_f32_gemm;
 mod mmm_f32_gemv;
 mod mmm_i32;
 mod reduce;
+mod softmax_rows;
 
 pub use act::*;
 pub use act_f32::*;
+pub use by_scalar::*;
+pub use depthwise::*;
 pub use exp::*;
 pub use ln::*;
 pub use mmm_f32_gemm::*;
 pub use mmm_f32_gemv::*;
 pub use mmm_i32::*;
+pub use softmax_rows::*;
 
 /// Every kernel this tier names must be one written for wasm: its answer is held to the suitable
 /// list, and a generic kernel counts as no opinion, leaving the N>1 rule to pick max(nr*mr) among
@@ -57,14 +63,8 @@ fn preferred(
             9..=16 => &wasm_f32_16x1.name,
             _ => &wasm_f32_32x1.name,
         }),
-        // GEMM by N: a k-step of 4x16 splats one A value into four multiply-adds where 8x8
-        // gets two, so it is 1.09-1.11x on the 64-wide shapes and 1.21x aggregate. It only
-        // pays when N is a multiple of 16: at N=8 a 16-wide tile wastes half its columns
-        // (0.58x) and N=24 pays that on its second tile, and gating on N>=16 instead cost
-        // fastenhancer tiny and base 4% each. An N unknown at optimisation time stays on 8x8.
-        // Rank the two on a full tiled GEMM: over a single tile the wider tile's doubled
-        // B-panel re-reads do not show.
-        (DatumType::F32, Some(n)) if n % 16 == 0 => Some(wasm_f32_4x16.name.as_str()),
+        // GEMM: 8x8 at every N. With A broadcast from two v128 loads it outruns 4x16 even
+        // where N fills 4x16's 16-wide tile, and it never wastes columns at N=8 or N=24.
         (DatumType::F32, _) => Some(wasm_f32_8x8.name.as_str()),
         _ => None,
     }
@@ -86,6 +86,19 @@ inventory::submit! {
 pub fn isa_set() -> crate::isa::IsaSet {
     use crate::isa::{Isa, IsaSet};
     let mut set = IsaSet::of_arch(crate::isa::Arch::Wasm32Simd128).with(Isa::Wasm32Simd128);
+    // The depthwise, by-scalar and row softmax kernels are reached only through their registry
+    // entries, and wasm-ld drops an object nothing references, entries included; every registry
+    // query passes through here.
+    #[cfg(target_feature = "simd128")]
+    std::hint::black_box((
+        depthwise::depthwise_w_f32 as *const (),
+        depthwise::depthwise_c_f32 as *const (),
+        <wasm_max_by_scalar_f32_16n as crate::frame::element_wise::ElementWiseKer<f32, f32>>::run
+            as *const (),
+        <wasm_min_by_scalar_f32_16n as crate::frame::element_wise::ElementWiseKer<f32, f32>>::run
+            as *const (),
+        softmax_rows::softmax_rows_f32 as *const (),
+    ));
     if cfg!(target_feature = "relaxed-simd") {
         set = set.with(Isa::Wasm32RelaxedSimd);
     }

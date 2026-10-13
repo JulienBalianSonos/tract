@@ -1,7 +1,7 @@
 use crate::device::get_context;
 use crate::memory::DeviceResolvedMemSchema;
-use crate::tensor::DeviceArenaView;
 use crate::tensor::DeviceTensor;
+use crate::tensor::DeviceView;
 use crate::tensor::OwnedDeviceTensor;
 
 use tract_core::internal::*;
@@ -12,17 +12,34 @@ pub struct DeviceMemoryPool {
     resolved_schema: DeviceResolvedMemSchema,
 }
 
-/// Reusable arena storage held in a turn's shared resources.
+/// Session-lived arena storage, cached in the session state across plan
+/// evaluations. Without it every evaluation allocates (and wires) a fresh
+/// multi-hundred-MB device buffer: over a chunked long-context prefill that
+/// is gigabytes of alloc/free churn, enough to push the process into the
+/// compressor and stall the next evaluations on driver re-residency.
 ///
-/// Storage is reused only when the cache is its sole owner. Live arena views
-/// retain their backing allocation and force a new allocation on the next turn.
+/// Growth allocates 25% headroom so a prefill whose per-chunk arena grows
+/// with the past-context length reallocates a handful of times instead of
+/// once per chunk; when demand drops to half the cached size or less (the
+/// prefill -> decode transition), the storage shrinks back to the demand.
+///
+/// Safety: the cached storage is only reused when this cache holds the sole
+/// reference to it. Anything still alive from an earlier evaluation (an
+/// escaped output view, an in-flight command buffer, a concurrently running
+/// clone of the state) keeps its own `Arc`, which forces a fresh allocation
+/// here instead of clobbering memory someone still reads.
 #[derive(Debug, Default)]
 pub struct ArenaStorageCache {
+    #[allow(clippy::type_complexity)]
     storage: std::sync::Mutex<Option<(Arc<Box<dyn OwnedDeviceTensor>>, usize)>>,
 }
 
 impl DeviceMemoryPool {
-    /// Granularity used to reuse a growing arena across nearby sizes.
+    /// Arena allocations are rounded up to this granularity so consecutive
+    /// steps of a growing-context decode request the SAME buffer size: one
+    /// storage allocation then serves many steps instead of reallocating and
+    /// wiring a fresh multi-MB device buffer per token (an IOGPU kernel trap
+    /// on alloc and free, per step, growing with context).
     const ARENA_SIZE_BUCKET: usize = 16 * 1024 * 1024;
 
     fn bucketed(size: usize) -> usize {
@@ -55,6 +72,19 @@ impl DeviceMemoryPool {
                 } else {
                     needed
                 };
+                if std::env::var_os("TRACT_GPU_LOG_ARENA").is_some() {
+                    eprintln!(
+                        "arena alloc: {:.1} MB (demand {:.1} MB, cached {:.1} MB{})",
+                        size as f64 / (1024.0 * 1024.0),
+                        needed as f64 / (1024.0 * 1024.0),
+                        cached.as_ref().map(|(_, s)| *s).unwrap_or(0) as f64 / (1024.0 * 1024.0),
+                        if cached.as_ref().is_some_and(|(s, _)| Arc::strong_count(s) > 1) {
+                            ", busy"
+                        } else {
+                            ""
+                        },
+                    );
+                }
                 let storage =
                     Arc::new(get_context()?.uninitialized_device_tensor(&[size], DatumType::U8)?);
                 *cached = Some((Arc::clone(&storage), size));
@@ -65,13 +95,7 @@ impl DeviceMemoryPool {
     }
 
     pub fn from_schema(resolved_schema: DeviceResolvedMemSchema) -> TractResult<Self> {
-        Ok(Self {
-            storage: Arc::new(
-                get_context()?
-                    .uninitialized_device_tensor(&[resolved_schema.memory_size], DatumType::U8)?,
-            ),
-            resolved_schema,
-        })
+        Self::from_schema_with_cache(resolved_schema, &ArenaStorageCache::default())
     }
 
     pub fn tensor_for_node(
@@ -86,8 +110,7 @@ impl DeviceMemoryPool {
         self.tensor_for_node_output(node_id, 0, dt, shape)
     }
 
-    /// Per-output variant of [`Self::tensor_for_node`] for multi-output nodes:
-    /// each output slot has its own arena region in the schema.
+    /// Allocate one output slot of a multi-output node from its arena region.
     pub fn tensor_for_node_output(
         &self,
         node_id: usize,
@@ -96,18 +119,16 @@ impl DeviceMemoryPool {
         shape: &[usize],
     ) -> TractResult<DeviceTensor> {
         match self.resolved_schema.offsets_by_node[node_id].as_ref() {
-            Some(offsets) if slot < offsets.len() && offsets[slot].len() == 1 => {
-                Ok(DeviceArenaView {
-                    arena: Arc::clone(&self.storage),
-                    dt,
-                    len: shape.iter().product(),
-                    shape: shape.into(),
-                    strides: Tensor::natural_strides(shape),
-                    offset_bytes: offsets[slot][0],
-                    exotic_fact: None,
-                }
-                .into())
+            Some(offsets) if slot < offsets.len() && offsets[slot].len() == 1 => Ok(DeviceView {
+                buffer: Arc::clone(&self.storage),
+                dt,
+                len: shape.iter().product(),
+                shape: shape.into(),
+                strides: Tensor::natural_strides(shape),
+                offset_bytes: offsets[slot][0],
+                exotic_fact: None,
             }
+            .into()),
             _ => DeviceTensor::uninitialized_dt(dt, shape),
         }
     }
@@ -124,8 +145,8 @@ impl DeviceMemoryPool {
                     offsets.len() == 1 && offsets[0].len() == 2,
                     "'scalar_exotic_tensor_for_node' is for mono-output nodes only"
                 );
-                Ok(DeviceArenaView {
-                    arena: Arc::clone(&self.storage),
+                Ok(DeviceView {
+                    buffer: Arc::clone(&self.storage),
                     dt,
                     len: 1,
                     shape: tvec!(),

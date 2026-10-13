@@ -4,6 +4,7 @@ mod tests {
     use std::ops::Range;
 
     use crate::MetalTransform;
+    use crate::kernels::matmul::mlx_sdpa::dispatch_mlx_sdpa;
     use crate::utils::with_borrowed_metal_stream;
     use tract_core::internal::*;
     use tract_core::ops::einsum::prefix_matmul::PrefixMatMul;
@@ -12,6 +13,7 @@ mod tests {
     use tract_core::transform::ModelTransform;
     use tract_gpu::device::get_context;
     use tract_gpu::memory::{DeviceMemSchema, DeviceMemoryPool, DeviceResolvedMemSchema};
+    use tract_gpu::ops::dyn_kv_cache::{GpuDynKVCache, GpuDynKVCacheState};
     use tract_gpu::tensor::{DeviceTensor, DeviceTensorExt, IntoDevice, LazyHostStorage};
 
     #[test]
@@ -58,6 +60,17 @@ mod tests {
             let input = iota(&[4, 6])?;
             let device = input.clone().into_device()?;
             check_slice(&input, &device, 1, 1..4)
+        })
+    }
+
+    /// Seven axes, two of them extent one: the copy merges down to what the
+    /// kernels address, so the slice stays on device.
+    #[test]
+    fn slice_rank_7_device_tensor() -> TractResult<()> {
+        with_borrowed_metal_stream(|_| {
+            let input = iota(&[2, 1, 3, 1, 4, 5, 6])?;
+            let device = input.clone().into_device()?;
+            check_slice(&input, &device, 4, 1..3)
         })
     }
 
@@ -113,7 +126,7 @@ mod tests {
                 memory_size: 4096,
             })?;
             let view = pool.tensor_for_node(0, f32::datum_type(), &[4, 6])?;
-            assert!(matches!(view, DeviceTensor::ArenaView(_)));
+            assert!(matches!(view, DeviceTensor::View(_)));
             let ctx = get_context()?;
             ctx.flat_copy(&input.clone().into_device()?, 0, &view, 0, 4 * 6 * 4)?;
             ctx.synchronize()?;
@@ -127,6 +140,51 @@ mod tests {
         let sliced = iota(&[2, 3])?.slice(1, 1, 3)?;
         assert!(sliced.as_device_tensor().is_none());
         sliced.close_enough(&tensor2(&[[1.0f32, 2.0], [4.0, 5.0]]), Approximation::Exact)
+    }
+
+    /// K and V as the live prefix of a buffer with spare capacity: what a KV
+    /// cache growing in place offers. Both kernel families read them through
+    /// strides, so the answer must not change and the tail must not reach it.
+    /// `ql = 1` picks the vector kernels, `ql = 64` the steel ones.
+    #[test]
+    fn mlx_sdpa_over_a_kv_cache_with_spare_capacity() -> TractResult<()> {
+        for ql in [1, 64] {
+            with_borrowed_metal_stream(|stream| {
+                let (b, qh, kvh, kl, d, capacity) = (2, 4, 2, 70, 64, 128);
+                let f32s = |n: usize, off: usize| {
+                    (0..n).map(|i| (i + off) as f32 / n as f32).collect::<Vec<_>>()
+                };
+                let q = Tensor::from_shape(&[b, qh, ql, d], &f32s(b * qh * ql * d, 0))?
+                    .into_device()?;
+                let kv_shape = [b, kvh, kl, d];
+                let kv = |off| Tensor::from_shape(&kv_shape, &f32s(b * kvh * kl * d, off));
+
+                let mut packed = tvec![];
+                let mut windowed = tvec![];
+                for off in [1, 2] {
+                    let t = kv(off)?;
+                    let mut buffer = Tensor::from_shape(
+                        &[b, kvh, capacity, d],
+                        &vec![-7f32; b * kvh * capacity * d],
+                    )?;
+                    buffer.assign_slice(0..kl, &t, 0..kl, 2)?;
+                    windowed.push(buffer.into_device()?.prefix_window(2, kl)?);
+                    packed.push(t.into_device()?);
+                }
+                assert!(matches!(windowed[0], DeviceTensor::View(_)));
+                assert_ne!(windowed[0].strides(), Tensor::natural_strides(&kv_shape).as_slice());
+
+                let run = |k: &DeviceTensor, v: &DeviceTensor| -> TractResult<Arc<Tensor>> {
+                    let out = DeviceTensor::uninitialized_dt(f32::datum_type(), q.shape())?;
+                    dispatch_mlx_sdpa(stream, 1.0, false, &q, k, v, None, &out)?;
+                    out.to_host()
+                };
+                let over_capacity = run(&windowed[0], &windowed[1])?;
+                let reference = run(&packed[0], &packed[1])?;
+                over_capacity.close_enough(&reference, Approximation::Exact)
+            })?;
+        }
+        Ok(())
     }
 
     fn wire_sdpa_layer(
@@ -975,6 +1033,41 @@ mod tests {
             .close_enough(&metal_out[0].clone().into_tensor(), Approximation::Exact)?;
         Ok(())
     }
+
+    /// The device-resident output declaration (the API replacing the
+    /// TRACT_GPU_DEVICE_RESIDENT_OUTPUTS side channel) must thread through
+    /// the metal transform: declared outputs keep their device fact (no
+    /// ToHost sync), undeclared ones still sync to host.
+    #[test]
+    fn declared_device_resident_output_skips_to_host_sync() -> TractResult<()> {
+        use tract_gpu::fact::DeviceTypedFactExt;
+        let build = || -> TractResult<TypedModel> {
+            let mut m = TypedModel::default();
+            let a = m.add_source("a", f32::fact([2, 3]))?;
+            let b = m.add_source("b", f32::fact([2, 3]))?;
+            let sum = m.wire_node("sum", add(), &[a, b])?[0];
+            let prod = m.wire_node("prod", mul(), &[a, b])?[0];
+            m.select_output_outlets(&[sum, prod])?;
+            Ok(m)
+        };
+
+        // No declaration: both outputs come back as host tensors.
+        let plain = MetalTransform::default().transform_into(build()?)?;
+        assert!(plain.outlet_fact(plain.outputs[0])?.as_device_fact().is_none());
+        assert!(plain.outlet_fact(plain.outputs[1])?.as_device_fact().is_none());
+
+        // Output 1 declared device-resident: its ToHost sync is skipped,
+        // output 0 still reaches the host.
+        let mut declared = build()?;
+        tract_gpu::sync::declare_device_resident_outputs(&mut declared, [1])?;
+        let declared = MetalTransform::default().transform_into(declared)?;
+        assert!(declared.outlet_fact(declared.outputs[0])?.as_device_fact().is_none());
+        assert!(
+            declared.outlet_fact(declared.outputs[1])?.as_device_fact().is_some(),
+            "declared output must keep its device fact (ToHost sync skipped)"
+        );
+        Ok(())
+    }
     /// A model output built on device comes back as a host tensor that has not
     /// been read back yet, and feeding it into the next run never touches host
     /// memory.
@@ -1015,19 +1108,117 @@ mod tests {
         Ok(())
     }
 
-    /// Slicing a device-resident output copies it off the device: a view would
-    /// be read after the turn that produced its bytes had reused them.
-    #[test]
-    fn slicing_a_device_output_copies_it_off_the_device() -> TractResult<()> {
-        use tract_gpu::tensor::LazyHostStorage;
-        let t = Tensor::from_shape(&[4, 3], &(0..12).map(|i| i as f32).collect::<Vec<_>>())?;
-        let lazy = LazyHostStorage::new(t.clone().into_device()?)?.into_tensor();
-
-        for (axis, start, end) in [(0, 1, 3), (1, 1, 3)] {
-            let sliced = lazy.slice(axis, start, end)?;
-            assert!(sliced.has_plain_ram_storage(), "slice still aliases device memory");
-            sliced.close_enough(&t.slice(axis, start, end)?, Approximation::Exact)?;
+    fn kv_op() -> GpuDynKVCache {
+        GpuDynKVCache {
+            name: "kv".to_string(),
+            axis: 2,
+            past_sequence_fact: f32::fact([1, 2, 0, 3]),
+            input_sequence_fact: f32::fact([1, 2, 1, 3]),
+            window_output: false,
         }
-        Ok(())
+    }
+
+    fn kv_state() -> GpuDynKVCacheState {
+        GpuDynKVCacheState::new("kv".to_string(), 2, f32::fact([1, 2, 0, 3]))
+    }
+
+    /// Token `t` of a `[1, 2, S, 3]` cache, every value `t`, so the cache at
+    /// length `n` is `[[0..n], [0..n]]` whatever order it was built in.
+    fn kv_token(t: usize) -> TractResult<Tensor> {
+        Tensor::from_shape(&[1, 2, 1, 3], &[t as f32; 6])
+    }
+
+    fn kv_expected(tokens: &[usize]) -> TractResult<Tensor> {
+        let n = tokens.len();
+        let mut data = vec![0f32; 2 * n * 3];
+        for h in 0..2 {
+            for (s, t) in tokens.iter().enumerate() {
+                for d in 0..3 {
+                    data[h * n * 3 + s * 3 + d] = *t as f32;
+                }
+            }
+        }
+        Tensor::from_shape(&[1, 2, n, 3], &data)
+    }
+
+    fn kv_push(
+        state: &mut GpuDynKVCacheState,
+        op: &GpuDynKVCache,
+        t: usize,
+    ) -> TractResult<Arc<Tensor>> {
+        let token = kv_token(t)?.into_device()?.into_tensor().into_tvalue();
+        let out = state.eval(&EvalContext::out_of_plan(), op, tvec!(token))?;
+        out[0].to_device_tensor()?.to_host()
+    }
+
+    /// One token per turn, the decode shape. The cache reads as everything
+    /// pushed, and re-seats its buffer a logarithmic number of times rather than
+    /// once a turn -- which is the whole point of holding spare capacity.
+    #[test]
+    fn kv_cache_grows_geometrically() -> TractResult<()> {
+        with_borrowed_metal_stream(|_| {
+            let (op, mut state) = (kv_op(), kv_state());
+            for t in 0..64 {
+                let out = kv_push(&mut state, &op, t)?;
+                out.close_enough(
+                    &kv_expected(&(0..=t).collect::<Vec<_>>())?,
+                    Approximation::Exact,
+                )?;
+            }
+            assert!(
+                state.reallocs() <= 8,
+                "64 single-token appends re-seated the buffer {} times",
+                state.reallocs()
+            );
+            assert!(state.capacity() >= 64);
+            Ok(())
+        })
+    }
+
+    /// Rolling back to a shared prefix is a shorter read of the same buffer, and
+    /// the decode goes on appending over the tail it dropped.
+    #[test]
+    fn kv_cache_truncates_and_grows_again() -> TractResult<()> {
+        with_borrowed_metal_stream(|_| {
+            let (op, mut state) = (kv_op(), kv_state());
+            for t in 0..10 {
+                kv_push(&mut state, &op, t)?;
+            }
+            let (capacity, reallocs) = (state.capacity(), state.reallocs());
+            state.truncate(4)?;
+            assert_eq!(state.capacity(), capacity, "truncation moved the buffer");
+            assert_eq!(state.reallocs(), reallocs);
+
+            let out = kv_push(&mut state, &op, 100)?;
+            out.close_enough(&kv_expected(&[0, 1, 2, 3, 100])?, Approximation::Exact)
+        })
+    }
+
+    /// A checkpoint carries the live prefix and nothing of the spare tail.
+    #[test]
+    fn kv_cache_checkpoint_carries_the_live_prefix() -> TractResult<()> {
+        with_borrowed_metal_stream(|_| {
+            let (op, mut state) = (kv_op(), kv_state());
+            for t in 0..5 {
+                kv_push(&mut state, &op, t)?;
+            }
+            assert!(state.capacity() > 5, "this test wants a buffer with a spare tail");
+            let mut saved = vec![];
+            state.save_to(&mut saved)?;
+            saved[0].close_enough(&kv_expected(&[0, 1, 2, 3, 4])?, Approximation::Exact)
+        })
+    }
+    /// A window with spare capacity is not its own bytes in order: reading it
+    /// back has to walk it, not take a flat run from the offset.
+    #[test]
+    fn a_strided_window_reads_back_whole() -> TractResult<()> {
+        with_borrowed_metal_stream(|_| {
+            let input = iota(&[2, 3, 8, 4])?;
+            let device = input.clone().into_device()?;
+            let window = device.prefix_window(2, 5)?;
+            assert!(matches!(window, DeviceTensor::View(_)));
+            assert_eq!(window.shape(), &[2, 3, 5, 4]);
+            window.to_host()?.close_enough(&input.slice(2, 0, 5)?, Approximation::Exact)
+        })
     }
 }

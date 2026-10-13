@@ -36,10 +36,66 @@ impl Arbitrary for DeconvProblem {
     type Strategy = BoxedStrategy<DeconvProblem>;
     type Parameters = DeconvProblemParams;
     fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
-        // The 2x2 stride-2 NCHW shape has a dedicated kernel and comes up about once
-        // in fifty thousand uniform draws, so half the cases are that shape.
-        prop_oneof![general(), fast_2x2_s2()].boxed()
+        // Kernels whose taps never overlap take a dedicated path and come up about once
+        // in fifty thousand uniform draws, so two thirds of the cases are that geometry.
+        prop_oneof![general(), fast_2x2_s2(), non_overlapping()].boxed()
     }
+}
+
+fn non_overlapping() -> BoxedStrategy<DeconvProblem> {
+    (1usize..3)
+        .prop_flat_map(|georank| {
+            (
+                data_format(),
+                kernel_format(),
+                Just(PaddingSpec::Valid),
+                1usize..3,
+                1usize..4,
+                1usize..4,
+                vec(1usize..5, georank..=georank),
+                vec(1usize..7, georank..=georank),
+                1usize..3,
+            )
+        })
+        .prop_flat_map(|(df, kf, pad, n, ci_over_group, co_over_group, hwk, hwi, group)| {
+            let mut kernel_shape = hwk.clone();
+            match kf {
+                OIHW => {
+                    kernel_shape.insert(0, co_over_group * group);
+                    kernel_shape.insert(1, ci_over_group);
+                }
+                HWIO => {
+                    kernel_shape.push(ci_over_group * group);
+                    kernel_shape.push(co_over_group);
+                }
+                OHWI => {
+                    kernel_shape.insert(0, co_over_group);
+                    kernel_shape.push(ci_over_group * group);
+                }
+            };
+            let data_shape = df.from_n_c_hw(n, ci_over_group * group, hwi).unwrap();
+            (
+                Just((df, kf, pad, hwk, group)),
+                tensor(&data_shape.shape),
+                tensor(&kernel_shape),
+                proptest::option::of(tensor(&[co_over_group * group])),
+            )
+        })
+        .prop_map(|((data_format, kernel_format, padding, hwk, group), input, kernel, bias)| {
+            DeconvProblem {
+                data_format,
+                kernel_format,
+                padding,
+                input,
+                kernel,
+                bias,
+                strides: hwk.iter().copied().collect(),
+                dilations: tvec!(1; hwk.len()),
+                adjustments: tvec!(0; hwk.len()),
+                group,
+            }
+        })
+        .boxed()
 }
 
 fn general() -> BoxedStrategy<DeconvProblem> {
@@ -336,6 +392,30 @@ pub fn suite() -> TractResult<TestSuite> {
 
     suite.add("nchw_2x2_s2_5x6", nchw_2x2_s2(1, 3, 4, 5, 6));
     suite.add("nchw_2x2_s2_wide", nchw_2x2_s2(2, 2, 3, 3, 9));
+
+    for (name, format, padding, group, width, stride) in [
+        ("nchw_rectangular", NCHW, PaddingSpec::Valid, 1, 17, 1),
+        ("nchw_rectangular_same", NCHW, PaddingSpec::SameUpper, 1, 17, 1),
+        ("nchw_rectangular_grouped", NCHW, PaddingSpec::SameUpper, 2, 17, 1),
+        ("chw_rectangular_same", CHW, PaddingSpec::SameUpper, 1, 17, 1),
+        ("nchw_rectangular_s2", NCHW, PaddingSpec::Valid, 1, 16, 2),
+        ("nchw_rectangular_s3", NCHW, PaddingSpec::SameUpper, 2, 17, 3),
+        ("nchw_rectangular_small", NCHW, PaddingSpec::Valid, 1, 15, 2),
+    ] {
+        let mut problem = nchw_2x2_s2(2, 4, 6, 3, width);
+        problem.data_format = format;
+        if format == CHW {
+            problem.input = problem.input.index_axis_move(Axis(0), 0);
+        }
+        problem.kernel = ArrayD::from_shape_fn(IxDyn(&[6, 4 / group, 3, 5]), |ix| {
+            ((ix[0] * 5 + ix[1] * 3 + ix[2] * 2 + ix[3]) % 7) as f32 - 3.0
+        });
+        problem.padding = padding;
+        problem.strides = tvec!(2, stride);
+        problem.dilations = tvec!(2, 3);
+        problem.group = group;
+        suite.add(name, problem);
+    }
 
     suite.add(
         "trivial_0",

@@ -212,6 +212,170 @@ unsafe fn copy_blocks<T: Copy>(
     }
 }
 
+/// Transpose the `[i0, i1) × [m0, m1)` window of a `[a, mid]` matrix of N-byte
+/// cells into a `[mid, a]` matrix. `src` holds `a * mid` cells and `dst` `mid * a`
+/// cells, both densely packed.
+#[allow(clippy::too_many_arguments)]
+fn transpose_tile_cells<const N: usize>(
+    src: &[u8],
+    dst: &mut [u8],
+    i0: usize,
+    i1: usize,
+    m0: usize,
+    m1: usize,
+    a: usize,
+    mid: usize,
+) {
+    let (src, _) = src.as_chunks::<N>();
+    let (dst, _) = dst.as_chunks_mut::<N>();
+    if (a * N).is_multiple_of(4096) {
+        for (m, row) in dst.chunks_exact_mut(a).enumerate().take(m1).skip(m0) {
+            for (cell, i) in row[i0..i1].iter_mut().zip(i0..i1) {
+                *cell = src[i * mid + m];
+            }
+        }
+    } else {
+        let mut i = i0;
+        while i + 4 <= i1 {
+            let mut m = m0;
+            while m + 4 <= m1 {
+                let r0: &[[u8; N]; 4] = src[i * mid + m..i * mid + m + 4].try_into().unwrap();
+                let r1: &[[u8; N]; 4] =
+                    src[(i + 1) * mid + m..(i + 1) * mid + m + 4].try_into().unwrap();
+                let r2: &[[u8; N]; 4] =
+                    src[(i + 2) * mid + m..(i + 2) * mid + m + 4].try_into().unwrap();
+                let r3: &[[u8; N]; 4] =
+                    src[(i + 3) * mid + m..(i + 3) * mid + m + 4].try_into().unwrap();
+                for k in 0..4 {
+                    dst[(m + k) * a + i..(m + k) * a + i + 4]
+                        .copy_from_slice(&[r0[k], r1[k], r2[k], r3[k]]);
+                }
+                m += 4;
+            }
+            while m < m1 {
+                for ii in i..i + 4 {
+                    dst[m * a + ii] = src[ii * mid + m];
+                }
+                m += 1;
+            }
+            i += 4;
+        }
+        for i in i..i1 {
+            for (cell, m) in src[i * mid + m0..i * mid + m1].iter().zip(m0..m1) {
+                dst[m * a + i] = *cell;
+            }
+        }
+    }
+}
+
+/// Transpose the `[i0, i1) × [m0, m1)` window of a `[a, mid]` matrix of `item`-byte
+/// cells into a `[mid, a]` matrix. `src` holds `a * mid` cells and `dst` `mid * a`
+/// cells, both densely packed.
+#[allow(clippy::too_many_arguments)]
+fn transpose_tile(
+    src: &[u8],
+    dst: &mut [u8],
+    i0: usize,
+    i1: usize,
+    m0: usize,
+    m1: usize,
+    a: usize,
+    mid: usize,
+    item: usize,
+) {
+    match item {
+        1 => transpose_tile_cells::<1>(src, dst, i0, i1, m0, m1, a, mid),
+        2 => transpose_tile_cells::<2>(src, dst, i0, i1, m0, m1, a, mid),
+        4 => transpose_tile_cells::<4>(src, dst, i0, i1, m0, m1, a, mid),
+        8 => transpose_tile_cells::<8>(src, dst, i0, i1, m0, m1, a, mid),
+        16 => transpose_tile_cells::<16>(src, dst, i0, i1, m0, m1, a, mid),
+        _ => {
+            for i in i0..i1 {
+                for m in m0..m1 {
+                    let s = (i * mid + m) * item;
+                    let d = (m * a + i) * item;
+                    dst[d..d + item].copy_from_slice(&src[s..s + item]);
+                }
+            }
+        }
+    }
+}
+
+/// Transpose a `[a, mid]` matrix of `item`-byte cells into a `[mid, a]` matrix,
+/// visiting both in cache-sized tiles. `src` holds `a * mid` cells and `dst`
+/// `mid * a` cells, both densely packed.
+fn transpose_cells(src: &[u8], dst: &mut [u8], a: usize, mid: usize, item: usize) {
+    let tile = (64 / item).max(16);
+    let mut i0 = 0;
+    while i0 < a {
+        let i1 = (i0 + tile).min(a);
+        let mut m0 = 0;
+        while m0 < mid {
+            let m1 = (m0 + tile).min(mid);
+            transpose_tile(src, dst, i0, i1, m0, m1, a, mid, item);
+            m0 += tile;
+        }
+        i0 += tile;
+    }
+}
+
+/// Copy `src`, a `[outer, p, q, inner]` contiguous tensor of `elem_size`-byte
+/// elements, into `dst` laid out as `[outer, q, p, inner]` — the data movement
+/// performed by a single `move_axis` where `p` and `q` are the two extents the
+/// moved axis travels across. Both slices must cover `outer * p * q * inner *
+/// elem_size` bytes.
+fn move_axis_blocks(
+    src: &[u8],
+    dst: &mut [u8],
+    outer: usize,
+    p: usize,
+    q: usize,
+    inner: usize,
+    elem_size: usize,
+) {
+    let item = inner * elem_size;
+    let block = outer * p * q * item;
+    if p == 1 || q == 1 || inner == 0 {
+        dst[..block].copy_from_slice(&src[..block]);
+        return;
+    }
+    if item >= 64 {
+        for o in 0..outer {
+            for i in 0..p {
+                for m in 0..q {
+                    let s = ((o * p + i) * q + m) * item;
+                    let d = ((o * q + m) * p + i) * item;
+                    dst[d..d + item].copy_from_slice(&src[s..s + item]);
+                }
+            }
+        }
+    } else {
+        for o in 0..outer {
+            transpose_cells(
+                &src[o * p * q * item..(o + 1) * p * q * item],
+                &mut dst[o * p * q * item..(o + 1) * p * q * item],
+                p,
+                q,
+                item,
+            );
+        }
+    }
+}
+
+/// If `axes` is the identity permutation with one element moved — the shape of
+/// permutation `move_axis` produces — return the `(from, to)` of that move.
+fn move_axis_pair(axes: &[usize]) -> Option<(usize, usize)> {
+    let lo = (0..axes.len()).find(|&i| axes[i] != i)?;
+    let hi = (0..axes.len()).rev().find(|&i| axes[i] != i).unwrap();
+    if axes[hi] == lo && (lo..hi).all(|i| axes[i] == i + 1) {
+        return Some((lo, hi));
+    }
+    if axes[lo] == hi && (lo + 1..=hi).all(|i| axes[i] == i - 1) {
+        return Some((hi, lo));
+    }
+    None
+}
+
 impl Tensor {
     /// Plain storage for this tensor's bytes, materializing it if the storage
     /// keeps them elsewhere.
@@ -758,9 +922,70 @@ impl Tensor {
         Ok(())
     }
 
+    /// `true` when the tensor is backed by plain contiguous storage laid out
+    /// with the natural strides of its shape, so the block move applies.
+    #[inline]
+    fn can_move_axis_blocks(&self) -> bool {
+        self.dt.is_copy()
+            && self.has_plain_ram_storage()
+            && self.strides[..] == natural_strides(&self.shape)[..]
+    }
+
+    /// Return a new tensor with the axis `from` moved to position `to`, in fresh
+    /// plain storage. Data is copied once. Falls back to a clone plus the
+    /// ndarray path when the tensor is not plainly and contiguously laid out.
+    pub fn moved_axis(&self, from: usize, to: usize) -> TractResult<Tensor> {
+        ensure!(from < self.rank());
+        ensure!(to < self.rank());
+        let mut new_shape: TVec<usize> = self.shape.clone();
+        let moved = new_shape.remove(from);
+        new_shape.insert(to, moved);
+        if !self.can_move_axis_blocks() {
+            let mut permutation: Vec<usize> = (0..self.rank()).collect();
+            permutation.remove(from);
+            permutation.insert(to, from);
+            return self.clone().permute_axes(&permutation);
+        }
+        let shape = &*self.shape;
+        let (outer, p, q, inner) = if from < to {
+            (
+                shape[..from].iter().product(),
+                shape[from],
+                shape[from + 1..=to].iter().product(),
+                shape[to + 1..].iter().product(),
+            )
+        } else {
+            (
+                shape[..to].iter().product(),
+                shape[to..from].iter().product(),
+                shape[from],
+                shape[from + 1..].iter().product(),
+            )
+        };
+        let mut output = Tensor::zero_dt(self.dt, &new_shape)?;
+        move_axis_blocks(
+            self.as_bytes(),
+            output.as_bytes_mut(),
+            outer,
+            p,
+            q,
+            inner,
+            self.dt.size_of(),
+        );
+        Ok(output)
+    }
+
     pub fn permute_axes(self, axes: &[usize]) -> TractResult<Tensor> {
         ensure!(axes.iter().duplicates().next().is_none());
         ensure!(axes.iter().all(|a| *a < self.rank()));
+        if axes.iter().enumerate().all(|(i, a)| i == *a) {
+            return Ok(self);
+        }
+        if let Some((from, to)) = move_axis_pair(axes)
+            && self.can_move_axis_blocks()
+        {
+            return self.moved_axis(from, to);
+        }
         unsafe {
             #[inline]
             unsafe fn permute<T: Datum>(axes: &[usize], input: Tensor) -> Tensor {
@@ -906,6 +1131,50 @@ impl Tensor {
         }
         let source = self.as_bytes();
         let dst = output.as_bytes_mut();
+        // When the innermost source axes broadcast, `run` collapses to a single element and
+        // the block walk below copies `dt_size` bytes per output element -- measured at ~15
+        // cycles each, which is 6.2 ms for a 6.5 MB `1x16x1x1` -> `1x16x320x320` bias
+        // broadcast. Every output cell is then one contiguous run of a single value, so lay
+        // the cell down once and double it instead of walking it. `run == dt_size` holds
+        // exactly when the innermost source axis is broadcast.
+        if run == dt_size {
+            let mut bs = shape.len();
+            while bs > 0 && src[bs - 1] == 1 {
+                bs -= 1;
+            }
+            let cell: usize = shape[bs..].iter().product();
+            let cells: usize = shape[..bs].iter().product();
+            if cell > 0 && cells > 0 {
+                let mut src_strides: TVec<usize> = tvec!(0; bs);
+                let mut acc = 1;
+                for ax in (0..bs).rev() {
+                    src_strides[ax] = if src[ax] == 1 { 0 } else { acc };
+                    acc *= src[ax];
+                }
+                let cell_bytes = cell * dt_size;
+                let mut coords: TVec<usize> = tvec!(0; bs);
+                for cell_ix in 0..cells {
+                    let from: usize =
+                        izip!(&coords, &src_strides).map(|(c, s)| c * s).sum::<usize>() * dt_size;
+                    let out = &mut dst[cell_ix * cell_bytes..][..cell_bytes];
+                    out[..dt_size].copy_from_slice(&source[from..][..dt_size]);
+                    let mut filled = dt_size;
+                    while filled < cell_bytes {
+                        let n = filled.min(cell_bytes - filled);
+                        out.copy_within(..n, filled);
+                        filled += n;
+                    }
+                    for ax in (0..bs).rev() {
+                        coords[ax] += 1;
+                        if coords[ax] < shape[ax] {
+                            break;
+                        }
+                        coords[ax] = 0;
+                    }
+                }
+                return Ok(output);
+            }
+        }
         let mut coords: TVec<usize> = tvec!(0; split);
         for block in 0..outer {
             let from: usize = izip!(&coords, &src_strides).map(|(c, s)| c * s).sum();
@@ -2399,6 +2668,102 @@ mod tests {
         PermuteAxisProblem { shape: vec![2, 2], permutation: vec![1, 0] }.check().unwrap();
     }
 
+    fn for_each_shape(rank: usize, max_dim: usize, mut f: impl FnMut(&[usize])) {
+        let mut shape = vec![1usize; rank];
+        loop {
+            f(&shape);
+            let mut i = rank;
+            loop {
+                if i == 0 {
+                    return;
+                }
+                i -= 1;
+                shape[i] += 1;
+                if shape[i] <= max_dim {
+                    break;
+                }
+                shape[i] = 1;
+            }
+        }
+    }
+
+    fn check_moved_axis<T: Datum + num_traits::NumCast + Copy>(
+        shape: &[usize],
+        from: usize,
+        to: usize,
+    ) {
+        let n: usize = shape.iter().product();
+        let data: Vec<T> = (0..n).map(|i| T::from(i % 251).unwrap()).collect();
+        let t = Tensor::from_shape::<T>(shape, &data).unwrap();
+        let mut permutation: Vec<usize> = (0..shape.len()).collect();
+        permutation.remove(from);
+        permutation.insert(to, from);
+        let reference = unsafe {
+            t.clone().into_array_unchecked::<T>().permuted_axes(&*permutation).into_tensor()
+        };
+        let got = t.moved_axis(from, to).unwrap();
+        assert_eq!(got.shape(), reference.shape(), "{shape:?} {from}->{to}");
+        assert_eq!(got.as_bytes(), reference.as_bytes(), "{shape:?} {from}->{to}");
+    }
+
+    #[test]
+    fn moved_axis_matches_permuted_axes() {
+        for (rank, max_dim) in [(2, 7), (3, 7), (4, 6), (5, 4)] {
+            for_each_shape(rank, max_dim, |shape| {
+                for from in 0..rank {
+                    for to in 0..rank {
+                        check_moved_axis::<u8>(shape, from, to);
+                        check_moved_axis::<f16>(shape, from, to);
+                        check_moved_axis::<f32>(shape, from, to);
+                        check_moved_axis::<f64>(shape, from, to);
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn moved_axis_matches_permuted_axes_across_tiles() {
+        // Past the 16- and 64-cell tile edges, and onto the page-aligned destination-stride rows.
+        for shape in [
+            vec![1030usize, 17],
+            vec![1024, 5],
+            vec![4096, 3],
+            vec![2048, 64],
+            vec![3, 1024, 7],
+            vec![2, 70, 33],
+            vec![1, 64, 100, 96],
+        ] {
+            for from in 0..shape.len() {
+                for to in 0..shape.len() {
+                    check_moved_axis::<u8>(&shape, from, to);
+                    check_moved_axis::<f16>(&shape, from, to);
+                    check_moved_axis::<f32>(&shape, from, to);
+                    check_moved_axis::<f64>(&shape, from, to);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn moved_axis_falls_back_on_non_contiguous() {
+        let mut t =
+            Tensor::from_shape::<f32>(&[4, 3], &(0..12).map(|i| i as f32).collect_vec()).unwrap();
+        unsafe { t.set_geometry_unchecked(&[3, 4], &[1, 4]) };
+        let got = t.moved_axis(0, 1).unwrap();
+        let reference = unsafe {
+            t.clone().into_array_unchecked::<f32>().permuted_axes(&[1, 0][..]).into_tensor()
+        };
+        assert_eq!(got.shape(), reference.shape());
+        assert_eq!(got.as_bytes(), reference.as_bytes());
+    }
+
+    #[test]
+    fn permute_axes_scalar() {
+        let t = tensor0(1f32);
+        assert_eq!(t.clone().permute_axes(&[]).unwrap(), t);
+    }
+
     #[derive(Debug)]
     struct BroadcastVecToShape {
         vec: Vec<f32>,
@@ -2839,6 +3204,13 @@ mod tests {
             (tvec!(2usize, 3), tvec!(2usize, 3)),
             (tvec!(1usize), tvec!(3usize, 1, 2)),
             (tvec!(3usize, 1), tvec!(3usize, 0)),
+            // Innermost-axis broadcasts take the repeated-cell path: one contiguous run of
+            // one value per cell, and cells that differ only on the axes below the walk.
+            (tvec!(3usize, 1), tvec!(3usize, 5)),
+            (tvec!(2usize, 1, 1), tvec!(2usize, 4, 3)),
+            (tvec!(1usize, 16, 1, 1), tvec!(1usize, 16, 4, 4)),
+            (tvec!(1usize, 1), tvec!(2usize, 3, 4)),
+            (tvec!(1024usize, 1, 1), tvec!(1024usize, 4, 1)),
         ] {
             for dt in [f32::datum_type(), u8::datum_type(), i32::datum_type()] {
                 let t = Tensor::zero_dt(dt, &src).unwrap().cast_to_dt(dt).unwrap().into_owned();
@@ -2847,6 +3219,26 @@ mod tests {
                 assert_eq!(got.shape(), &*dst, "{src:?} -> {dst:?}");
                 assert_eq!(got, want, "{src:?} -> {dst:?} {dt:?}");
             }
+        }
+    }
+
+    /// The repeated-cell path is only correct if every cell lands on the source element its
+    /// coordinates name, so check it against the reference on values rather than on zeros.
+    #[test]
+    fn broadcast_to_shape_repeats_innermost_cells_with_the_right_value() {
+        for (src, dst) in [
+            (tvec!(3usize, 1), tvec!(3usize, 5)),
+            (tvec!(2usize, 1, 1), tvec!(2usize, 4, 3)),
+            (tvec!(1usize, 16, 1, 1), tvec!(1usize, 16, 4, 4)),
+            (tvec!(1usize, 1), tvec!(2usize, 3, 4)),
+            (tvec!(1024usize, 1, 1), tvec!(1024usize, 4, 1)),
+            (tvec!(4usize, 1, 7), tvec!(4usize, 3, 7)),
+            (tvec!(2usize, 3, 1, 1), tvec!(2usize, 3, 5, 6)),
+        ] {
+            let t = ramp::<u32>(&src, 0);
+            let got = t.broadcast_to_shape(&dst).unwrap();
+            let want = Tensor::broadcast_to_shape_t::<u32>(&t, &dst).unwrap();
+            assert_eq!(got, want, "{src:?} -> {dst:?}");
         }
     }
 

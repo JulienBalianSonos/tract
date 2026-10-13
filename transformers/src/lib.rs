@@ -14,10 +14,6 @@ register_simple_model_transform!(
     SdpaFuseKvCacheBroadcastTransform
 );
 register_simple_model_transform!("unfold_kv_cache", UnfoldKeyValueCacheTransform);
-register_simple_model_transform!(
-    "fuse_inplace_kv_sdpa",
-    ops::inplace_kv_cache::InPlaceKvSdpaTransform
-);
 register_simple_model_transform!("transformers_detect_all", TransformersTransform);
 register_simple_model_transform!(
     "quantize_kv_storage",
@@ -36,6 +32,7 @@ pub fn register(registry: &mut Registry) {
     ops::dyn_kv_cache::register(registry);
     ops::window_kv_cache::register(registry);
     ops::kv_quant::register(registry);
+    ops::moe_ffn::register(registry);
     ops::quant_dyn_kv_cache::register(registry);
     ops::gdn_recurrent::register(registry);
 }

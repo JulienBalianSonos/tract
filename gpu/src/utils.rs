@@ -95,7 +95,7 @@ pub enum BroadcastKind {
 }
 
 impl BroadcastKind {
-    pub const ALL: [BroadcastKind; 8] = [
+    pub const ALL: [BroadcastKind; 9] = [
         Self::Unicast,
         Self::ByScalarLeft,
         Self::ByScalarRight,
@@ -104,6 +104,7 @@ impl BroadcastKind {
         Self::Nd3,
         Self::Nd4,
         Self::Nd5,
+        Self::Nd6,
     ];
 
     pub fn from_rank(rank: usize) -> TractResult<Self> {
@@ -159,6 +160,85 @@ impl BroadcastKind {
             })
             .collect()
     }
+}
+
+/// One tensor's layout as a kernel addresses it: an extent per axis and a stride
+/// per axis, a broadcast axis holding a stride of zero.
+pub struct Layout<'a> {
+    pub shape: &'a mut TVec<usize>,
+    pub strides: &'a mut TVec<isize>,
+}
+
+/// Merges the adjacent axes every layout walks as one run, until the rank fits
+/// `max_rank`, and answers the rank reached.
+///
+/// A pair merges when, for every layout, either the outer stride is the inner
+/// one times its extent -- so the two axes spell out one contiguous run -- or the
+/// axis is broadcast on both halves and stays broadcast. Merging is exact: it
+/// renames a walk the kernel was already going to make, and the extents the
+/// kernel is given are the output's.
+pub fn merge_axes_to_fit(layouts: &mut [Layout], max_rank: usize) -> usize {
+    let mut rank = layouts.first().map(|l| l.shape.len()).unwrap_or(0);
+    let mut axis = 0;
+    while rank > max_rank && axis + 1 < rank {
+        let inner_extent = layouts.last().map(|l| l.shape[axis + 1]).unwrap_or(1);
+        let runs = |l: &Layout| {
+            l.strides[axis] == l.strides[axis + 1] * inner_extent as isize
+                || (l.strides[axis] == 0 && l.strides[axis + 1] == 0)
+        };
+        if !layouts.iter().all(runs) {
+            axis += 1;
+            continue;
+        }
+        for l in layouts.iter_mut() {
+            // A layout broadcast along both halves is broadcast along the merged
+            // axis, and says so with an extent of one.
+            l.shape[axis] = if l.strides[axis] == 0 && l.strides[axis + 1] == 0 {
+                1
+            } else {
+                l.shape[axis] * l.shape[axis + 1]
+            };
+            l.shape.remove(axis + 1);
+            l.strides[axis] = l.strides[axis + 1];
+            l.strides.remove(axis + 1);
+        }
+        rank -= 1;
+    }
+    rank
+}
+
+/// Highest rank the backends' `copy_nd` kernels address.
+pub const MAX_COPY_RANK: usize = 6;
+
+/// A `copy_nd` zone: the output's extents, and the strides each side walks it by.
+pub struct CopyGeometry {
+    pub shape: TVec<usize>,
+    pub input_strides: TVec<isize>,
+    pub output_strides: TVec<isize>,
+}
+
+/// Merges a copy's adjacent axes with [`merge_axes_to_fit`] until it fits
+/// [`MAX_COPY_RANK`]. The rank answered still exceeds it when the two layouts
+/// leave no pair to merge, which a caller must check before dispatching.
+pub fn merge_copy_axes(
+    input_strides: &[isize],
+    output_shape: &[usize],
+    output_strides: &[isize],
+) -> CopyGeometry {
+    let mut in_shape: TVec<usize> = output_shape.into();
+    let mut geo = CopyGeometry {
+        shape: output_shape.into(),
+        input_strides: input_strides.into(),
+        output_strides: output_strides.into(),
+    };
+    merge_axes_to_fit(
+        &mut [
+            Layout { shape: &mut in_shape, strides: &mut geo.input_strides },
+            Layout { shape: &mut geo.shape, strides: &mut geo.output_strides },
+        ],
+        MAX_COPY_RANK,
+    );
+    geo
 }
 
 pub fn compute_broadcast_strides<T: num_traits::Zero + Copy + 'static>(

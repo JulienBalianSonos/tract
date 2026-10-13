@@ -61,6 +61,8 @@ pub mod amx_bf16;
 #[cfg(target_arch = "x86_64")]
 pub mod avxvnni;
 pub mod by_scalar;
+pub mod conv_w4;
+pub mod depthwise;
 pub mod erf;
 pub mod exp;
 #[cfg(tract_avx512vnni)]

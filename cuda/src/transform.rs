@@ -15,13 +15,13 @@ use tract_core::ops::einsum::prefix_matmul::{PrefixMatMul, rewrite_einsum_to_pre
 use tract_core::ops::konst::Const;
 
 tract_core::declare_knob!(
-    TRACT_CUDA_FORCE_CPU,
+    scopable TRACT_CUDA_FORCE_CPU,
     String,
     String::new(),
     "Comma-separated node-name substrings forced onto the CPU instead of CUDA."
 );
 tract_core::declare_knob!(
-    TRACT_CUDA_TRANSLATE_DEBUG,
+    scopable TRACT_CUDA_TRANSLATE_DEBUG,
     bool,
     false,
     "Log nodes that fail output-fact validation during CUDA translation."
@@ -35,6 +35,7 @@ use tract_gpu::rewrite_rules::rms_norm::{
     fuse_rms_norm_residual, fuse_rms_norm_scale, fuse_rms_norm_split_scale,
     fuse_scaled_rms_norm_in_cast, fuse_scaled_rms_norm_out_cast, remove_rms_norm_cast,
 };
+use tract_gpu::rewrite_rules::scaled_masked_softmax::drop_unit_axes_of_scaled_masked_softmax;
 use tract_gpu::sync::{DeviceSyncKind, sync_inputs_if_required, sync_model_outputs_if_required};
 use tract_gpu::tensor::{DeviceTensor, IntoDevice};
 use tract_gpu::utils::as_quant_fact;
@@ -103,6 +104,10 @@ impl CudaTransform {
             .with_rule_for("add_broadcast_pre_matmul", rewrite_rules::add_broadcast_pre_matmul)
             .with_rule_for("rewrite_kernel_conv_in_oihw", rewrite_kernel_conv_in_oihw)
             .with_rule_for("rewrite_conv_with_n_axis", rewrite_conv_with_n_axis)
+            .with_rule_for(
+                "drop_unit_axes_of_scaled_masked_softmax",
+                drop_unit_axes_of_scaled_masked_softmax,
+            )
             .with_rule_for("nearest_upsample_to_broadcast", rewrite_nearest_upsample_to_broadcast)
             .rewrite(&(), model)?;
 
@@ -147,6 +152,9 @@ impl CudaTransform {
 
         Rewriter::default()
             .with_rule_for("pad_q40_weights", rewrite_rules::pad_q40_weights)
+            .rewrite(&(), model)?;
+        Rewriter::default()
+            .with_rule_for("window_kv_cache_output", window_kv_cache_output)
             .rewrite(&(), model)?;
         Ok(())
     }
@@ -651,6 +659,7 @@ mod test {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tract_transformers::ops::dyn_kv_cache::DynKeyValueCache;
 
     fn sdpa_model(head_dim: usize) -> TractResult<(TypedModel, TVec<TValue>)> {
         let (heads, seq) = (4usize, 32usize);
@@ -680,6 +689,76 @@ mod tests {
         Ok((model, tvec!(mk(1)?, mk(2)?, mk(3)?)))
     }
 
+    /// A cache whose K (or V) feeds the flash-attention kernel may hand out a
+    /// window; one whose consumer is the exploded attention may not, because
+    /// those primitives read a packed tensor.
+    fn kv_cache_sdpa_model(head_dim: usize) -> TractResult<TypedModel> {
+        let (heads, seq) = (4usize, 32usize);
+        let dims = |s: &[usize]| s.iter().map(|d| TDim::from(*d as i64)).collect::<TVec<_>>();
+        let q_fact = f16::fact(dims(&[1, heads, seq, head_dim]));
+        let step_fact = f16::fact(dims(&[1, heads, 1, head_dim]));
+        let mut model = TypedModel::default();
+        let q = model.add_source("q", q_fact)?;
+        let mut cached = tvec!();
+        for name in ["k", "v"] {
+            let src = model.add_source(name, step_fact.clone())?;
+            cached.push(
+                model.wire_node(
+                    format!("{name}_cache"),
+                    DynKeyValueCache {
+                        name: format!("{name}_cache"),
+                        axis: 2,
+                        past_sequence_fact: f16::fact(dims(&[1, heads, seq - 1, head_dim])),
+                        input_sequence_fact: step_fact.clone(),
+                    },
+                    &[src],
+                )?[0],
+            );
+        }
+        let out = model.wire_node(
+            "sdpa",
+            Sdpa {
+                scale: None,
+                datum_type: f16::datum_type(),
+                acc_datum_type: f32::datum_type(),
+                is_causal: false,
+            },
+            &[q, cached[0], cached[1]],
+        )?;
+        model.select_output_outlets(&out)?;
+        Ok(model)
+    }
+
+    fn caches_window_their_output(model: &TypedModel) -> Vec<bool> {
+        model
+            .nodes()
+            .iter()
+            .filter_map(|n| n.op_as::<tract_gpu::ops::dyn_kv_cache::GpuDynKVCache>())
+            .map(|op| op.window_output)
+            .collect()
+    }
+
+    #[test]
+    fn kv_cache_feeding_flash_attention_windows_its_output() -> TractResult<()> {
+        let cuda = CudaTransform.transform_into(kv_cache_sdpa_model(64)?)?;
+        let windowing = caches_window_their_output(&cuda);
+        assert_eq!(windowing.len(), 2, "expected the K and V caches to survive");
+        assert!(windowing.iter().all(|w| *w), "a cache feeding flash attention should window");
+        Ok(())
+    }
+
+    #[test]
+    fn kv_cache_feeding_exploded_attention_packs_its_output() -> TractResult<()> {
+        let cuda = CudaTransform.transform_into(kv_cache_sdpa_model(8)?)?;
+        let windowing = caches_window_their_output(&cuda);
+        assert_eq!(windowing.len(), 2, "expected the K and V caches to survive");
+        assert!(
+            windowing.iter().all(|w| !*w),
+            "the exploded attention reads packed tensors, so its caches must pack"
+        );
+        Ok(())
+    }
+
     #[test]
     fn sdpa_at_supported_head_dim_routes_to_flash_attention() -> TractResult<()> {
         let (model, _) = sdpa_model(64)?;
@@ -704,4 +783,24 @@ mod tests {
         found[0].close_enough(&expected[0], Approximation::Approximate)?;
         Ok(())
     }
+}
+
+/// The flash attention kernel takes the K and V plane stride as an argument, so
+/// a cache feeding one may hand out a window of its buffer instead of packing
+/// the live prefix every turn. A sync to host packs on the way out, so a cache
+/// the application also holds is served too.
+///
+/// Runs after `rewire_syncs`, or a cache that is also a model output would look
+/// like it had no consumer but the attention.
+fn window_kv_cache_output(
+    _ctx: &(),
+    model: &TypedModel,
+    node: &TypedNode,
+    _node_name: &str,
+    op: &tract_gpu::ops::dyn_kv_cache::GpuDynKVCache,
+) -> TractResult<Option<TypedModelPatch>> {
+    tract_gpu::ops::dyn_kv_cache::window_output_for(model, node, op, |succ| {
+        succ.op_is::<crate::ops::flash_attn::CudaFlashAttention>()
+            || succ.op_is::<tract_gpu::sync::DeviceSync>()
+    })
 }

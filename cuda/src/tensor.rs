@@ -239,6 +239,7 @@ mod tests {
     use super::*;
     use tract_gpu::device::get_context;
     use tract_gpu::memory::{DeviceMemoryPool, DeviceResolvedMemSchema};
+    use tract_gpu::ops::dyn_kv_cache::{GpuDynKVCache, GpuDynKVCacheState};
     use tract_gpu::tensor::{DeviceTensorExt, IntoDevice, LazyHostStorage};
 
     fn iota(shape: &[usize]) -> TractResult<Tensor> {
@@ -279,6 +280,17 @@ mod tests {
             let input = iota(&[4, 6])?;
             let device = input.clone().into_device()?;
             check_slice(&input, &device, 1, 1..4)
+        })
+    }
+
+    /// Seven axes, two of them extent one: the copy merges down to what the
+    /// kernels address, so the slice stays on device.
+    #[test]
+    fn slice_rank_7_device_tensor() -> TractResult<()> {
+        crate::with_cuda_stream(|_| {
+            let input = iota(&[2, 1, 3, 1, 4, 5, 6])?;
+            let device = input.clone().into_device()?;
+            check_slice(&input, &device, 4, 1..3)
         })
     }
 
@@ -325,11 +337,126 @@ mod tests {
                 memory_size: 4096,
             })?;
             let view = pool.tensor_for_node(0, f32::datum_type(), &[4, 6])?;
-            assert!(matches!(view, DeviceTensor::ArenaView(_)));
+            assert!(matches!(view, DeviceTensor::View(_)));
             let ctx = get_context()?;
             ctx.flat_copy(&input.clone().into_device()?, 0, &view, 0, 4 * 6 * 4)?;
             ctx.synchronize()?;
             check_slice(&input, &view, 0, 2..4)
+        })
+    }
+
+    fn kv_op() -> GpuDynKVCache {
+        GpuDynKVCache {
+            name: "kv".to_string(),
+            axis: 2,
+            past_sequence_fact: f32::fact([1, 2, 0, 3]),
+            input_sequence_fact: f32::fact([1, 2, 1, 3]),
+            window_output: false,
+        }
+    }
+
+    fn kv_state() -> GpuDynKVCacheState {
+        GpuDynKVCacheState::new("kv".to_string(), 2, f32::fact([1, 2, 0, 3]))
+    }
+
+    /// Token `t` of a `[1, 2, S, 3]` cache, every value `t`, so the cache at
+    /// length `n` is `[[0..n], [0..n]]` whatever order it was built in.
+    fn kv_token(t: usize) -> TractResult<Tensor> {
+        Tensor::from_shape(&[1, 2, 1, 3], &[t as f32; 6])
+    }
+
+    fn kv_expected(tokens: &[usize]) -> TractResult<Tensor> {
+        let n = tokens.len();
+        let mut data = vec![0f32; 2 * n * 3];
+        for h in 0..2 {
+            for (s, t) in tokens.iter().enumerate() {
+                for d in 0..3 {
+                    data[h * n * 3 + s * 3 + d] = *t as f32;
+                }
+            }
+        }
+        Tensor::from_shape(&[1, 2, n, 3], &data)
+    }
+
+    fn kv_push(
+        state: &mut GpuDynKVCacheState,
+        op: &GpuDynKVCache,
+        t: usize,
+    ) -> TractResult<Arc<Tensor>> {
+        let token = kv_token(t)?.into_device()?.into_tensor().into_tvalue();
+        let out = state.eval(&EvalContext::out_of_plan(), op, tvec!(token))?;
+        out[0].to_device_tensor()?.to_host()
+    }
+
+    /// One token per turn, the decode shape. The cache reads as everything
+    /// pushed, and re-seats its buffer a logarithmic number of times rather than
+    /// once a turn -- which is the whole point of holding spare capacity.
+    #[test]
+    fn kv_cache_grows_geometrically() -> TractResult<()> {
+        crate::with_cuda_stream(|_| {
+            let (op, mut state) = (kv_op(), kv_state());
+            for t in 0..64 {
+                let out = kv_push(&mut state, &op, t)?;
+                out.close_enough(
+                    &kv_expected(&(0..=t).collect::<Vec<_>>())?,
+                    Approximation::Exact,
+                )?;
+            }
+            assert!(
+                state.reallocs() <= 8,
+                "64 single-token appends re-seated the buffer {} times",
+                state.reallocs()
+            );
+            assert!(state.capacity() >= 64);
+            Ok(())
+        })
+    }
+
+    /// Rolling back to a shared prefix is a shorter read of the same buffer, and
+    /// the decode goes on appending over the tail it dropped.
+    #[test]
+    fn kv_cache_truncates_and_grows_again() -> TractResult<()> {
+        crate::with_cuda_stream(|_| {
+            let (op, mut state) = (kv_op(), kv_state());
+            for t in 0..10 {
+                kv_push(&mut state, &op, t)?;
+            }
+            let (capacity, reallocs) = (state.capacity(), state.reallocs());
+            state.truncate(4)?;
+            assert_eq!(state.capacity(), capacity, "truncation moved the buffer");
+            assert_eq!(state.reallocs(), reallocs);
+
+            let out = kv_push(&mut state, &op, 100)?;
+            out.close_enough(&kv_expected(&[0, 1, 2, 3, 100])?, Approximation::Exact)
+        })
+    }
+
+    /// A checkpoint carries the live prefix and nothing of the spare tail.
+    #[test]
+    fn kv_cache_checkpoint_carries_the_live_prefix() -> TractResult<()> {
+        crate::with_cuda_stream(|_| {
+            let (op, mut state) = (kv_op(), kv_state());
+            for t in 0..5 {
+                kv_push(&mut state, &op, t)?;
+            }
+            assert!(state.capacity() > 5, "this test wants a buffer with a spare tail");
+            let mut saved = vec![];
+            state.save_to(&mut saved)?;
+            saved[0].close_enough(&kv_expected(&[0, 1, 2, 3, 4])?, Approximation::Exact)
+        })
+    }
+
+    /// A window with spare capacity is not its own bytes in order: reading it
+    /// back has to walk it, not take a flat run from the offset.
+    #[test]
+    fn a_strided_window_reads_back_whole() -> TractResult<()> {
+        crate::with_cuda_stream(|_| {
+            let input = iota(&[2, 3, 8, 4])?;
+            let device = input.clone().into_device()?;
+            let window = device.prefix_window(2, 5)?;
+            assert!(matches!(window, DeviceTensor::View(_)));
+            assert_eq!(window.shape(), &[2, 3, 5, 4]);
+            window.to_host()?.close_enough(&input.slice(2, 0, 5)?, Approximation::Exact)
         })
     }
 }

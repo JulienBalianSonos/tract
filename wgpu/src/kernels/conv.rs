@@ -3,8 +3,9 @@ use tract_core::ops::cnn::Conv;
 use tract_gpu::tensor::DeviceTensor;
 
 use crate::kernels::shaders::{
-    ChainStep, DepthwiseShape, EntryPoint, LayoutKind, ModuleKey, ModuleKind, PipelineKey,
-    ShaderDtype, conv_depthwise_module, conv_module, keys_for, pack_u32s, program_key,
+    CONV_PIXEL_WG, ChainStep, DepthwiseShape, EntryPoint, LayoutKind, ModuleKey, ModuleKind,
+    PipelineKey, ShaderDtype, conv_depthwise_module, conv_module, conv_pixel_module, keys_for,
+    pack_u32s,
 };
 use crate::utils::{element_offset, get_wgpu_buffer};
 use crate::with_wgpu_queue;
@@ -53,10 +54,9 @@ fn dispatch_depthwise(
 ) -> TractResult<()> {
     let dt = ShaderDtype::from_datum(input.datum_type())?;
     let layout = LayoutKind::Chain(3 + extras.len() as u8);
-    let key = format!("convdw{}", shape.key());
-    let key = program_key(&key, dt, epilogue, extras.len());
+    let key = ("conv_dw", shape, dt, epilogue, extras.len());
     let pipeline =
-        q.context().chain_pipeline(&key, layout, EntryPoint::typed("conv_dw", dt), || {
+        q.context().chain_pipeline(key, layout, EntryPoint::typed("conv_dw", dt), || {
             conv_depthwise_module(dt, shape, epilogue, extras.len())
         })?;
 
@@ -136,18 +136,6 @@ pub fn wgpu_conv_dispatch(
         }
         let dt = ShaderDtype::from_datum(input.datum_type())?;
         let layout = LayoutKind::Chain(3 + extras.len() as u8);
-        let pipeline = if epilogue.is_empty() {
-            q.context().pipeline(PipelineKey {
-                module: ModuleKey { kind: ModuleKind::Conv, dtype: dt },
-                entry: EntryPoint::typed("conv2d", dt),
-            })?
-        } else {
-            let key = program_key("conv", dt, epilogue, extras.len());
-            q.context().chain_pipeline(&key, layout, EntryPoint::typed("conv2d", dt), || {
-                conv_module(dt, epilogue, extras.len())
-            })?
-        };
-
         let in_shape = op.pool_spec.data_format.shape(input.shape())?;
         let out_shape = op.pool_spec.data_format.shape(output.shape())?;
         ensure!(in_shape.hw_rank() == 2, "tract-wgpu conv is 2D only");
@@ -167,6 +155,34 @@ pub fn wgpu_conv_dispatch(
         let strides = op.pool_spec.strides();
         let dilations = op.pool_spec.dilations();
         let channels_last = op.pool_spec.data_format.c_is_last() as u32;
+
+        // The per-pixel kernel unrolls 3x3 taps at dilation 1 and wants every
+        // output channel of a pixel from one thread: the stem's shape.
+        let per_pixel = channels_last == 0
+            && groups == 1
+            && kh == 3
+            && kw == 3
+            && dilations[0] == 1
+            && dilations[1] == 1
+            && (n * oh * ow).div_ceil(CONV_PIXEL_WG as usize) <= 65535;
+        let pipeline = if per_pixel {
+            q.context().chain_pipeline(
+                ("conv_pixel", dt, epilogue, extras.len()),
+                layout,
+                EntryPoint::typed("conv2d_pixel", dt),
+                || conv_pixel_module(dt, epilogue, extras.len()),
+            )?
+        } else if epilogue.is_empty() {
+            q.context().pipeline(PipelineKey {
+                module: ModuleKey { kind: ModuleKind::Conv, dtype: dt },
+                entry: EntryPoint::typed("conv2d", dt),
+            })?
+        } else {
+            let key = ("conv", dt, epilogue, extras.len());
+            q.context().chain_pipeline(key, layout, EntryPoint::typed("conv2d", dt), || {
+                conv_module(dt, epilogue, extras.len())
+            })?
+        };
 
         let in_sn = *in_shape.n_stride().unwrap_or(&0);
         let in_sc = *in_shape.c_stride();
@@ -238,6 +254,10 @@ pub fn wgpu_conv_dispatch(
         let mut params = params;
         params.extend_from_slice(&pack_u32s(&tail));
         let dyn_off = q.alloc_uniform(&params)?;
+        if per_pixel {
+            let groups = (n * oh * ow).div_ceil(CONV_PIXEL_WG as usize) as u32;
+            return q.dispatch_grid("conv_pixel", &pipeline, &bg, dyn_off, [groups, 1, 1]);
+        }
         q.dispatch("conv", &pipeline, &bg, dyn_off, (n * co * oh * ow) as u64)
     })
 }

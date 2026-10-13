@@ -195,6 +195,43 @@ pub trait Op:
         Ok(vec![])
     }
 
+    /// Whether evaluating this op can *bind* runtime symbols (symbols that only
+    /// get a value when tensors are produced: the length of a dynamic Range, a
+    /// NonZero count...). The plan's shape-feedback loop resolves such symbols
+    /// as these nodes evaluate, and uses this marker to order other nodes that
+    /// mention them (in their shapes or in symbolic tensor values) after their
+    /// defining node.
+    ///
+    /// Sources must be marked even though `set_input` binds their symbols
+    /// before evaluation: they come first in dataflow, so they claim their
+    /// shape's symbols in the definer map before an over-eager marker (say, a
+    /// Scan propagating a source-defined symbol in its output shape) would.
+    fn mints_runtime_symbols(&self) -> bool {
+        false
+    }
+
+    /// Symbols that must be bound before this op's evaluation can succeed,
+    /// beyond those visible in its output facts. The default collects the
+    /// symbols carried by symbolic tensor *values* on the input side (a TDim
+    /// konst or uniform, e.g. a folded Shape feeding a Cast): the plan's
+    /// static ordering uses these to place the node after whatever binds
+    /// them, so hidden mentions are not missed. Ops whose needs are fully
+    /// covered by their output facts need not override this.
+    fn required_bound_symbols(&self, inputs: &[&TypedFact]) -> TVec<Symbol> {
+        let mut syms: TVec<Symbol> = tvec![];
+        for fact in inputs {
+            for t in [fact.konst.as_deref(), fact.uniform.as_deref()].into_iter().flatten() {
+                if t.datum_type() == TDim::datum_type()
+                    && let Some(slice) =
+                        t.try_as_plain_ram().ok().and_then(|v| v.as_slice::<TDim>().ok())
+                {
+                    syms.extend(slice.iter().flat_map(|d| d.symbols()));
+                }
+            }
+        }
+        syms
+    }
+
     fn as_typed(&self) -> Option<&dyn TypedOp>;
 }
 

@@ -254,6 +254,13 @@ impl TypedOp for Delay {
     fn output_facts(&self, inputs: &[&TypedFact]) -> TractResult<TVec<TypedFact>> {
         let mut fact = inputs[0].clone();
         fact.shape.set(self.axis, fact.shape[self.axis].clone() + self.overlap.to_dim());
+        // A pulse of a constant is not that constant: it is the buffered context
+        // ahead of it, and it is one axis longer. Carrying the input's value over
+        // would both misreport the shape and offer the optimizer a fold. The
+        // buffer starts at zero, so a uniform input does not make a uniform pulse
+        // either.
+        fact.konst = None;
+        fact.uniform = None;
         Ok(tvec!(fact))
     }
 
@@ -278,10 +285,15 @@ impl TypedOp for Delay {
     ) -> TractResult<Option<AxisChangeConsequence>> {
         if let Some(axis) = change.transform_axis(self.axis) {
             if axis != self.axis {
+                // The buffer holds the delayed frames in the input's own layout,
+                // so it takes the change too -- and `wants_axis_first` reads its
+                // leading extent to tell a lane axis from a plain one.
+                let mut buffer_shape = self.buffer_shape.clone();
+                change.change_shape_array(&mut buffer_shape, false)?;
                 Ok(Some(AxisChangeConsequence::new(
                     model,
                     node,
-                    Some(Box::new(Self { axis, ..self.clone() }) as _),
+                    Some(Box::new(Self { axis, buffer_shape, ..self.clone() }) as _),
                     change,
                 )))
             } else {

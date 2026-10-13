@@ -1,6 +1,6 @@
 [package]
 name = "tract-cuda"
-version = "0.23.8-pre"
+version = "0.23.9-pre"
 license = "MIT OR Apache-2.0"
 authors = [
 	"Louis Chouraki <louis.chouraki@sonos.com>",
@@ -69,7 +69,4 @@ harness = false
 
 [[bench]]
 name = "rms_norm_fusion"
-
-[[bench]]
-name = "arena_bench"
 harness = false

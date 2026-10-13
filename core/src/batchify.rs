@@ -32,6 +32,7 @@
 use std::collections::HashSet;
 
 use crate::internal::*;
+use crate::ops::array::{MultiBroadcastTo, TypedConcat};
 use crate::ops::change_axes::AxisOp;
 use crate::ops::einsum::EinSum;
 use crate::ops::source::TypedSource;
@@ -69,6 +70,10 @@ impl ModelTransform for Batchify {
 struct Hosted {
     op: Option<Box<dyn TypedOp>>,
     pad: TVec<usize>,
+    /// Whether a padded slot must also be broadcast to the batch: an op whose
+    /// operands have to agree axis by axis, rather than broadcast against each
+    /// other, reads an axis of extent one as an axis of extent one.
+    broadcast: bool,
 }
 
 /// Batch axis on axis 0 of every input but the `shared` ones, sized by `batch`.
@@ -79,12 +84,24 @@ pub fn batchify(model: &TypedModel, batch: &Symbol, shared: &[String]) -> TractR
             "{name} is listed as a shared input but is not a model input"
         );
     }
+    // An export which kept the batch on one input and collapsed it to a leading
+    // one on another -- an RNNT joint, whose decoder side carries the beam it is
+    // batched over -- has the axis already, and the collapsed inputs join it
+    // rather than introduce a second batch of their own.
+    let mut join = false;
+    for outlet in model.input_outlets()? {
+        let name = &model.node(outlet.node).name;
+        join |= !shared.contains(name) && carrier(model.outlet_fact(*outlet)?, batch).is_some();
+    }
     let mut carried: HashSet<OutletId> = Default::default();
     let mut hosts: HashMap<usize, Hosted> = Default::default();
     for id in model.eval_order()? {
         let node = model.node(id);
         if let Some(source) = node.op_as::<TypedSource>() {
-            if !shared.contains(&node.name) && carrier(&source.fact, batch).is_none() {
+            if !shared.contains(&node.name)
+                && carrier(&source.fact, batch).is_none()
+                && !collapsed(&source.fact, batch, join)
+            {
                 carried.insert(id.into());
             }
             continue;
@@ -99,12 +116,13 @@ pub fn batchify(model: &TypedModel, batch: &Symbol, shared: &[String]) -> TractR
         if batched.is_empty() {
             continue;
         }
-        let hosted = host(model, node, &batched, &carried)
+        let mut hosted = host(model, node, &batched, &carried)
             .with_context(|| format!("Giving {node} a batch axis"))?;
+        hosted.broadcast = node.op_is::<TypedConcat>();
         hosts.insert(id, hosted);
         carried.extend((0..node.outputs.len()).map(|slot| OutletId::new(id, slot)));
     }
-    let wired = wire(model, batch, shared, &hosts)?;
+    let wired = wire(model, batch, shared, join, &hosts)?;
     check(wired, batch)
 }
 
@@ -112,6 +130,14 @@ pub fn batchify(model: &TypedModel, batch: &Symbol, shared: &[String]) -> TractR
 /// expression the batch symbol is in.
 fn carrier(fact: &TypedFact, batch: &Symbol) -> Option<usize> {
     fact.shape.iter().position(|dim| dim.symbols().contains(batch))
+}
+
+/// Whether an input's batch is the leading one an export collapsed it to: the
+/// model carries the axis elsewhere, this input has no dim sized by it, and its
+/// first axis is one. Such an input is resized rather than reshaped, so the
+/// graph behind it hosts nothing.
+fn collapsed(fact: &TypedFact, batch: &Symbol, join: bool) -> bool {
+    join && carrier(fact, batch).is_none() && fact.shape.first() == Some(&1.to_dim())
 }
 
 /// Asks an op to host the batch axis on the inputs that carry it, and refuses an
@@ -124,6 +150,13 @@ fn host(
 ) -> TractResult<Hosted> {
     if let Some(einsum) = node.op_as::<EinSum>() {
         return batched_einsum(einsum, batched);
+    }
+    if let Some(axis_op) = node.op_as::<AxisOp>() {
+        return Ok(Hosted {
+            op: Some(Box::new(shifted_axis_op(axis_op))),
+            pad: tvec!(),
+            broadcast: false,
+        });
     }
     let change = AxisOp::Add(0);
     let consequence = node
@@ -145,7 +178,7 @@ fn host(
             _ => None,
         })
         .collect();
-    Ok(Hosted { op: consequence.substitute_op, pad })
+    Ok(Hosted { op: consequence.substitute_op, pad, broadcast: false })
 }
 
 /// An `EinSum` batched by one label of its own, on axis 0 of the batched inputs
@@ -161,16 +194,52 @@ fn batched_einsum(einsum: &EinSum, batched: &[usize]) -> TractResult<Hosted> {
         axes = axes.with_extra_axis_occurency(label, InOut::Out(slot), 0)?;
     }
     let op = EinSum { axes, ..einsum.clone() };
-    Ok(Hosted { op: Some(Box::new(op)), pad: tvec!() })
+    Ok(Hosted { op: Some(Box::new(op)), pad: tvec!(), broadcast: false })
+}
+
+/// An `AxisOp` one axis further up, which is what hosting the batch on axis 0
+/// asks of it: an export collapsed to one stream reaches the graph through an
+/// `Add(0)` putting the batch back, and the ops the change_axes protocol
+/// answers for would carry the seats to axis 1 instead, folding them into the
+/// axis the collapse left behind.
+fn shifted_axis_op(op: &AxisOp) -> AxisOp {
+    match op {
+        AxisOp::Add(a) => AxisOp::Add(a + 1),
+        AxisOp::Rm(a) => AxisOp::Rm(a + 1),
+        AxisOp::Move(from, to) => AxisOp::Move(from + 1, to + 1),
+        AxisOp::Reshape(at, from, to) => AxisOp::Reshape(at + 1, from.clone(), to.clone()),
+    }
 }
 
 /// The batchified model, rebuilt through its ops so that every fact comes from
+/// Moves a `pulse.*_axes` property right by one wherever the interface it
+/// indexes gained the batch axis. A negative entry marks an interface with no
+/// streaming axis and stays as it is.
+fn shift_pulse_axes(model: &mut TypedModel, key: &str, widened: &[bool]) -> TractResult<()> {
+    let Some(axes) = model.properties.get(key) else { return Ok(()) };
+    let mut axes: Vec<i64> = axes.cast_to::<i64>()?.try_as_plain_ram()?.as_slice::<i64>()?.to_vec();
+    ensure!(
+        axes.len() == widened.len(),
+        "{key} holds {} axes for {} interfaces",
+        axes.len(),
+        widened.len()
+    );
+    for (axis, widened) in axes.iter_mut().zip(widened) {
+        if *widened && *axis >= 0 {
+            *axis += 1;
+        }
+    }
+    model.properties.insert(key.to_string(), tensor1(&axes).into_arc_tensor());
+    Ok(())
+}
+
 /// `output_facts` with the batch extent in place rather than from the facts the
 /// unbatched model stored.
 fn wire(
     model: &TypedModel,
     batch: &Symbol,
     shared: &[String],
+    join: bool,
     hosts: &HashMap<usize, Hosted>,
 ) -> TractResult<TypedModel> {
     let mut target = TypedModel { symbols: model.symbols.clone(), ..TypedModel::default() };
@@ -179,8 +248,14 @@ fn wire(
     for id in model.eval_order()? {
         let node = model.node(id);
         let wires = if let Some(source) = node.op_as::<TypedSource>() {
-            let (source, interior) =
-                batched_source(&mut target, node, source, batch, !shared.contains(&node.name))?;
+            let (source, interior) = batched_source(
+                &mut target,
+                node,
+                source,
+                batch,
+                !shared.contains(&node.name),
+                join,
+            )?;
             interface.insert(id.into(), source);
             tvec!(interior)
         } else {
@@ -188,11 +263,21 @@ fn wire(
             let mut inputs: TVec<OutletId> =
                 node.inputs.iter().map(|input| mapping[input]).collect();
             for slot in hosted.map(|h| &*h.pad).unwrap_or(&[]) {
-                inputs[*slot] = target.wire_node(
+                let mut wire = target.wire_node(
                     format!("{}.batchify.rank.{slot}", node.name),
                     AxisOp::Add(0),
                     &[inputs[*slot]],
                 )?[0];
+                if hosted.is_some_and(|h| h.broadcast) {
+                    let mut shape: TVec<TDim> = target.outlet_fact(wire)?.shape.to_tvec();
+                    shape[0] = batch.to_dim();
+                    wire = target.wire_node(
+                        format!("{}.batchify.broadcast.{slot}", node.name),
+                        MultiBroadcastTo { shape: shape.into() },
+                        &[wire],
+                    )?[0];
+                }
+                inputs[*slot] = wire;
             }
             let op = hosted.and_then(|h| h.op.clone()).unwrap_or_else(|| node.op.clone());
             target
@@ -225,6 +310,21 @@ fn wire(
     }
     target.set_input_outlets(&inputs)?;
     target.select_output_outlets(&outputs)?;
+    // A batched model is the same model, so it keeps what the graph says about
+    // itself -- its name, and the pulse properties a streaming caller reads to
+    // find the delay and the streaming axes. The axes among them are indices
+    // into shapes this transform has just widened.
+    target.properties.clone_from(&model.properties);
+    if !join {
+        let batched_inputs: Vec<bool> = model
+            .input_outlets()?
+            .iter()
+            .map(|o| !shared.contains(&model.node(o.node).name))
+            .collect();
+        shift_pulse_axes(&mut target, "pulse.input_axes", &batched_inputs)?;
+        let batched_outputs = vec![true; model.output_outlets()?.len()];
+        shift_pulse_axes(&mut target, "pulse.output_axes", &batched_outputs)?;
+    }
     Ok(target)
 }
 
@@ -238,10 +338,21 @@ fn batched_source(
     source: &TypedSource,
     batch: &Symbol,
     batched: bool,
+    join: bool,
 ) -> TractResult<(OutletId, OutletId)> {
     let carrier = carrier(&source.fact, batch);
     if !batched || carrier == Some(0) {
         let wire = target.wire_node(&node.name, source.clone(), &[])?[0];
+        return Ok((wire, wire));
+    }
+    if collapsed(&source.fact, batch, join) {
+        // The seats go where the collapse left its one, so the interface and the
+        // interior are the same wire, one axis wider.
+        let mut fact = source.fact.clone();
+        let mut shape = fact.shape.to_tvec();
+        shape[0] = batch.to_dim();
+        fact.shape = shape.into();
+        let wire = target.wire_node(&node.name, TypedSource::new(fact), &[])?[0];
         return Ok((wire, wire));
     }
     let mut shape = source.fact.shape.to_tvec();

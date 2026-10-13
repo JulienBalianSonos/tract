@@ -2,7 +2,7 @@
 //!
 //! Flattened 1-D indexing: `dispatch_workgroups` is 3-D, tract tensors are
 //! routinely 4-D+, so shaders take a linear id and apply strides from uniforms.
-//! Byte offsets live in uniforms so arena views work without 256-byte-aligned
+//! Byte offsets live in uniforms so device views work without 256-byte-aligned
 //! `GPUBufferBinding.offset` (the whole storage buffer is bound at 0).
 //!
 //! Structure follows tfjs-backend-webgpu unary/binary (Apache-2.0): one entry
@@ -12,6 +12,9 @@
 use tract_core::internal::*;
 
 pub const WORKGROUP: u32 = 64;
+/// Threads per workgroup of the blocked matmul.
+pub const MATMUL_BLOCKED_WG: u32 = 192;
+
 /// Threads in a cooperative sum: each output gets one workgroup this wide.
 pub const SUM_RUN_WG: u32 = 256;
 /// Steps of each of the gemv pair's reductions taken per iteration.
@@ -19,6 +22,10 @@ pub const GEMV_PAIR_UNROLL: usize = 10;
 
 /// The fused squeeze-excitation gate runs as one workgroup of this width.
 pub const GEMV_PAIR_WG: u32 = 256;
+
+/// WebGPU's cap on workgroups per dispatch dimension. A kernel that walks a
+/// tensor linearly takes the overflow on y and folds it back into its index.
+pub const GRID_LIMIT: u32 = 65535;
 
 /// Reads one of the eight values a uniform packs as two `vec4<u32>`.
 const AT8: &str = "fn at8(a: vec4<u32>, b: vec4<u32>, i: u32) -> u32 {
@@ -355,46 +362,11 @@ pub enum ChainStep {
 /// which inputs share the output's layout and can skip index arithmetic.
 /// How a chain operand is read: element for element with the output, one value
 /// splatted across the four a thread handles, or gathered through its strides.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChainOperand {
     Contiguous,
     Splat,
     Gather,
-}
-
-pub fn chain_key(
-    dt: ShaderDtype,
-    steps: &[ChainStep],
-    contiguous: &[bool],
-    kinds: Option<&[ChainOperand]>,
-) -> String {
-    let mut key = format!("chain_{}", dt.suffix());
-    match kinds {
-        Some(kinds) => {
-            key.push_str("_v4");
-            for k in kinds {
-                key.push(match k {
-                    ChainOperand::Contiguous => 'c',
-                    ChainOperand::Splat => 's',
-                    ChainOperand::Gather => 'g',
-                });
-            }
-        }
-        None => {
-            for c in contiguous {
-                key.push(if *c { 'c' } else { 'b' });
-            }
-        }
-    }
-    for step in steps {
-        match step {
-            ChainStep::Unary(op) => key.push_str(&format!("_{op}")),
-            ChainStep::Binary { op, rhs, swapped } => {
-                key.push_str(&format!("_{op}{rhs}{}", if *swapped { "r" } else { "" }))
-            }
-        }
-    }
-    key
 }
 
 /// The chain over `vec4`s: a thread takes four values at a time, which is
@@ -688,7 +660,7 @@ struct Params {{
             r#"
 @compute @workgroup_size({WORKGROUP})
 fn {name}_{suf}(@builtin(global_invocation_id) gid: vec3<u32>) {{
-    let i = gid.x;
+    let i = gid.y * {GRID_LIMIT}u * {WORKGROUP}u + gid.x;
     if (i >= params.len) {{ return; }}
     outp[params.off_out + i] = op_{name}(inp[params.off_in + i]);
 }}
@@ -787,7 +759,7 @@ fn gather_idx(linear: u32, is_lhs: bool) -> u32 {{
             r#"
 @compute @workgroup_size({WORKGROUP})
 fn {name}_{suf}(@builtin(global_invocation_id) gid: vec3<u32>) {{
-    let i = gid.x;
+    let i = gid.y * {GRID_LIMIT}u * {WORKGROUP}u + gid.x;
     if (i >= params.len) {{ return; }}
     let li = params.off_lhs + gather_idx(i, true);
     let ri = params.off_rhs + gather_idx(i, false);
@@ -833,14 +805,14 @@ fn store4(i: u32, v: vec4<{t}>) {{
             r#"
 @compute @workgroup_size({WORKGROUP})
 fn {name}_v4_{suf}(@builtin(global_invocation_id) gid: vec3<u32>) {{
-    let i = gid.x;
+    let i = gid.y * {GRID_LIMIT}u * {WORKGROUP}u + gid.x;
     if (i * 4u >= params.len) {{ return; }}
     store4(i, op_{name}_v(lhs4(i), rhs4(i)));
 }}
 
 @compute @workgroup_size({WORKGROUP})
 fn {name}_v4s_{suf}(@builtin(global_invocation_id) gid: vec3<u32>) {{
-    let i = gid.x;
+    let i = gid.y * {GRID_LIMIT}u * {WORKGROUP}u + gid.x;
     if (i * 4u >= params.len) {{ return; }}
     let r = vec4<{t}>(rhs[params.off_rhs + gather_idx(i * 4u, false)]);
     store4(i, op_{name}_v(lhs4(i), r));
@@ -880,7 +852,7 @@ struct Params {{
 
 @compute @workgroup_size({WORKGROUP})
 fn copy_{suf}(@builtin(global_invocation_id) gid: vec3<u32>) {{
-    let i = gid.x;
+    let i = gid.y * {GRID_LIMIT}u * {WORKGROUP}u + gid.x;
     if (i >= params.len) {{ return; }}
     var rest = i;
     var in_i = params.off_in;
@@ -1193,7 +1165,7 @@ struct Params {{ off_in: u32, off_out: u32, len: u32, _p: u32 }}
 @group(0) @binding(2) var<uniform> params: Params;
 @compute @workgroup_size({WORKGROUP})
 fn cast_f32_f16(@builtin(global_invocation_id) gid: vec3<u32>) {{
-    let i = gid.x;
+    let i = gid.y * {GRID_LIMIT}u * {WORKGROUP}u + gid.x;
     if (i >= params.len) {{ return; }}
     outp[params.off_out + i] = f16(inp[params.off_in + i]);
 }}
@@ -1210,7 +1182,7 @@ struct Params {{ off_in: u32, off_out: u32, len: u32, _p: u32 }}
 @group(0) @binding(2) var<uniform> params: Params;
 @compute @workgroup_size({WORKGROUP})
 fn cast_f16_f32(@builtin(global_invocation_id) gid: vec3<u32>) {{
-    let i = gid.x;
+    let i = gid.y * {GRID_LIMIT}u * {WORKGROUP}u + gid.x;
     if (i >= params.len) {{ return; }}
     outp[params.off_out + i] = f32(inp[params.off_in + i]);
 }}
@@ -1258,13 +1230,6 @@ impl DepthwiseShape {
 
     fn tile_w(&self) -> u32 {
         (DW_WG - 1) * self.stride_w + (self.kw - 1) * self.dil_w + 1
-    }
-
-    pub fn key(&self) -> String {
-        format!(
-            "{}x{}s{}x{}d{}x{}",
-            self.kh, self.kw, self.stride_h, self.stride_w, self.dil_h, self.dil_w
-        )
     }
 }
 
@@ -1588,9 +1553,208 @@ fn conv2d_{suf}(@builtin(global_invocation_id) gid: vec3<u32>) {{
     s
 }
 
-fn deconv_wgsl(dt: ShaderDtype) -> String {
+/// Threads per workgroup of the per-pixel convolution.
+pub const CONV_PIXEL_WG: u32 = 256;
+
+/// One thread per output pixel computing every output channel, for a dense 3x3
+/// convolution over few input channels — the MobileNet stem: the 27 inputs a
+/// pixel reads are shared by all its channels, so they are read once per group
+/// of four rather than once per output element. The kernel came out of an
+/// OpenEvolve search over tract's own conv contract (3.0x on the stem, seed
+/// 115us); the taps are unrolled for kh = kw = 3 at dilation 1.
+pub fn conv_pixel_module(dt: ShaderDtype, epilogue: &[ChainStep], extras: usize) -> String {
     let t = dt.wgsl();
     let suf = dt.suffix();
+    let out_binding = 2 + extras;
+    let uniform_binding = 3 + extras;
+    let extra_bindings = (0..extras)
+        .map(|i| {
+            format!("@group(0) @binding({}) var<storage, read> extra{i}: array<{t}>;\n", 2 + i)
+        })
+        .collect::<String>();
+    let lib = if epilogue.is_empty() {
+        String::new()
+    } else {
+        format!("{}{}", unary_ops_wgsl(t), binary_ops_wgsl(t))
+    };
+    let epilogue = epilogue_body(epilogue, "co");
+    let mut s = preamble(dt);
+    // Same packed params as `conv_module`, see kernels/conv.rs.
+    s.push_str(&format!(
+        r#"
+struct Params {{
+    off_in: u32,
+    off_w: u32,
+    off_out: u32,
+    n: u32,
+    ci: u32,
+    co: u32,
+    ih: u32,
+    iw: u32,
+    oh: u32,
+    ow: u32,
+    kh: u32,
+    kw: u32,
+    groups: u32,
+    ci_pg: u32,
+    co_pg: u32,
+    channels_last: u32,
+    pad_h: i32,
+    pad_w: i32,
+    stride_h: i32,
+    stride_w: i32,
+    dil_h: i32,
+    dil_w: i32,
+    in_sn: i32,
+    in_sc: i32,
+    in_sh: i32,
+    in_sw: i32,
+    w_so: i32,
+    w_si: i32,
+    w_sh: i32,
+    w_sw: i32,
+    out_sn: i32,
+    out_sc: i32,
+    out_sh: i32,
+    out_sw: i32,
+    _pad: vec2<u32>,
+    off_extra: vec4<u32>,
+    mode_extra: vec4<u32>,
+}}
+
+@group(0) @binding(0) var<storage, read> inp: array<{t}>;
+@group(0) @binding(1) var<storage, read> wgt: array<{t}>;
+{extra_bindings}@group(0) @binding({out_binding}) var<storage, read_write> outp: array<{t}>;
+@group(0) @binding({uniform_binding}) var<uniform> params: Params;
+{lib}
+fn read_inp(ih: i32, iw: i32, ic: u32, n: u32) -> f32 {{
+    if (ih < 0 || ih >= i32(params.ih) || iw < 0 || iw >= i32(params.iw)) {{ return 0.0; }}
+    return f32(inp[params.off_in + u32(i32(n) * params.in_sn + ih * params.in_sh + iw * params.in_sw + i32(ic) * params.in_sc)]);
+}}
+
+@compute @workgroup_size({CONV_PIXEL_WG})
+fn conv2d_pixel_{suf}(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let idx = gid.x;
+    let npix = params.n * params.oh * params.ow;
+    if (idx >= npix) {{ return; }}
+    var rest = idx;
+    let ow = rest % params.ow; rest /= params.ow;
+    let oh = rest % params.oh; rest /= params.oh;
+    let n = rest;
+    let ih0 = i32(oh) * params.stride_h - params.pad_h;
+    let iw0 = i32(ow) * params.stride_w - params.pad_w;
+    // Four channels at a time, in four named accumulators: an indexed private
+    // array here lands in memory under Tint, which costs ~20% in Chrome.
+    for (var co_grp = 0u; co_grp < params.co; co_grp += 4u) {{
+        var acc0 = 0.0;
+        var acc1 = 0.0;
+        var acc2 = 0.0;
+        var acc3 = 0.0;
+        for (var ci = 0u; ci < params.ci; ci++) {{
+            let i00 = read_inp(ih0, iw0, ci, n);
+            let i01 = read_inp(ih0, iw0 + 1, ci, n);
+            let i02 = read_inp(ih0, iw0 + 2, ci, n);
+            let i10 = read_inp(ih0 + 1, iw0, ci, n);
+            let i11 = read_inp(ih0 + 1, iw0 + 1, ci, n);
+            let i12 = read_inp(ih0 + 1, iw0 + 2, ci, n);
+            let i20 = read_inp(ih0 + 2, iw0, ci, n);
+            let i21 = read_inp(ih0 + 2, iw0 + 1, ci, n);
+            let i22 = read_inp(ih0 + 2, iw0 + 2, ci, n);
+            if (co_grp + 0u < params.co) {{
+                let co = co_grp + 0u;
+                let wc0 = params.off_w + co * u32(params.w_so) + ci * u32(params.w_si);
+                let w00 = f32(wgt[wc0]);
+                let w01 = f32(wgt[wc0 + u32(params.w_sw)]);
+                let w02 = f32(wgt[wc0 + 2u * u32(params.w_sw)]);
+                let w10 = f32(wgt[wc0 + u32(params.w_sh)]);
+                let w11 = f32(wgt[wc0 + u32(params.w_sh) + u32(params.w_sw)]);
+                let w12 = f32(wgt[wc0 + u32(params.w_sh) + 2u * u32(params.w_sw)]);
+                let w20 = f32(wgt[wc0 + 2u * u32(params.w_sh)]);
+                let w21 = f32(wgt[wc0 + 2u * u32(params.w_sh) + u32(params.w_sw)]);
+                let w22 = f32(wgt[wc0 + 2u * u32(params.w_sh) + 2u * u32(params.w_sw)]);
+                acc0 += i00 * w00 + i01 * w01 + i02 * w02 + i10 * w10 + i11 * w11 + i12 * w12 + i20 * w20 + i21 * w21 + i22 * w22;
+            }}
+            if (co_grp + 1u < params.co) {{
+                let co = co_grp + 1u;
+                let wc0 = params.off_w + co * u32(params.w_so) + ci * u32(params.w_si);
+                let w00 = f32(wgt[wc0]);
+                let w01 = f32(wgt[wc0 + u32(params.w_sw)]);
+                let w02 = f32(wgt[wc0 + 2u * u32(params.w_sw)]);
+                let w10 = f32(wgt[wc0 + u32(params.w_sh)]);
+                let w11 = f32(wgt[wc0 + u32(params.w_sh) + u32(params.w_sw)]);
+                let w12 = f32(wgt[wc0 + u32(params.w_sh) + 2u * u32(params.w_sw)]);
+                let w20 = f32(wgt[wc0 + 2u * u32(params.w_sh)]);
+                let w21 = f32(wgt[wc0 + 2u * u32(params.w_sh) + u32(params.w_sw)]);
+                let w22 = f32(wgt[wc0 + 2u * u32(params.w_sh) + 2u * u32(params.w_sw)]);
+                acc1 += i00 * w00 + i01 * w01 + i02 * w02 + i10 * w10 + i11 * w11 + i12 * w12 + i20 * w20 + i21 * w21 + i22 * w22;
+            }}
+            if (co_grp + 2u < params.co) {{
+                let co = co_grp + 2u;
+                let wc0 = params.off_w + co * u32(params.w_so) + ci * u32(params.w_si);
+                let w00 = f32(wgt[wc0]);
+                let w01 = f32(wgt[wc0 + u32(params.w_sw)]);
+                let w02 = f32(wgt[wc0 + 2u * u32(params.w_sw)]);
+                let w10 = f32(wgt[wc0 + u32(params.w_sh)]);
+                let w11 = f32(wgt[wc0 + u32(params.w_sh) + u32(params.w_sw)]);
+                let w12 = f32(wgt[wc0 + u32(params.w_sh) + 2u * u32(params.w_sw)]);
+                let w20 = f32(wgt[wc0 + 2u * u32(params.w_sh)]);
+                let w21 = f32(wgt[wc0 + 2u * u32(params.w_sh) + u32(params.w_sw)]);
+                let w22 = f32(wgt[wc0 + 2u * u32(params.w_sh) + 2u * u32(params.w_sw)]);
+                acc2 += i00 * w00 + i01 * w01 + i02 * w02 + i10 * w10 + i11 * w11 + i12 * w12 + i20 * w20 + i21 * w21 + i22 * w22;
+            }}
+            if (co_grp + 3u < params.co) {{
+                let co = co_grp + 3u;
+                let wc0 = params.off_w + co * u32(params.w_so) + ci * u32(params.w_si);
+                let w00 = f32(wgt[wc0]);
+                let w01 = f32(wgt[wc0 + u32(params.w_sw)]);
+                let w02 = f32(wgt[wc0 + 2u * u32(params.w_sw)]);
+                let w10 = f32(wgt[wc0 + u32(params.w_sh)]);
+                let w11 = f32(wgt[wc0 + u32(params.w_sh) + u32(params.w_sw)]);
+                let w12 = f32(wgt[wc0 + u32(params.w_sh) + 2u * u32(params.w_sw)]);
+                let w20 = f32(wgt[wc0 + 2u * u32(params.w_sh)]);
+                let w21 = f32(wgt[wc0 + 2u * u32(params.w_sh) + u32(params.w_sw)]);
+                let w22 = f32(wgt[wc0 + 2u * u32(params.w_sh) + 2u * u32(params.w_sw)]);
+                acc3 += i00 * w00 + i01 * w01 + i02 * w02 + i10 * w10 + i11 * w11 + i12 * w12 + i20 * w20 + i21 * w21 + i22 * w22;
+            }}
+        }}
+        for (var j = 0u; j < 4u; j++) {{
+            let co = co_grp + j;
+            if (co >= params.co) {{ break; }}
+            let acc = select(select(select(acc0, acc1, j == 1u), acc2, j == 2u), acc3, j == 3u);
+            let out_i = params.off_out + u32(i32(n) * params.out_sn + i32(co) * params.out_sc + i32(oh) * params.out_sh + i32(ow) * params.out_sw);
+            var v = {t}(acc);
+{epilogue}
+            outp[out_i] = v;
+        }}
+    }}
+}}
+"#
+    ));
+    s
+}
+
+fn deconv_wgsl(dt: ShaderDtype) -> String {
+    deconv_module(dt, &[], 0)
+}
+
+/// The gather-based transposed convolution, with an epilogue as
+/// [`conv_module`] takes one.
+pub fn deconv_module(dt: ShaderDtype, epilogue: &[ChainStep], extras: usize) -> String {
+    let t = dt.wgsl();
+    let suf = dt.suffix();
+    let out_binding = 2 + extras;
+    let uniform_binding = 3 + extras;
+    let extra_bindings = (0..extras)
+        .map(|i| {
+            format!("@group(0) @binding({}) var<storage, read> extra{i}: array<{t}>;\n", 2 + i)
+        })
+        .collect::<String>();
+    let lib = if epilogue.is_empty() {
+        String::new()
+    } else {
+        format!("{}{}", unary_ops_wgsl(t), binary_ops_wgsl(t))
+    };
+    let epilogue = epilogue_body(epilogue, "co");
     let mut s = preamble(dt);
     // Gather-based conv_transpose (ORT style). WGSL has no float atomics.
     s.push_str(&format!(
@@ -1630,13 +1794,16 @@ struct Params {{
     out_sc: i32,
     out_sh: i32,
     out_sw: i32,
+    _pad: vec2<u32>,
+    off_extra: vec4<u32>,
+    mode_extra: vec4<u32>,
 }}
 
 @group(0) @binding(0) var<storage, read> inp: array<{t}>;
 @group(0) @binding(1) var<storage, read> wgt: array<{t}>;
-@group(0) @binding(2) var<storage, read_write> outp: array<{t}>;
-@group(0) @binding(3) var<uniform> params: Params;
-
+{extra_bindings}@group(0) @binding({out_binding}) var<storage, read_write> outp: array<{t}>;
+@group(0) @binding({uniform_binding}) var<uniform> params: Params;
+{lib}
 @compute @workgroup_size({WORKGROUP})
 fn conv_transpose2d_{suf}(@builtin(global_invocation_id) gid: vec3<u32>) {{
     let i = gid.x;
@@ -1682,7 +1849,9 @@ fn conv_transpose2d_{suf}(@builtin(global_invocation_id) gid: vec3<u32>) {{
         + i32(oh) * params.out_sh
         + i32(ow) * params.out_sw
     );
-    outp[out_i] = {t}(acc);
+    var v = {t}(acc);
+{epilogue}
+    outp[out_i] = v;
 }}
 "#
     ));
@@ -1733,6 +1902,143 @@ fn resize_axis_{suf}(@builtin(global_invocation_id) gid: vec3<u32>) {{
         acc += f32(inp[in_i]) * wt;
     }}
     outp[params.off_out + (outer_i * params.len_out) * params.inner + xo * params.inner + inner_i] = {t}(acc);
+}}
+"#
+    ));
+    s
+}
+
+/// Resize over the two trailing axes in one launch: each output sums its
+/// `win_h x win_w` taps, weights being the product of the two axes' plans.
+pub fn resize_2d_module(dt: ShaderDtype) -> String {
+    let t = dt.wgsl();
+    let suf = dt.suffix();
+    let mut s = preamble(dt);
+    s.push_str(&format!(
+        r#"
+struct Params {{
+    off_in: u32,
+    off_ih: u32,
+    off_wh: u32,
+    off_iw: u32,
+    off_ww: u32,
+    off_out: u32,
+    outer: u32,
+    h_in: u32,
+    w_in: u32,
+    h_out: u32,
+    w_out: u32,
+    win_h: u32,
+    win_w: u32,
+    _p0: u32,
+    _p1: u32,
+    _p2: u32,
+}}
+
+@group(0) @binding(0) var<storage, read> inp: array<{t}>;
+@group(0) @binding(1) var<storage, read> idx_h: array<i32>;
+@group(0) @binding(2) var<storage, read> wt_h: array<f32>;
+@group(0) @binding(3) var<storage, read> idx_w: array<i32>;
+@group(0) @binding(4) var<storage, read> wt_w: array<f32>;
+@group(0) @binding(5) var<storage, read_write> outp: array<{t}>;
+@group(0) @binding(6) var<uniform> params: Params;
+
+@compute @workgroup_size({WORKGROUP})
+fn resize_2d_{suf}(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let i = gid.x;
+    let n = params.outer * params.h_out * params.w_out;
+    if (i >= n) {{ return; }}
+    let xo = i % params.w_out;
+    let t = i / params.w_out;
+    let yo = t % params.h_out;
+    let outer_i = t / params.h_out;
+    let in_base = params.off_in + outer_i * params.h_in * params.w_in;
+    var acc = 0.0;
+    for (var a = 0u; a < params.win_h; a++) {{
+        let iy = u32(idx_h[params.off_ih + yo * params.win_h + a]);
+        let wy = wt_h[params.off_wh + yo * params.win_h + a];
+        let row = in_base + iy * params.w_in;
+        for (var b = 0u; b < params.win_w; b++) {{
+            let ix = u32(idx_w[params.off_iw + xo * params.win_w + b]);
+            let wx = wt_w[params.off_ww + xo * params.win_w + b];
+            acc += f32(inp[row + ix]) * wy * wx;
+        }}
+    }}
+    outp[params.off_out + i] = {t}(acc);
+}}
+"#
+    ));
+    s
+}
+
+/// Workgroup of the two-tap resize: 8 columns x 8 rows x 2 outer slices.
+pub const RESIZE_2D_WG: [u32; 3] = [8, 8, 2];
+
+/// [`resize_2d_module`] for two taps per axis — bilinear — with the taps
+/// unrolled and a 3-D grid over (columns, rows, outer slices), so a workgroup
+/// writes contiguous rows. Found by an OpenEvolve search scored in Chrome
+/// (6.8x over the generic kernel there, 144 -> 21 us per frame of the
+/// segmenter's three upsamples).
+pub fn resize_2d_bilinear_module(dt: ShaderDtype) -> String {
+    let t = dt.wgsl();
+    let suf = dt.suffix();
+    let [wx, wy, wz] = RESIZE_2D_WG;
+    let mut s = preamble(dt);
+    s.push_str(&format!(
+        r#"
+struct Params {{
+    off_in: u32,
+    off_ih: u32,
+    off_wh: u32,
+    off_iw: u32,
+    off_ww: u32,
+    off_out: u32,
+    outer: u32,
+    h_in: u32,
+    w_in: u32,
+    h_out: u32,
+    w_out: u32,
+    win_h: u32,
+    win_w: u32,
+    _p0: u32,
+    _p1: u32,
+    _p2: u32,
+}}
+
+@group(0) @binding(0) var<storage, read> inp: array<{t}>;
+@group(0) @binding(1) var<storage, read> idx_h: array<i32>;
+@group(0) @binding(2) var<storage, read> wt_h: array<f32>;
+@group(0) @binding(3) var<storage, read> idx_w: array<i32>;
+@group(0) @binding(4) var<storage, read> wt_w: array<f32>;
+@group(0) @binding(5) var<storage, read_write> outp: array<{t}>;
+@group(0) @binding(6) var<uniform> params: Params;
+
+@compute @workgroup_size({wx}, {wy}, {wz})
+fn resize_2d_bilinear_{suf}(@builtin(workgroup_id) wgid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let yo = wgid.y * {wy}u + lid.y;
+    let xo = wgid.x * {wx}u + lid.x;
+    if (yo >= params.h_out || xo >= params.w_out) {{ return; }}
+    let ih0 = u32(idx_h[params.off_ih + yo * 2u]);
+    let ih1 = u32(idx_h[params.off_ih + yo * 2u + 1u]);
+    let wh0 = wt_h[params.off_wh + yo * 2u];
+    let wh1 = wt_h[params.off_wh + yo * 2u + 1u];
+    let iw0 = u32(idx_w[params.off_iw + xo * 2u]);
+    let iw1 = u32(idx_w[params.off_iw + xo * 2u + 1u]);
+    let ww0 = wt_w[params.off_ww + xo * 2u];
+    let ww1 = wt_w[params.off_ww + xo * 2u + 1u];
+    let row0 = ih0 * params.w_in;
+    let row1 = ih1 * params.w_in;
+    let out_pos = yo * params.w_out + xo;
+    let c = wgid.z * {wz}u + lid.z;
+    if (c < params.outer) {{
+        let in_base = params.off_in + c * params.h_in * params.w_in;
+        let out_base = params.off_out + c * params.h_out * params.w_out;
+        let acc = f32(inp[in_base + row0 + iw0]) * wh0 * ww0
+            + f32(inp[in_base + row0 + iw1]) * wh0 * ww1
+            + f32(inp[in_base + row1 + iw0]) * wh1 * ww0
+            + f32(inp[in_base + row1 + iw1]) * wh1 * ww1;
+        outp[out_base + out_pos] = {t}(acc);
+    }}
 }}
 "#
     ));
@@ -1790,6 +2096,12 @@ fn softmax_{suf}(@builtin(global_invocation_id) gid: vec3<u32>) {{
 
 /// Applies the fused steps to `v`, reading each extra operand at `index`.
 fn epilogue_body(steps: &[ChainStep], index: &str) -> String {
+    epilogue_body_at(steps, index, "0u")
+}
+
+/// As [`epilogue_body`], where a mode-2 operand is read at `element`, the
+/// output element's own offset.
+fn epilogue_body_at(steps: &[ChainStep], index: &str, element: &str) -> String {
     let mut s = String::new();
     for step in steps {
         match step {
@@ -1797,7 +2109,7 @@ fn epilogue_body(steps: &[ChainStep], index: &str) -> String {
             ChainStep::Binary { op, rhs, swapped } => {
                 let i = rhs - 1;
                 s.push_str(&format!(
-                    "    let e{i} = extra{i}[params.off_extra[{i}u] + select(0u, {index}, params.mode_extra[{i}u] != 0u)];\n"
+                    "    let e{i} = extra{i}[params.off_extra[{i}u] + select(select(0u, {index}, params.mode_extra[{i}u] == 1u), {element}, params.mode_extra[{i}u] == 2u)];\n"
                 ));
                 if *swapped {
                     s.push_str(&format!("    v = op_{op}(e{i}, v);\n"));
@@ -1808,20 +2120,6 @@ fn epilogue_body(steps: &[ChainStep], index: &str) -> String {
         }
     }
     s
-}
-
-/// Names a generated program by its kernel and fused epilogue.
-pub fn program_key(kind: &str, dt: ShaderDtype, steps: &[ChainStep], extras: usize) -> String {
-    let mut key = format!("{kind}_{}_{extras}", dt.suffix());
-    for step in steps {
-        match step {
-            ChainStep::Unary(op) => key.push_str(&format!("_{op}")),
-            ChainStep::Binary { op, rhs, swapped } => {
-                key.push_str(&format!("_{op}{rhs}{}", if *swapped { "r" } else { "" }))
-            }
-        }
-    }
-    key
 }
 
 fn matmul_wgsl(dt: ShaderDtype) -> String {
@@ -1844,7 +2142,7 @@ pub fn matmul_module(dt: ShaderDtype, epilogue: &[ChainStep], extras: usize) -> 
     } else {
         format!("{}{}", unary_ops_wgsl(t), binary_ops_wgsl(t))
     };
-    let epilogue = epilogue_body(epilogue, "col");
+    let epilogue = epilogue_body_at(epilogue, "col", "oe");
     let mut s = preamble(dt);
     s.push_str(&format!(
         r#"
@@ -1925,6 +2223,7 @@ fn matmul_{suf}(@builtin(global_invocation_id) gid: vec3<u32>) {{
     }}
     let o_row_s = select(at8(params.out_s0, params.out_s1, 6u), at8(params.out_s0, params.out_s1, 7u), params.tc != 0u);
     let o_col_s = select(at8(params.out_s0, params.out_s1, 7u), at8(params.out_s0, params.out_s1, 6u), params.tc != 0u);
+    let oe = o_i - params.off_out + row * o_row_s + col * o_col_s;
     var v = {t}(acc);
 {epilogue}
     outp[o_i + row * o_row_s + col * o_col_s] = v;
@@ -1936,6 +2235,16 @@ fn matmul_{suf}(@builtin(global_invocation_id) gid: vec3<u32>) {{
 
 /// A single-channel tensor into a texture the caller can sample: the mask
 /// leaves the graph as a GPU resource rather than as bytes on the host.
+/// A matmul whose thread computes a four-by-four tile of the output.
+///
+/// Both operands are read as `vec4`: four rows of `a` are contiguous because the
+/// activations are channels-first, and four columns of `b` are contiguous
+/// because the weights were transposed once at build time. Eight `k` per pass,
+/// with a four-step tail, keeps the loop overhead off what is otherwise a
+/// two-load, sixteen-multiply step and gives each accumulator eight
+/// independent products to overlap. Requires `m`, `n` and `k` all multiples
+/// of four, a unit prefix, and both matmul axes unit-strided on their fastest
+/// side.
 /// Two matrix-vector products with an activation between them, as one kernel.
 ///
 /// One workgroup: it computes the hidden vector cooperatively, holds it in
@@ -2189,4 +2498,269 @@ pub fn broadcast_strides(shape: &[usize], strides: &[isize], out_shape: &[usize]
         }
     }
     out
+}
+
+/// Threads per workgroup of the split-k matmul: 32 tiles, four lanes each.
+pub const MATMUL_SPLITK_WG: u32 = 128;
+/// Below this `m` the blocked matmul runs split over k.
+pub const MATMUL_SPLITK_MAX_M: usize = 2304;
+
+/// The blocked matmul for small `m`: four lanes share a four-by-four output
+/// tile, each summing a quarter of `k`, and reduce through workgroup memory.
+/// The squeeze-excitation projections (m = 144, k up to 128) put only a few
+/// hundred threads on the device with the plain kernel, so its time is one
+/// thread's k loop; four lanes cut that chain and came out of a search scored
+/// in Chrome at 2-2.5x on those shapes (m = 144: 56 -> 22 us, m = 576 with
+/// k >= 72: 47 -> 23 us). Same contract and epilogue as
+/// [`matmul_blocked_module`]; `k` a multiple of four.
+pub fn matmul_splitk_module(dt: ShaderDtype, epilogue: &[ChainStep], extras: usize) -> String {
+    let t = dt.wgsl();
+    let suf = dt.suffix();
+    let out_binding = 2 + extras;
+    let uniform_binding = 3 + extras;
+    let extra_bindings = (0..extras)
+        .map(|i| {
+            format!("@group(0) @binding({}) var<storage, read> extra{i}: array<{t}>;\n", 2 + i)
+        })
+        .collect::<String>();
+    let lib = format!("{}{}", unary_ops_wgsl("f32"), binary_ops_wgsl("f32"));
+    let epi = epilogue_body_at(epilogue, "col", "oe");
+    let mut s = preamble(dt);
+    s.push_str(&format!(
+        r#"
+struct Params {{
+    m: u32,
+    k: u32,
+    n: u32,
+    off_a: u32,
+    off_b: u32,
+    off_out: u32,
+    _p0: u32,
+    _p1: u32,
+    off_extra: vec4<u32>,
+    mode_extra: vec4<u32>,
+}}
+
+@group(0) @binding(0) var<storage, read> a4: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> b4: array<vec4<f32>>;
+{extra_bindings}@group(0) @binding({out_binding}) var<storage, read_write> c4: array<vec4<f32>>;
+@group(0) @binding({uniform_binding}) var<uniform> params: Params;
+{lib}
+var<workgroup> sh0: array<vec4<f32>, {MATMUL_SPLITK_WG}>;
+var<workgroup> sh1: array<vec4<f32>, {MATMUL_SPLITK_WG}>;
+var<workgroup> sh2: array<vec4<f32>, {MATMUL_SPLITK_WG}>;
+var<workgroup> sh3: array<vec4<f32>, {MATMUL_SPLITK_WG}>;
+
+fn epi(v_in: f32, col: u32, oe: u32) -> f32 {{
+    var v = v_in;
+{epi}
+    return v;
+}}
+
+@compute @workgroup_size({MATMUL_SPLITK_WG})
+fn matmul_splitk_{suf}(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let m4 = params.m / 4u;
+    let n4 = params.n / 4u;
+    let tile_global = gid.x >> 2u;
+    let lane = gid.x & 3u;
+    let row_tile_raw = tile_global % m4;
+    let col_tile_raw = tile_global / m4;
+    let valid = (row_tile_raw < m4) && (col_tile_raw < n4);
+    let row_tile = min(row_tile_raw, m4 - 1u);
+    let col_tile = min(col_tile_raw, n4 - 1u);
+
+    var acc0 = vec4<f32>(0.0);
+    var acc1 = vec4<f32>(0.0);
+    var acc2 = vec4<f32>(0.0);
+    var acc3 = vec4<f32>(0.0);
+
+    let chunk = params.k >> 2u;
+    let k_start = lane * chunk;
+    let unroll_end = k_start + (chunk & ~3u);
+    var kk = k_start;
+    loop {{
+        if (kk >= unroll_end) {{ break; }}
+        let ab0 = params.off_a + kk * m4 + row_tile;
+        let bb0 = params.off_b + kk * n4 + col_tile;
+        let ab1 = ab0 + m4;
+        let bb1 = bb0 + n4;
+        let ab2 = ab1 + m4;
+        let bb2 = bb1 + n4;
+        let ab3 = ab2 + m4;
+        let bb3 = bb2 + n4;
+        let a0v = a4[ab0]; let b0v = b4[bb0];
+        let a1v = a4[ab1]; let b1v = b4[bb1];
+        let a2v = a4[ab2]; let b2v = b4[bb2];
+        let a3v = a4[ab3]; let b3v = b4[bb3];
+        acc0 += a0v * b0v.x + a1v * b1v.x + a2v * b2v.x + a3v * b3v.x;
+        acc1 += a0v * b0v.y + a1v * b1v.y + a2v * b2v.y + a3v * b3v.y;
+        acc2 += a0v * b0v.z + a1v * b1v.z + a2v * b2v.z + a3v * b3v.z;
+        acc3 += a0v * b0v.w + a1v * b1v.w + a2v * b2v.w + a3v * b3v.w;
+        kk += 4u;
+    }}
+    let k_end = k_start + chunk;
+    loop {{
+        if (kk >= k_end) {{ break; }}
+        let ab = params.off_a + kk * m4 + row_tile;
+        let bb = params.off_b + kk * n4 + col_tile;
+        let av = a4[ab];
+        let bv = b4[bb];
+        acc0 += av * bv.x;
+        acc1 += av * bv.y;
+        acc2 += av * bv.z;
+        acc3 += av * bv.w;
+        kk += 1u;
+    }}
+
+    let base = lid.x - lane;
+    sh0[lid.x] = acc0;
+    sh1[lid.x] = acc1;
+    sh2[lid.x] = acc2;
+    sh3[lid.x] = acc3;
+    workgroupBarrier();
+
+    if (lane == 0u) {{
+        let s0 = sh0[base] + sh0[base + 1u] + sh0[base + 2u] + sh0[base + 3u];
+        let s1 = sh1[base] + sh1[base + 1u] + sh1[base + 2u] + sh1[base + 3u];
+        let s2 = sh2[base] + sh2[base + 1u] + sh2[base + 2u] + sh2[base + 3u];
+        let s3 = sh3[base] + sh3[base + 1u] + sh3[base + 2u] + sh3[base + 3u];
+        if (valid) {{
+            let col0 = col_tile * 4u;
+            let cc = params.off_out + col0 * m4 + row_tile;
+            let row_base = row_tile * 4u;
+            let e0 = col0 * params.m + row_base;
+            let e1 = e0 + params.m;
+            let e2 = e1 + params.m;
+            let e3 = e2 + params.m;
+            c4[cc] = vec4<f32>(epi(s0.x, col0, e0), epi(s0.y, col0, e0 + 1u), epi(s0.z, col0, e0 + 2u), epi(s0.w, col0, e0 + 3u));
+            c4[cc + m4] = vec4<f32>(epi(s1.x, col0 + 1u, e1), epi(s1.y, col0 + 1u, e1 + 1u), epi(s1.z, col0 + 1u, e1 + 2u), epi(s1.w, col0 + 1u, e1 + 3u));
+            c4[cc + 2u * m4] = vec4<f32>(epi(s2.x, col0 + 2u, e2), epi(s2.y, col0 + 2u, e2 + 1u), epi(s2.z, col0 + 2u, e2 + 2u), epi(s2.w, col0 + 2u, e2 + 3u));
+            c4[cc + 3u * m4] = vec4<f32>(epi(s3.x, col0 + 3u, e3), epi(s3.y, col0 + 3u, e3 + 1u), epi(s3.z, col0 + 3u, e3 + 2u), epi(s3.w, col0 + 3u, e3 + 3u));
+        }}
+    }}
+}}
+"#
+    ));
+    s
+}
+
+pub fn matmul_blocked_module(dt: ShaderDtype, epilogue: &[ChainStep], extras: usize) -> String {
+    let t = dt.wgsl();
+    let suf = dt.suffix();
+    let out_binding = 2 + extras;
+    let uniform_binding = 3 + extras;
+    let extra_bindings = (0..extras)
+        .map(|i| {
+            format!("@group(0) @binding({}) var<storage, read> extra{i}: array<{t}>;\n", 2 + i)
+        })
+        .collect::<String>();
+    let lib = format!("{}{}", unary_ops_wgsl("f32"), binary_ops_wgsl("f32"));
+    let epi = epilogue_body_at(epilogue, "col", "oe");
+    let mut s = preamble(dt);
+    s.push_str(&format!(
+        r#"
+struct Params {{
+    m: u32,
+    k: u32,
+    n: u32,
+    off_a: u32,
+    off_b: u32,
+    off_out: u32,
+    _p0: u32,
+    _p1: u32,
+    off_extra: vec4<u32>,
+    mode_extra: vec4<u32>,
+}}
+
+@group(0) @binding(0) var<storage, read> a4: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> b4: array<vec4<f32>>;
+{extra_bindings}@group(0) @binding({out_binding}) var<storage, read_write> c4: array<vec4<f32>>;
+@group(0) @binding({uniform_binding}) var<uniform> params: Params;
+{lib}
+
+fn epi(v_in: f32, col: u32, oe: u32) -> f32 {{
+    var v = v_in;
+{epi}
+    return v;
+}}
+
+@compute @workgroup_size({MATMUL_BLOCKED_WG})
+fn matmul_blocked_{suf}(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let m4 = params.m / 4u;
+    let n4 = params.n / 4u;
+    let tile = gid.x;
+    let row_tile = tile % m4;
+    let col_tile = tile / m4;
+    if (col_tile >= n4) {{ return; }}
+    var acc0 = vec4<f32>(0.0);
+    var acc1 = vec4<f32>(0.0);
+    var acc2 = vec4<f32>(0.0);
+    var acc3 = vec4<f32>(0.0);
+    var kk = 0u;
+    for (; kk + 8u <= params.k; kk += 8u) {{
+        let ab = params.off_a + kk * m4 + row_tile;
+        let bb = params.off_b + kk * n4 + col_tile;
+        let a0 = a4[ab];
+        let a1 = a4[ab + m4];
+        let a2 = a4[ab + 2u * m4];
+        let a3 = a4[ab + 3u * m4];
+        let a4v = a4[ab + 4u * m4];
+        let a5 = a4[ab + 5u * m4];
+        let a6 = a4[ab + 6u * m4];
+        let a7 = a4[ab + 7u * m4];
+        let b0 = b4[bb];
+        let b1 = b4[bb + n4];
+        let b2 = b4[bb + 2u * n4];
+        let b3 = b4[bb + 3u * n4];
+        let b4v = b4[bb + 4u * n4];
+        let b5 = b4[bb + 5u * n4];
+        let b6 = b4[bb + 6u * n4];
+        let b7 = b4[bb + 7u * n4];
+        acc0 += a0 * b0.x + a1 * b1.x + a2 * b2.x + a3 * b3.x
+              + a4v * b4v.x + a5 * b5.x + a6 * b6.x + a7 * b7.x;
+        acc1 += a0 * b0.y + a1 * b1.y + a2 * b2.y + a3 * b3.y
+              + a4v * b4v.y + a5 * b5.y + a6 * b6.y + a7 * b7.y;
+        acc2 += a0 * b0.z + a1 * b1.z + a2 * b2.z + a3 * b3.z
+              + a4v * b4v.z + a5 * b5.z + a6 * b6.z + a7 * b7.z;
+        acc3 += a0 * b0.w + a1 * b1.w + a2 * b2.w + a3 * b3.w
+              + a4v * b4v.w + a5 * b5.w + a6 * b6.w + a7 * b7.w;
+    }}
+    for (; kk < params.k; kk += 4u) {{
+        let ab = params.off_a + kk * m4 + row_tile;
+        let bb = params.off_b + kk * n4 + col_tile;
+        let a0 = a4[ab];
+        let a1 = a4[ab + m4];
+        let a2 = a4[ab + 2u * m4];
+        let a3 = a4[ab + 3u * m4];
+        let b0 = b4[bb];
+        let b1 = b4[bb + n4];
+        let b2 = b4[bb + 2u * n4];
+        let b3 = b4[bb + 3u * n4];
+        acc0 += a0 * b0.x + a1 * b1.x + a2 * b2.x + a3 * b3.x;
+        acc1 += a0 * b0.y + a1 * b1.y + a2 * b2.y + a3 * b3.y;
+        acc2 += a0 * b0.z + a1 * b1.z + a2 * b2.z + a3 * b3.z;
+        acc3 += a0 * b0.w + a1 * b1.w + a2 * b2.w + a3 * b3.w;
+    }}
+    let col0 = col_tile * 4u;
+    let cc = params.off_out + col0 * m4 + row_tile;
+    let e0 = (col0 * m4 + row_tile) * 4u;
+    let e1 = e0 + m4 * 4u;
+    let e2 = e1 + m4 * 4u;
+    let e3 = e2 + m4 * 4u;
+    c4[cc] = vec4<f32>(
+        epi(acc0.x, col0, e0), epi(acc0.y, col0, e0 + 1u),
+        epi(acc0.z, col0, e0 + 2u), epi(acc0.w, col0, e0 + 3u));
+    c4[cc + m4] = vec4<f32>(
+        epi(acc1.x, col0 + 1u, e1), epi(acc1.y, col0 + 1u, e1 + 1u),
+        epi(acc1.z, col0 + 1u, e1 + 2u), epi(acc1.w, col0 + 1u, e1 + 3u));
+    c4[cc + 2u * m4] = vec4<f32>(
+        epi(acc2.x, col0 + 2u, e2), epi(acc2.y, col0 + 2u, e2 + 1u),
+        epi(acc2.z, col0 + 2u, e2 + 2u), epi(acc2.w, col0 + 2u, e2 + 3u));
+    c4[cc + 3u * m4] = vec4<f32>(
+        epi(acc3.x, col0 + 3u, e3), epi(acc3.y, col0 + 3u, e3 + 1u),
+        epi(acc3.z, col0 + 3u, e3 + 2u), epi(acc3.w, col0 + 3u, e3 + 3u));
+}}
+"#
+    ));
+    s
 }

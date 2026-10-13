@@ -5,6 +5,7 @@ use crate::kernels::{BroadcastKind, LibraryName, get_sliced_cuda_view};
 use cudarc::driver::PushKernelArg;
 use tract_core::internal::*;
 use tract_gpu::tensor::DeviceTensor;
+use tract_gpu::utils::merge_copy_axes;
 
 /// Single dispatch function for all copy_nd kernel launches.
 /// Used by GpuMultiBroadcastTo, GpuSlice, GpuConcat, and GpuAxisOp.
@@ -20,6 +21,10 @@ pub fn cuda_copy_nd_dispatch(
     if output_shape.contains(&0) {
         return Ok(());
     }
+    let geo = merge_copy_axes(input_strides, output_shape, output_strides);
+    let (output_shape, input_strides, output_strides) =
+        (&geo.shape[..], &geo.input_strides[..], &geo.output_strides[..]);
+
     crate::with_cuda_stream(|stream| {
         let kernel_name = BroadcastKind::from_rank(output_shape.len())?
             .copy_kernel_name(input.datum_type(), "")?;
@@ -97,6 +102,7 @@ mod tests {
         run_copy_case(&[2, 3, 4, 5, 6, 7], &[2, 3, 4, 5, 6, 9], &[2, 3, 4, 5, 6, 7])?;
         run_copy_case(&[2, 3, 4, 5, 6, 7], &[2, 3, 4, 5, 6, 7], &[1, 2, 3, 4, 5, 6])?;
         run_copy_case(&[4, 5], &[4, 5], &[0, 5])?;
+        run_copy_case(&[2, 1, 3, 1, 4, 5, 7], &[2, 1, 3, 1, 4, 5, 9], &[2, 1, 3, 1, 4, 5, 7])?;
         // More rows than a grid dimension other than x holds.
         run_copy_case(&[70000, 300], &[70000, 300], &[70000, 300])?;
         run_copy_case(&[70000, 8], &[70000, 9], &[70000, 8])?;

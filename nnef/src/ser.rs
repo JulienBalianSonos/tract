@@ -1,3 +1,4 @@
+use crate::ast::dump::is_direct_identifier;
 use crate::ast::*;
 use crate::internal::*;
 use tract_core::ndarray::ArrayViewD;
@@ -36,7 +37,15 @@ pub fn rewrite_model(model: &mut TypedModel) -> TractResult<()> {
         .rewrite(&(), model)
 }
 
+/// NNEF graph id for a model carrying no [`TRACT_NAME`] property.
+pub const DEFAULT_GRAPH_ID: &str = "network";
+
 pub fn to_proto_model(framework: &Nnef, model: &TypedModel) -> TractResult<ProtoModel> {
+    if stage_is_optimized(&model.properties) {
+        warn!(
+            "Serializing an optimized model: NNEF is an interchange format, and optimized graphs carry target-specific ops. Serialize before optimizing."
+        );
+    }
     let mut fixed_model = model.clone();
     rewrite_model(&mut fixed_model)?;
     let mut into_ast = IntoAst::new(framework, &fixed_model);
@@ -172,10 +181,14 @@ impl<'a> IntoAst<'a> {
     }
 
     pub fn into_proto_model(mut self) -> TractResult<ProtoModel> {
+        let name_as_graph_id = self.model.name().is_some_and(|name| {
+            self.framework.allow_extended_identifier_syntax || is_direct_identifier(name)
+        });
         let mut properties = self
             .model
             .properties
             .iter()
+            .filter(|(k, _v)| !(name_as_graph_id && *k == TRACT_NAME))
             .sorted_by_key(|(k, _v)| k.to_owned())
             .map(|(k, v)| Ok(tuple_2(string(k), self.konst(k, v)?.as_ref().clone())))
             .collect::<TractResult<Vec<_>>>()?;
@@ -229,7 +242,12 @@ impl<'a> IntoAst<'a> {
             version: "1.0".into(),
             extension,
             fragments: fragments.into_values().collect(),
-            graph_def: GraphDef { id: Identifier("network".into()), parameters, results, body },
+            graph_def: GraphDef {
+                id: Identifier(self.model.name().unwrap_or(DEFAULT_GRAPH_ID).into()),
+                parameters,
+                results,
+                body,
+            },
         };
         let quantization = if self.quantization.len() > 0 { Some(self.quantization) } else { None };
         Ok(ProtoModel { doc, tensors, quantization, resources: self.resources })
