@@ -73,7 +73,8 @@ pub fn register_may_alias_check(f: fn(&TypedNode) -> bool) {
 /// their input buffer (see `DeviceTensor::try_dense_alias`): the source
 /// buffer must then stay alive as long as the aliasing node's own output.
 fn may_alias_input(node: &TypedNode) -> bool {
-    node.op_is::<crate::ops::slice::GpuSlice>()
+    node.op_is::<crate::ops::fused_view_copy::GpuFusedViewCopy>()
+        || node.op_is::<crate::ops::slice::GpuSlice>()
         || node.op_is::<crate::ops::change_axes::GpuAxisOp>()
         || EXTRA_ALIAS_CHECKS.read().expect("alias check registry poisoned").iter().any(|f| f(node))
 }
@@ -89,6 +90,7 @@ pub fn eval_device_mem_req_for_nodes(
         let cpu_sync_in_next_nodes = next_nodes(model, node).is_some_and(|nodes| {
             nodes.iter().any(|it| {
                 it.op_as::<DeviceSync>().is_some_and(|op| op.kind == DeviceSyncKind::ToHost)
+                    || it.outputs.iter().any(|o| o.fact.as_device_fact().is_none())
             })
         });
 

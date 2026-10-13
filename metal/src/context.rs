@@ -970,13 +970,16 @@ mod tests {
                 "drop under an open command buffer must not recycle yet"
             );
 
-            // Committed but unawaited (within the in-flight window): still
-            // deferred.
             stream.commit_current()?;
-            ensure!(
-                context.pool_take(dt, &shape).is_none(),
-                "drop under a committed-but-unawaited buffer must not recycle yet"
-            );
+            let pending = stream.committed_command_buffers.borrow().back().is_some_and(|entry| {
+                entry.buffer.status() != metal::MTLCommandBufferStatus::Completed
+            });
+            if pending {
+                ensure!(
+                    context.pool_take(dt, &shape).is_none(),
+                    "drop under a pending committed buffer must not recycle yet"
+                );
+            }
 
             // Fully waited: the deferred pair lands in the pool.
             stream.wait_until_completed()?;

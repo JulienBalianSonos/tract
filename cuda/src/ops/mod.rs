@@ -1,6 +1,6 @@
 mod conv;
 pub mod flash_attn;
-mod fused_axis_op;
+pub mod fused_axis_op;
 mod gemm;
 mod iff;
 mod quant_q81;
