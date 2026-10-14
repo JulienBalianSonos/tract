@@ -12,80 +12,63 @@ pub struct DeviceMemoryPool {
     resolved_schema: DeviceResolvedMemSchema,
 }
 
-/// Arena storage retained across evaluations in `TurnState.shared`.
+/// Reusable arena storage held in a turn's shared resources.
 ///
-/// Storage is reused only while the cache holds its sole reference. Escaped
-/// views and in-flight command buffers retain their own references and require
-/// a fresh allocation. Growth reserves 25% headroom; a demand below half the
-/// cached capacity releases that headroom.
+/// Storage is reused only when the cache is its sole owner. Live arena views
+/// retain their backing allocation and force a new allocation on the next turn.
 #[derive(Debug, Default)]
-pub struct ArenaStorageCache {
-    #[allow(clippy::type_complexity)]
-    storage: std::sync::Mutex<Option<(Arc<Box<dyn OwnedDeviceTensor>>, usize)>>,
+pub(crate) struct ArenaStorageCache {
+    storage: std::sync::Mutex<Option<ArenaStorage>>,
+}
+
+#[derive(Debug)]
+struct ArenaStorage {
+    tensor: Arc<Box<dyn OwnedDeviceTensor>>,
+    capacity: usize,
 }
 
 impl DeviceMemoryPool {
-    /// Arena allocations are rounded up to this granularity so consecutive
-    /// steps of a growing-context decode request the SAME buffer size: one
-    /// storage allocation then serves many steps instead of reallocating and
-    /// wiring a fresh multi-MB device buffer per token (an IOGPU kernel trap
-    /// on alloc and free, per step, growing with context).
-    const ARENA_SIZE_BUCKET: usize = 16 * 1024 * 1024;
-
-    fn bucketed(size: usize) -> usize {
-        if size > Self::ARENA_SIZE_BUCKET {
-            size.next_multiple_of(Self::ARENA_SIZE_BUCKET)
-        } else {
-            size
-        }
-    }
-
-    pub fn from_schema_with_cache(
+    /// Reuses storage when it has no live views and capacity is within twice
+    /// the resolved demand. Growth reserves 25% headroom; shrinking below half
+    /// the cached capacity releases it.
+    pub(crate) fn from_schema_with_cache(
         resolved_schema: DeviceResolvedMemSchema,
         cache: &ArenaStorageCache,
     ) -> TractResult<Self> {
-        let needed = Self::bucketed(resolved_schema.memory_size);
+        let needed = resolved_schema.memory_size;
         let mut cached = cache.storage.lock().map_err(|e| anyhow!("{e:?}"))?;
         let storage = match &*cached {
-            Some((storage, size))
-                if *size >= needed
-                    && *size <= needed.saturating_mul(2)
-                    && Arc::strong_count(storage) == 1 =>
+            Some(storage)
+                if storage.capacity >= needed
+                    && storage.capacity <= needed.saturating_mul(2)
+                    && Arc::strong_count(&storage.tensor) == 1 =>
             {
-                Arc::clone(storage)
+                Arc::clone(&storage.tensor)
             }
             _ => {
-                // Headroom only helps the growth path; a shrink goes straight
-                // to the demanded size.
-                let size = if cached.as_ref().is_some_and(|(_, size)| *size < needed) {
-                    Self::bucketed(needed.saturating_mul(5) / 4)
+                let capacity = if cached.as_ref().is_some_and(|s| s.capacity < needed) {
+                    needed.saturating_add(needed / 4)
                 } else {
                     needed
                 };
-                if std::env::var_os("TRACT_GPU_LOG_ARENA").is_some() {
-                    eprintln!(
-                        "arena alloc: {:.1} MB (demand {:.1} MB, cached {:.1} MB{})",
-                        size as f64 / (1024.0 * 1024.0),
-                        needed as f64 / (1024.0 * 1024.0),
-                        cached.as_ref().map(|(_, s)| *s).unwrap_or(0) as f64 / (1024.0 * 1024.0),
-                        if cached.as_ref().is_some_and(|(s, _)| Arc::strong_count(s) > 1) {
-                            ", busy"
-                        } else {
-                            ""
-                        },
-                    );
-                }
-                let storage =
-                    Arc::new(get_context()?.uninitialized_device_tensor(&[size], DatumType::U8)?);
-                *cached = Some((Arc::clone(&storage), size));
-                storage
+                let tensor = Arc::new(
+                    get_context()?.uninitialized_device_tensor(&[capacity], DatumType::U8)?,
+                );
+                *cached = Some(ArenaStorage { tensor: Arc::clone(&tensor), capacity });
+                tensor
             }
         };
         Ok(Self { storage, resolved_schema })
     }
 
     pub fn from_schema(resolved_schema: DeviceResolvedMemSchema) -> TractResult<Self> {
-        Self::from_schema_with_cache(resolved_schema, &ArenaStorageCache::default())
+        Ok(Self {
+            storage: Arc::new(
+                get_context()?
+                    .uninitialized_device_tensor(&[resolved_schema.memory_size], DatumType::U8)?,
+            ),
+            resolved_schema,
+        })
     }
 
     pub fn tensor_for_node(
@@ -100,7 +83,8 @@ impl DeviceMemoryPool {
         self.tensor_for_node_output(node_id, 0, dt, shape)
     }
 
-    /// Allocate one output slot of a multi-output node from its arena region.
+    /// Per-output variant of [`Self::tensor_for_node`] for multi-output nodes:
+    /// each output slot has its own arena region in the schema.
     pub fn tensor_for_node_output(
         &self,
         node_id: usize,

@@ -410,11 +410,6 @@ impl DeviceMemSchema {
     /// Build a memory schema for given model and execution order. The hint is used to optimize
     /// the memory schema because it is based on symbolic dimensions. That doesn't mean it will be
     /// optimal for all possible values for symbolic dimensions.
-    ///
-    /// Symbols missing from the hint fall back to a representative default
-    /// (`GpuTuning::mem_hint_default_dim`, env `TRACT_GPU_MEM_HINT_DEFAULT`):
-    /// the hint only drives the partition packing order, never correctness,
-    /// so an incomplete (or empty) hint still yields a valid schema.
     pub fn build(
         model: &TypedModel,
         order: &[usize],
@@ -423,21 +418,9 @@ impl DeviceMemSchema {
         let mut nodes_mem_req = eval_device_mem_req_for_nodes(model, order)?;
 
         let exotic_facts = collect_exotic_facts(model)?;
-        let default_dim: i64 = crate::tuning::tuning().mem_hint_default_dim;
-        let mut hint = hint.clone();
-        for node_mem in &nodes_mem_req {
-            for sym in node_mem.mem_size.symbols() {
-                if hint.get(&sym).is_none() {
-                    log::debug!(
-                        "memory schema hint missing symbol {sym}, defaulting to {default_dim}"
-                    );
-                    hint.set(&sym, default_dim);
-                }
-            }
-        }
         let hinted_mem_size = nodes_mem_req
             .iter()
-            .map(|node_mem| Ok((node_mem.outlet_id, node_mem.mem_size.eval_to_i64(&hint)?)))
+            .map(|node_mem| Ok((node_mem.outlet_id, node_mem.mem_size.eval_to_i64(hint)?)))
             .collect::<TractResult<HashMap<OutletId, i64>>>()?;
 
         nodes_mem_req.sort_by(|lhs, rhs| {

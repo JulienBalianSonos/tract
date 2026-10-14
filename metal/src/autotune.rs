@@ -307,10 +307,6 @@ fn probe(plan: &Arc<TypedSimplePlan>, resolved: MetalTuning) -> TractResult<Meta
             let mut trial = current;
             (knob.set)(&mut trial, candidate);
             tuning::probe_set(trial)?;
-            // Output invariance: these knobs schedule work, they must never
-            // change its result. A mismatch signals a tract bug (see the
-            // known buffer-pool/in-flight nondeterminism note above); either
-            // way the candidate must not be adopted.
             let out = host_bytes(&run_once(&mut state, &inputs)?);
             if let (Some(reference), Some(out)) = (&reference, &out)
                 && let Some(ix) = first_mismatch(reference, out)

@@ -16,7 +16,6 @@ use std::ffi::c_void;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -74,19 +73,6 @@ pub(crate) fn log_buffer_kernels() -> bool {
     *V.get_or_init(|| std::env::var_os("TRACT_METAL_LOG_BUFFER_KERNELS").is_some())
 }
 
-pub(crate) fn buffer_pool_disabled() -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var_os("TRACT_METAL_DISABLE_BUFFER_POOL").is_some())
-}
-
-/// Log threshold in KB for pool event logging; None = disabled.
-pub(crate) fn log_pool() -> Option<usize> {
-    static V: OnceLock<Option<usize>> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TRACT_METAL_LOG_POOL").ok().map(|v| v.parse::<usize>().unwrap_or(8192))
-    })
-}
-
 #[derive(Debug, Clone)]
 pub struct MetalContext {
     device: Device,
@@ -94,116 +80,9 @@ pub struct MetalContext {
     #[allow(clippy::type_complexity)]
     cache_pipelines:
         Arc<RwLock<HashMap<(LibraryName, String, Option<ConstantValues>), ComputePipelineState>>>,
-    /// Recycled (host allocation, MTLBuffer) pairs keyed by exact
-    /// (dtype, shape). Creating and destroying Metal buffers goes through an
-    /// IOGPU kernel trap each way (~17% of decode CPU time before pooling);
-    /// transformer decode reallocates the same transient shapes every token,
-    /// so an exact-shape pool absorbs nearly all of it.
-    #[allow(clippy::type_complexity)]
-    buffer_pool: Arc<Mutex<HashMap<(DatumType, TVec<usize>), Vec<(Arc<Tensor>, Buffer, u64)>>>>,
-    pooled_bytes: Arc<std::sync::atomic::AtomicUsize>,
-    /// Monotonic insertion stamp driving oldest-first pool eviction.
-    pool_stamp: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl MetalContext {
-    /// Cap on recycled buffers per exact (dtype, shape) key. See
-    /// [`crate::tuning::MetalTuning::max_pooled_per_key`].
-    fn max_pooled_per_key() -> usize {
-        crate::tuning::tuning().max_pooled_per_key
-    }
-
-    /// Hard cap on recycled bytes, oldest-first eviction beyond it. See
-    /// [`crate::tuning::MetalTuning::pool_max_bytes`]
-    /// (`TRACT_METAL_POOL_MAX_MB`).
-    fn max_pooled_bytes() -> usize {
-        crate::tuning::tuning().pool_max_bytes
-    }
-
-    fn pool_take(&self, dt: DatumType, shape: &[usize]) -> Option<(Arc<Tensor>, Buffer)> {
-        if buffer_pool_disabled() {
-            return None;
-        }
-        let mut pool = self.buffer_pool.lock().ok()?;
-        let entry = pool.get_mut(&(dt, TVec::from_slice(shape)));
-        if let Some(thresh_kb) = log_pool() {
-            let bytes = shape.iter().product::<usize>() * dt.size_of();
-            if bytes >= thresh_kb * 1024 {
-                eprintln!(
-                    "pool_take {:?} {:?} {:.1} KB: {}",
-                    dt,
-                    shape,
-                    bytes as f64 / 1024.0,
-                    if entry.as_ref().is_some_and(|e| !e.is_empty()) { "hit" } else { "MISS" }
-                );
-            }
-        }
-        let hit = entry?.pop()?;
-        self.pooled_bytes
-            .fetch_sub(hit.0.len() * dt.size_of(), std::sync::atomic::Ordering::Relaxed);
-        Some(hit.0.clone()).map(|host| (host, hit.1))
-    }
-
-    fn pool_put(&self, host: Arc<Tensor>, buffer: Buffer) {
-        if buffer_pool_disabled() {
-            return;
-        }
-        let dt = host.datum_type();
-        if !DeviceTensor::is_supported_dt(dt) {
-            return;
-        }
-        let bytes = host.len() * dt.size_of();
-        let budget = Self::max_pooled_bytes();
-        if log_pool().is_some_and(|thresh_kb| bytes >= thresh_kb * 1024) {
-            eprintln!(
-                "pool_put {:?} {:?} {:.1} KB (pooled {:.1} MB){}",
-                dt,
-                host.shape(),
-                bytes as f64 / 1024.0,
-                self.pooled_bytes.load(std::sync::atomic::Ordering::Relaxed) as f64
-                    / (1024.0 * 1024.0),
-                if bytes > budget { " REJECTED-over-budget" } else { "" }
-            );
-        }
-        if bytes > budget {
-            return;
-        }
-        let Ok(mut pool) = self.buffer_pool.lock() else { return };
-        // Evict oldest entries (globally, by insertion stamp) until the new
-        // buffer fits the budget: recent shapes stay hot, stale shapes from
-        // an earlier context length get released for real.
-        while self.pooled_bytes.load(std::sync::atomic::Ordering::Relaxed) + bytes > budget {
-            let oldest_key = pool
-                .iter()
-                .filter(|(_, v)| !v.is_empty())
-                .min_by_key(|(_, v)| v.first().map(|e| e.2).unwrap_or(u64::MAX))
-                .map(|(k, _)| k.clone());
-            let Some(key) = oldest_key else { break };
-            let Some(entry) = pool.get_mut(&key) else { break };
-            let (evicted_host, _, _) = entry.remove(0);
-            let evicted_bytes = evicted_host.len() * evicted_host.datum_type().size_of();
-            if log_pool().is_some_and(|thresh_kb| evicted_bytes >= thresh_kb * 1024) {
-                eprintln!(
-                    "pool_evict {:?} {:?} {:.1} KB",
-                    evicted_host.datum_type(),
-                    evicted_host.shape(),
-                    evicted_bytes as f64 / 1024.0,
-                );
-            }
-            self.pooled_bytes.fetch_sub(evicted_bytes, std::sync::atomic::Ordering::Relaxed);
-            if entry.is_empty() {
-                pool.remove(&key);
-            }
-        }
-        let entry = pool.entry((dt, TVec::from_slice(host.shape()))).or_default();
-        if entry.len() >= Self::max_pooled_per_key() {
-            return;
-        }
-        let stamp = self.pool_stamp.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.pooled_bytes.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
-        entry.push((host, buffer, stamp));
-    }
-
     pub fn new() -> TractResult<Self> {
         let device = Device::system_default()
             .with_context(|| "Could not find system default Metal device")?;
@@ -212,9 +91,6 @@ impl MetalContext {
             device,
             cache_libraries: Arc::new(RwLock::new(HashMap::new())),
             cache_pipelines: Arc::new(RwLock::new(HashMap::new())),
-            buffer_pool: Arc::new(Mutex::new(HashMap::new())),
-            pooled_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            pool_stamp: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         ctxt.preload_pipelines()?;
         Ok(ctxt)
@@ -363,23 +239,20 @@ impl DeviceContext for MetalContext {
         let data = if data_bytes.is_empty() { &ZERO } else { data_bytes };
 
         let size = core::mem::size_of_val(data) as NSUInteger;
-        let buffer = self.device.new_buffer_with_bytes_no_copy(
-            data.as_ptr() as *const core::ffi::c_void,
-            size,
-            MTLResourceOptions::StorageModeShared,
-            None,
-        );
-        let host = tensor.into_arc_tensor();
         let device_buffer = MetalBuffer {
-            inner: buffer.clone(),
-            _pool: if bqf.is_none() {
-                Some(Arc::new(BufferPoolGuard { host: host.clone(), buffer }))
-            } else {
-                None
-            },
+            inner: self.device.new_buffer_with_bytes_no_copy(
+                data.as_ptr() as *const core::ffi::c_void,
+                size,
+                MTLResourceOptions::StorageModeShared,
+                None,
+            ),
         };
 
-        Ok(Box::new(MetalTensor { inner: MValue::Natural(host), device_buffer, exotic_fact: bqf }))
+        Ok(Box::new(MetalTensor {
+            inner: MValue::Natural(tensor.into_arc_tensor()),
+            device_buffer,
+            exotic_fact: bqf,
+        }))
     }
 
     fn uninitialized_device_tensor(
@@ -387,34 +260,12 @@ impl DeviceContext for MetalContext {
         shape: &[usize],
         dt: DatumType,
     ) -> TractResult<Box<dyn OwnedDeviceTensor>> {
-        if let Some((host, buffer)) = self.pool_take(dt, shape) {
-            let device_buffer = MetalBuffer {
-                inner: buffer.clone(),
-                _pool: Some(Arc::new(BufferPoolGuard { host: host.clone(), buffer })),
-            };
-            return Ok(Box::new(MetalTensor {
-                inner: MValue::Natural(host),
-                device_buffer,
-                exotic_fact: None,
-            }));
-        }
-        let t0 = log_pool().map(|_| std::time::Instant::now());
         let tensor = unsafe {
             Tensor::uninitialized_dt(dt, shape).with_context(|| {
                 format!("Error while allocating a {dt:?} tensor of shape {shape:?}")
             })?
         };
-        let r = self.tensor_to_device(tensor.into());
-        if let Some(t0) = t0 {
-            eprintln!(
-                "fresh_alloc {:?} {:?} {:.1} KB: {:.1} us",
-                dt,
-                shape,
-                (shape.iter().product::<usize>() * dt.size_of()) as f64 / 1024.0,
-                t0.elapsed().as_secs_f64() * 1e6
-            );
-        }
-        r
+        self.tensor_to_device(tensor.into())
     }
 
     fn uninitialized_device_exotic_tensor(
@@ -460,21 +311,11 @@ impl DeviceContext for MetalContext {
     }
 }
 
-/// One committed-but-unawaited command buffer with everything that must
-/// stay alive (retained tensors) or stay out of the recycling pool
-/// (deferred pool pairs) until it completes.
+/// A committed command buffer and the tensors retained until it completes.
 #[derive(Debug)]
 struct InFlightBuffer {
     buffer: TCommandBuffer,
     retained: Vec<DeviceTensor>,
-    /// (host allocation, MTLBuffer) pairs whose last host-side owner dropped
-    /// while GPU work was pending: recycling them into the pool is deferred
-    /// to this buffer's completion, because a buffer committed earlier (or
-    /// this one) may still read or write them. Recycling at host-drop time
-    /// raced exactly there: the pool handed the pair to a new tensor while
-    /// an in-flight command buffer still referenced it (byte-level run-to-run
-    /// nondeterminism at low in-flight depth, qwen3.5-35B, 2026-08-12).
-    recycle: Vec<(Arc<Tensor>, Buffer)>,
     kernel_names: Vec<String>,
 }
 
@@ -487,10 +328,6 @@ pub struct MetalStream {
     /// first, each with the tensors that must stay alive until it completes.
     /// The queue is FIFO, so waiting on the newest implies all have completed.
     committed_command_buffers: RefCell<VecDeque<InFlightBuffer>>,
-    /// Pool pairs dropped since the last commit (see
-    /// [`InFlightBuffer::recycle`]): they move onto the next committed
-    /// buffer, or recycle directly at the next blocking wait.
-    recycle_stash: RefCell<Vec<(Arc<Tensor>, Buffer)>>,
     /// Kernel names dispatched into the current (open) command buffer, only
     /// populated under TRACT_METAL_PROFILE_KERNELS.
     pending_kernel_names: RefCell<Vec<String>>,
@@ -518,7 +355,6 @@ impl MetalStream {
             command_queue,
             command_buffer: RefCell::new(None),
             committed_command_buffers: RefCell::new(VecDeque::new()),
-            recycle_stash: RefCell::new(Vec::new()),
             pending_kernel_names: RefCell::new(Vec::new()),
             command_buffer_id: AtomicUsize::new(0),
             retained_tensors: RefCell::new(vec![]),
@@ -668,21 +504,12 @@ impl MetalStream {
         command_buffer.commit();
         let retained = std::mem::take(&mut *self.retained_tensors.borrow_mut());
         let names = std::mem::take(&mut *self.pending_kernel_names.borrow_mut());
-        // Pool pairs dropped while this buffer was open may still be
-        // referenced by it (or by an earlier one, which the queue's FIFO
-        // order covers): recycle them only once this buffer has completed.
-        let recycle = std::mem::take(&mut *self.recycle_stash.borrow_mut());
         let mut committed = self.committed_command_buffers.borrow_mut();
         committed.push_back(InFlightBuffer {
             buffer: command_buffer,
             retained,
-            recycle,
             kernel_names: names,
         });
-        // Retire every already-completed buffer at the front (no wait): their
-        // recycle pairs go back to the pool at true completion time instead
-        // of pop time, keeping the pool hot within a step at deep in-flight
-        // settings. Then enforce the in-flight cap with blocking waits.
         loop {
             let done = committed
                 .front()
@@ -693,32 +520,10 @@ impl MetalStream {
             let oldest = committed.pop_front().unwrap();
             oldest.buffer.wait_until_completed();
             Self::log_completed_kernels(&oldest.buffer, "segment", &oldest.kernel_names);
-            for (host, buffer) in oldest.recycle {
-                self.context.pool_put(host, buffer);
-            }
-            // Dropping the retained tensors can fire BufferPoolGuard drops,
-            // which re-enter through the recycle stash (the committed deque
-            // is mutably borrowed here, so the guard defers): those pairs
-            // ride to the next commit or the next blocking wait.
+
             drop(oldest.retained);
         }
         Ok(())
-    }
-
-    /// Recycle everything that was deferred to command-buffer completion.
-    /// Only call with the device fully quiesced (all buffers waited): pairs
-    /// go straight into the pool. Loops because dropping retained tensors
-    /// can push new pairs into the stash.
-    fn flush_recycle_stash(&self) {
-        loop {
-            let pairs = std::mem::take(&mut *self.recycle_stash.borrow_mut());
-            if pairs.is_empty() {
-                return;
-            }
-            for (host, buffer) in pairs {
-                self.context.pool_put(host, buffer);
-            }
-        }
     }
 
     pub fn wait_until_completed(&self) -> TractResult<()> {
@@ -734,13 +539,9 @@ impl MetalStream {
                 Self::log_completed_kernels(&entry.buffer, "segment-tail", &entry.kernel_names);
             }
             for entry in drained {
-                for (host, buffer) in entry.recycle {
-                    self.context.pool_put(host, buffer);
-                }
                 drop(entry.retained);
             }
             self.retained_tensors.borrow_mut().clear();
-            self.flush_recycle_stash();
             return Ok(());
         };
 
@@ -765,15 +566,11 @@ impl MetalStream {
         // committed earlier by commit_current has completed too.
         let drained: Vec<_> = self.committed_command_buffers.borrow_mut().drain(..).collect();
         for entry in drained {
-            for (host, buffer) in entry.recycle {
-                self.context.pool_put(host, buffer);
-            }
             drop(entry.retained);
         }
 
         // Clear local retained values used by the command buffer
         self.retained_tensors.borrow_mut().clear();
-        self.flush_recycle_stash();
 
         *self.command_buffer.borrow_mut() = None;
         anyhow::ensure!(
@@ -830,59 +627,12 @@ impl Drop for MetalStream {
             command_buffer.commit();
             command_buffer.wait_until_completed();
         }
-        // Everything is waited: deferred pairs are simply released (no
-        // recycling into the process pool from a dying stream).
-        self.recycle_stash.borrow_mut().clear();
-    }
-}
-
-/// Returns its (host allocation, MTLBuffer) pair to the context pool when
-/// the last owner drops it, provided nothing else still references the host
-/// tensor (`to_host` on unified memory hands out the same allocation, so an
-/// escaped `Arc<Tensor>` blocks recycling and the pair is simply released).
-#[derive(Debug)]
-pub(crate) struct BufferPoolGuard {
-    pub(crate) host: Arc<Tensor>,
-    pub(crate) buffer: Buffer,
-}
-
-impl Drop for BufferPoolGuard {
-    fn drop(&mut self) {
-        if Arc::strong_count(&self.host) != 1 || buffer_pool_disabled() {
-            return;
-        }
-        let mut pair = Some((self.host.clone(), self.buffer.clone()));
-        // Defer recycling to command-buffer completion when this thread's
-        // stream has (or may have, when a RefCell is busy because this drop
-        // runs inside commit_current/wait) GPU work in flight that could
-        // still reference the pair: recycling at host-drop time handed the
-        // buffer to a new tensor while an in-flight command buffer still
-        // read or wrote it. A thread without a stream never dispatched
-        // anything referencing the pair, so it recycles immediately (the
-        // historical behavior).
-        let _ = METAL_STREAM.try_with(|cell| {
-            let Ok(stream_ref) = cell.try_borrow() else { return };
-            let Some(stream) = stream_ref.as_ref() else { return };
-            let busy = stream.command_buffer.try_borrow().map_or(true, |cb| cb.is_some())
-                || stream
-                    .committed_command_buffers
-                    .try_borrow()
-                    .map_or(true, |committed| !committed.is_empty());
-            if busy {
-                stream.recycle_stash.borrow_mut().push(pair.take().unwrap());
-            }
-        });
-        if let Some((host, buffer)) = pair {
-            metal_context().pool_put(host, buffer);
-        }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct MetalBuffer {
     pub inner: Buffer,
-    /// Shared across clones of the owning tensor; the last drop recycles.
-    pub(crate) _pool: Option<Arc<BufferPoolGuard>>,
 }
 
 impl PartialEq for MetalBuffer {
@@ -910,69 +660,6 @@ impl DeviceBuffer for MetalBuffer {
         self.inner.gpu_address() as *const c_void
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Regression test for the transient buffer-pool recycling race: a
-    /// pooled tensor dropped while GPU work is pending (an open command
-    /// buffer, then a committed-but-unawaited one) must NOT be recyclable
-    /// until that work completes. Before the deferral fix the pair entered
-    /// the pool at host-drop time and could be handed to a new tensor while
-    /// an in-flight command buffer still referenced it (byte-level
-    /// run-to-run nondeterminism on qwen3.5-35B at in-flight depth 2,
-    /// 2026-08-12). The race itself needs GPU/CPU timing to bite, so this
-    /// tests the lifetime mechanics deterministically instead.
-    #[test]
-    fn pool_recycling_defers_to_command_buffer_completion() -> TractResult<()> {
-        crate::utils::with_borrowed_metal_stream(|stream| {
-            // A shape no other test uses, so pool state is ours alone.
-            let shape = [4099usize];
-            let dt = DatumType::F32;
-            let context = metal_context();
-            // Drain anything a previous run of this test left behind.
-            while context.pool_take(dt, &shape).is_some() {}
-
-            // Idle stream: a drop recycles immediately (historical behavior).
-            let t = DeviceTensor::uninitialized_dt(dt, &shape)?;
-            drop(t);
-            ensure!(
-                context.pool_take(dt, &shape).is_some(),
-                "idle-stream drop must recycle immediately"
-            );
-
-            // Busy stream: with a command buffer open, the drop must defer.
-            let t = DeviceTensor::uninitialized_dt(dt, &shape)?;
-            let _cb = stream.command_buffer();
-            drop(t);
-            ensure!(
-                context.pool_take(dt, &shape).is_none(),
-                "drop under an open command buffer must not recycle yet"
-            );
-
-            stream.commit_current()?;
-            let pending = stream.committed_command_buffers.borrow().back().is_some_and(|entry| {
-                entry.buffer.status() != metal::MTLCommandBufferStatus::Completed
-            });
-            if pending {
-                ensure!(
-                    context.pool_take(dt, &shape).is_none(),
-                    "drop under a pending committed buffer must not recycle yet"
-                );
-            }
-
-            // Fully waited: the deferred pair lands in the pool.
-            stream.wait_until_completed()?;
-            ensure!(
-                context.pool_take(dt, &shape).is_some(),
-                "the pair must recycle once the in-flight work completed"
-            );
-            Ok(())
-        })
-    }
-}
-
 /// The description of the `NSError` a failed command buffer carries, which the
 /// `metal` crate does not expose.
 // The objc msg_send!/sel! macros expand to a cargo-clippy cfg check that older

@@ -68,17 +68,6 @@ pub struct MetalTuning {
     /// the cheaper one. No env override (gate:
     /// `TRACT_METAL_DISABLE_GROUPED_MOE`).
     pub moe_grouped_min_routes: usize,
-    /// Hard cap in bytes on recycled buffer-pool memory. The budget must
-    /// hold the session memory arena (recycled once per decode step, tens to
-    /// hundreds of MB at long context) with room to spare for the small
-    /// fixed-shape transients; entries beyond it are evicted oldest-first,
-    /// so stale shapes from a grown context cannot pin wired memory forever
-    /// Env:
-    /// `TRACT_METAL_POOL_MAX_MB` (in MiB).
-    pub pool_max_bytes: usize,
-    /// Cap on recycled buffers pooled per exact (dtype, shape) key.
-    /// No env override.
-    pub max_pooled_per_key: usize,
 }
 
 /// Partial profile an embedding application may register through
@@ -95,8 +84,6 @@ pub struct MetalTuningOverrides {
     pub max_command_buffers_in_flight: Option<usize>,
     pub moe_commit_min_routes: Option<usize>,
     pub moe_grouped_min_routes: Option<usize>,
-    pub pool_max_bytes: Option<usize>,
-    pub max_pooled_per_key: Option<usize>,
 }
 
 impl MetalTuningOverrides {
@@ -116,9 +103,7 @@ impl MetalTuningOverrides {
             commit_every_n_dispatches,
             max_command_buffers_in_flight,
             moe_commit_min_routes,
-            moe_grouped_min_routes,
-            pool_max_bytes,
-            max_pooled_per_key
+            moe_grouped_min_routes
         );
     }
 }
@@ -172,8 +157,6 @@ impl MetalTuning {
         max_command_buffers_in_flight: 8,
         moe_commit_min_routes: 64,
         moe_grouped_min_routes: 64,
-        pool_max_bytes: 512 * 1024 * 1024,
-        max_pooled_per_key: 16,
     };
 
     /// Resolve the profile from the baseline, the registered application
@@ -228,11 +211,6 @@ impl MetalTuning {
             moe_grouped_min_routes: overrides
                 .moe_grouped_min_routes
                 .unwrap_or(base.moe_grouped_min_routes),
-            pool_max_bytes: parsed("TRACT_METAL_POOL_MAX_MB")
-                .map(|mb| mb * 1024 * 1024)
-                .or(overrides.pool_max_bytes)
-                .unwrap_or(base.pool_max_bytes),
-            max_pooled_per_key: overrides.max_pooled_per_key.unwrap_or(base.max_pooled_per_key),
         }
     }
 }
@@ -392,8 +370,6 @@ mod tests {
         assert_eq!(t.max_command_buffers_in_flight, 8);
         assert_eq!(t.moe_commit_min_routes, 64);
         assert_eq!(t.moe_grouped_min_routes, 64);
-        assert_eq!(t.pool_max_bytes, 512 * 1024 * 1024);
-        assert_eq!(t.max_pooled_per_key, 16);
     }
 
     #[test]
@@ -401,7 +377,6 @@ mod tests {
         let env = |name: &str| match name {
             "TRACT_METAL_COMMIT_EVERY_N_DISPATCHES" => Some("20".to_string()),
             "TRACT_METAL_MAX_IN_FLIGHT" => Some("2".to_string()),
-            "TRACT_METAL_POOL_MAX_MB" => Some("128".to_string()),
             "TRACT_METAL_SDPA_PREFILL_BLOCK" => Some("1024".to_string()),
             "TRACT_METAL_MOE_COMMIT_MIN_ROUTES" => Some("32".to_string()),
             _ => None,
@@ -412,7 +387,6 @@ mod tests {
         // Env beats the application hint.
         assert_eq!(t.commit_every_n_dispatches, 20);
         assert_eq!(t.max_command_buffers_in_flight, 2);
-        assert_eq!(t.pool_max_bytes, 128 * 1024 * 1024);
         assert_eq!(t.sdpa_prefill_block, 1024);
         assert_eq!(t.moe_commit_min_routes, 32);
         // Untouched fields keep the baseline.
@@ -506,7 +480,7 @@ mod tests {
         if autotune_enabled() && !is_frozen() {
             // Probe window open: candidates can be swapped in and read back.
             let mut probed = first;
-            probed.max_pooled_per_key = first.max_pooled_per_key + 1;
+            probed.moe_grouped_min_routes = first.moe_grouped_min_routes + 1;
             probe_set(probed).unwrap();
             assert_eq!(tuning(), probed);
             probe_freeze(first);
