@@ -385,6 +385,7 @@ fn llc_bytes() -> usize {
     max.unwrap_or(32 * 1024 * 1024)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bench_shape(
     dt: DatumType,
     m: usize,

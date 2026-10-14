@@ -20,7 +20,6 @@ use tract_core::tract_linalg::block_quant::Q4_0;
 use tract_core::tract_linalg::block_quant::{BlockQuant, BlockQuantStorage};
 use tract_core::transform::ModelTransform;
 use tract_gpu::fact::{DeviceFact, DeviceTypedFactExt};
-use tract_gpu::rewrite_rules::cast::bypass_device_downcast_roundtrip;
 use tract_gpu::rewrite_rules::rewire_syncs::rewire_syncs;
 use tract_gpu::rewrite_rules::rms_norm::{
     fuse_rms_norm_residual, fuse_rms_norm_scale, fuse_rms_norm_scale_after_cast,
@@ -301,9 +300,6 @@ impl MetalTransform {
             return Ok(());
         }
 
-        Rewriter::default()
-            .with_rule_for("bypass_device_downcast_roundtrip", bypass_device_downcast_roundtrip)
-            .rewrite(&(), model)?;
         rewrite_rules::fuse_sibling_gemms(model)?;
         Rewriter::default()
             .with_rule_for("fuse_elementwise_chain_ew", rewrite_rules::fuse_elementwise_chain_ew)
@@ -349,7 +345,7 @@ impl MetalTransform {
                 *counts.entry(node.op.name().to_string()).or_default() += 1;
             }
             let mut sorted: Vec<_> = counts.into_iter().collect();
-            sorted.sort_by(|a, b| b.1.cmp(&a.1));
+            sorted.sort_by_key(|entry| std::cmp::Reverse(entry.1));
             eprintln!("metal-transform op census ({} nodes):", model.nodes().len());
             for (name, count) in &sorted {
                 eprintln!("  {count:5} {name}");
@@ -1219,9 +1215,7 @@ fn repack_canonical_q40_moe_experts(model: &mut TypedModel) -> TractResult<()> {
     Ok(())
 }
 
-/// Casts inserted by the Metal lowering itself (marked synthetic: they may
-/// be bypassed by precision-roundtrip rewrites). Source-graph Cast ops are
-/// converted separately in `kernels::array::cast` and stay non-synthetic.
+/// Construct a device cast preserving the requested dtype and rounding.
 pub(crate) fn metal_cast_new(to: DatumType) -> Option<tract_gpu::ops::cast::GpuCast> {
     tract_gpu::ops::cast::GpuCast::new(
         to,
@@ -1229,7 +1223,6 @@ pub(crate) fn metal_cast_new(to: DatumType) -> Option<tract_gpu::ops::cast::GpuC
         kernels::array::metal_cast_dispatch,
         kernels::array::Cast::is_supported_dt,
     )
-    .map(tract_gpu::ops::cast::GpuCast::into_synthetic)
 }
 
 fn check_matmul_in_dts(in_facts: &[TypedFact]) -> bool {

@@ -21,10 +21,7 @@ use tract_core::internal::*;
 pub struct MetalTuning {
     /// Context length (in cached tokens) where decode-shaped SDPA steps
     /// switch from the batched-gemm pipeline to the fused flash-attention
-    /// kernel. Benchmarked 2026-08-05 on gpt-oss-20b (M4 Pro): the batched
-    /// GGML mm/gemv pipeline beat the flash kernel at every length tried
-    /// (74, 2800, 5.6k, 11k ctx: e.g. 24.3 vs 21.1 tok/s at 11k), so flash
-    /// is disabled by default (`usize::MAX`) and kept for future tuning.
+    /// kernel. The default `usize::MAX` keeps the batched-gemm path active.
     /// Env: `TRACT_METAL_FLASH_SDPA_MIN_T` (legacy
     /// `TRACT_METAL_GPT_OSS_FLASH_MIN_T`).
     pub flash_sdpa_min_t: usize,
@@ -36,9 +33,7 @@ pub struct MetalTuning {
     /// Env: `TRACT_METAL_SDPA_PREFILL_BLOCK`.
     pub sdpa_prefill_block: usize,
     /// Context length where the decode AV gemv switches to split-k (partial
-    /// sums over key chunks + a small reduce). Measured crossover vs the
-    /// plain batched gemv on gpt-oss-20b (M4 Pro): plain wins to ~5.6k
-    /// (52.6 vs 47.5 tok/s @2800), split-k wins beyond (39.2 vs 37.6 @11k).
+    /// sums over key chunks + a small reduce).
     /// No env override (gate: `TRACT_METAL_DISABLE_SDPA_SPLIT_K`).
     pub sdpa_split_k_min_t: usize,
     /// Target keys per split-k chunk (chunk count is clamped to [2, 16]).
@@ -47,44 +42,28 @@ pub struct MetalTuning {
     /// Commit cadence: split each forward into command buffers every N
     /// `command_buffer()` acquisitions (roughly every N kernel dispatches),
     /// so the GPU starts executing early layers while the CPU still encodes
-    /// late ones. 0 (the default) disables the cadence: single buffer per
-    /// forward, plus whatever boundaries ops request themselves. The right
-    /// value is model-shaped, not device-shaped: hybrid-attention models
-    /// (~1200 small dispatches/token, qwen3.5-35B) want 10 (interleaved A/B
-    /// vs 20: +1.0 tok/s @74, +1.2 @2799, +1.8 @11k; 4-6 too eager, 12
-    /// equal, >=16 loses), while dense-KV models (gpt-oss-20b, few large
-    /// dispatches) lose badly under any cadence (66 -> 53 tok/s), hence
-    /// baseline 0, a per-model application hint ([`set_tuning_overrides`])
-    /// and the load-time probe. Env:
+    /// late ones. 0 disables the cadence: a forward uses one buffer plus
+    /// boundaries requested by operations. Applications can set a model-
+    /// specific value with [`set_tuning_overrides`]. Env:
     /// `TRACT_METAL_COMMIT_EVERY_N_DISPATCHES`.
     pub commit_every_n_dispatches: usize,
     /// How many committed-but-unawaited command buffers `commit_current`
     /// keeps in flight (>= 1). The wait on the oldest buffer is the
-    /// backpressure that bounds transient memory (without it, a long-context
-    /// forward retains every layer's transients at once and thrashes).
-    /// Depth 2 already overlaps CPU encoding with GPU execution, but any
-    /// encode hiccup then drains the queue and the GPU idles between buffers
-    /// (~2.8 ms/step measured on qwen3.5-35B decode at cadence 10, ~115
-    /// buffers/step). Depth 8 absorbs the jitter (+5 tok/s on that model,
-    /// +4 at 11k ctx) while transients stay bounded: post-arena they are
-    /// almost all views into the session arena, so deeper retention holds
-    /// Arc clones, not extra wired memory. Env: `TRACT_METAL_MAX_IN_FLIGHT`.
+    /// backpressure that bounds transient memory. Env:
+    /// `TRACT_METAL_MAX_IN_FLIGHT`.
     pub max_command_buffers_in_flight: usize,
     /// Routed-MoE ops end their dispatch with a non-blocking command-buffer
     /// boundary only when the step routes more than this many (token,
     /// expert) pairs. The boundary is a correctness measure for prefill-sized
     /// batches (see `MetalRoutedQ40MatMul`); decode steps (route_count =
     /// top_k) end with the runtime's own blocking logits sync anyway, and
-    /// splitting at decode costs ~75% of the decode wall time in
-    /// waitUntilCompleted for no benefit. Env:
+    /// Env:
     /// `TRACT_METAL_MOE_COMMIT_MIN_ROUTES`.
     pub moe_commit_min_routes: usize,
     /// Route count at which routed-q40 MoE matmuls take the expert-grouped
     /// path: bin the routes by expert (single-threadgroup counting sort),
-    /// then let each threadgroup amortize every weight read across 32 routes
-    /// of one expert through the simdgroup-matrix pipeline. Halves
-    /// 2800-token prefill vs the per-route gemv (11.5 -> 5.9 s on
-    /// gpt-oss-20b). The per-route kernel re-reads an expert's weights once
+    /// then let each threadgroup amortize weight reads across routes
+    /// of one expert through the simdgroup-matrix pipeline. The per-route kernel re-reads an expert's weights once
     /// per route, so below this threshold (decode-sized route lists) it is
     /// the cheaper one. No env override (gate:
     /// `TRACT_METAL_DISABLE_GROUPED_MOE`).
@@ -94,8 +73,7 @@ pub struct MetalTuning {
     /// hundreds of MB at long context) with room to spare for the small
     /// fixed-shape transients; entries beyond it are evicted oldest-first,
     /// so stale shapes from a grown context cannot pin wired memory forever
-    /// (unbounded pinning is what used to slow the weight-streaming kernels
-    /// when large buffers were pooled without eviction). Env:
+    /// Env:
     /// `TRACT_METAL_POOL_MAX_MB` (in MiB).
     pub pool_max_bytes: usize,
     /// Cap on recycled buffers pooled per exact (dtype, shape) key.
@@ -184,8 +162,7 @@ pub(crate) fn pinned_knobs() -> PinnedKnobs {
 }
 
 impl MetalTuning {
-    /// The hardcoded defaults, tuned on an Apple M4 Pro (48 GB) during the
-    /// 2026-08 decode-perf campaign. See each field for provenance.
+    /// The hardcoded defaults for this runtime.
     pub const BASELINE: MetalTuning = MetalTuning {
         flash_sdpa_min_t: usize::MAX,
         sdpa_prefill_block: 4096,
@@ -324,8 +301,7 @@ fn tuning_unfrozen() -> MetalTuning {
         tuning
     });
     if !autotune_enabled() {
-        // Probe opted out: freeze at first read, the historical
-        // resolve-once behavior, byte for byte.
+        // Freeze the resolved profile when probing is disabled.
         let _ = FROZEN.set(t);
     }
     t
@@ -403,8 +379,7 @@ mod tests {
         None
     }
 
-    /// The documented baseline IS the default resolution: no env, no
-    /// overrides must yield exactly the 2026-08 M4 Pro tuned values.
+    /// The default resolution uses the baseline when no overrides are set.
     #[test]
     fn default_profile_is_baseline() {
         let t = MetalTuning::resolve(&MetalTuningOverrides::default(), no_env);
@@ -471,7 +446,7 @@ mod tests {
     }
 
     /// Unparseable or out-of-domain env values fall through, matching the
-    /// historical per-site parsing (`parse().ok()`, in-flight `>= 1`).
+    /// parsing behavior used at each call site (`parse().ok()`, in-flight `>= 1`).
     #[test]
     fn invalid_env_values_fall_through() {
         let env = |name: &str| match name {

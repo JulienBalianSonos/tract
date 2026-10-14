@@ -962,7 +962,7 @@ pub fn dispatch_mul_mv_q8_0(
     c_offset: usize,
     c_row_stride: usize,
 ) -> TractResult<()> {
-    ensure!(k % 32 == 0, "q8_0 gemv needs k % 32 == 0, got {k}");
+    ensure!(k.is_multiple_of(32), "q8_0 gemv needs k.is_multiple_of(32), got {k}");
     stream.retain_tensor(a);
     stream.retain_tensor(b);
     stream.retain_tensor(c);
@@ -1031,11 +1031,11 @@ pub fn dispatch_mul_mv_f16_split_k(
     partial: &DeviceTensor,
 ) -> TractResult<()> {
     let chunks = k_total.div_ceil(k_chunk);
-    ensure!(k_chunk % 32 == 0, "split-k chunk must be a multiple of 32");
+    ensure!(k_chunk.is_multiple_of(32), "split-k chunk must be a multiple of 32");
     // The last chunk may be short: the kernel reads exactly ne00 elements, so
-    // callers must guarantee k_total % k_chunk == 0 (pad upstream) or accept
+    // callers must guarantee k_total.is_multiple_of(k_chunk) (pad upstream) or accept
     // that we require it here.
-    ensure!(k_total % k_chunk == 0, "split-k needs k_total % k_chunk == 0");
+    ensure!(k_total.is_multiple_of(k_chunk), "split-k needs k_total.is_multiple_of(k_chunk)");
     stream.retain_tensor(a);
     stream.retain_tensor(b);
     stream.retain_tensor(partial);

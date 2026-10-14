@@ -1,47 +1,20 @@
-//! Fused attention with an in-place KV cache, generic across transformer
-//! exports (GPT-OSS, Qwen3.5 full-attention layers, ...).
+//! Attention over caller-owned K/V history with optional normalization sinks.
 //!
-//! These exports never match the generic Sdpa/DynKeyValueCache detection:
-//! attention is raw ops (optionally with SINKS in the softmax denominator),
-//! and the KV cache is a plain in-graph `concat([in_cache, new], axis=2)`
-//! whose output is both a model output and the attention input. That concat
-//! copies the whole past per layer per token: O(T^2) over a decode, the
-//! dominant long-context decode cost.
+//! CPU evaluation is a stateless tensor computation. Metal may retain append-only
+//! storage, but incoming history remains authoritative. Serialization expands to
+//! portable tensor operations instead of introducing a device cache primitive.
 //!
-//! `FusedSdpa` replaces the per-layer subgraph
-//! `{concat K/V, GQA expand, QK*scale, +mask, [concat sinks], softmax,
-//! [drop sink], @V}` with one stateful op that owns geometrically-grown K/V
-//! capacity buffers and appends only the new rows each step. The model KEEPS
-//! its cache I/O signature: `out_cache_*` dims still carry the symbolic P+S
-//! the rest of the graph resolves masks/positions/reshapes from. On the CPU
-//! path the emitted cache is a contiguous copy (no worse than the concat it
-//! replaces); device paths can emit zero-copy views of the capacity buffer,
-//! which is where the O(T) win lands.
-//!
-//! Everything geometry-related is parametric: head_dim, GQA ratio (Hq/Hkv),
-//! sequence lengths. Attention sinks are optional (`has_sinks`), the sliding
-//! window is optional (`window == 0` means full attention).
-//!
-//! Cache-input handling per step: if the incoming cache length equals the
-//! state's accumulated length, this is a continuation and the input tensor is
-//! ignored (no copy); anything else (fresh session, truncation, retry,
-//! teacher forcing) rebuilds the state from the provided cache so external
-//! semantics stay exact.
+//! Recognition requires a single f16 QK product and scale multiply, f32 mask and
+//! softmax, f16 probabilities and an AV product. Split or f32 score expressions
+//! retain their original operations and precision boundaries. The mask defines
+//! visible keys; unsupported graphs keep the standard backend fallback.
 
 use tract_nnef::internal::*;
-use tract_nnef::tract_ndarray::{Array2, ArrayView2, Ix1, Ix4, s};
-
-use crate::ops::inplace_kv_cache::InPlaceKvCache;
 
 /// Sequence axis of `[B, H, S, D]`.
 const SEQ_AXIS: usize = 2;
 
-/// Env flag with a legacy fallback name (from when the op was GPT-OSS
-/// specific): the new name wins, the old one keeps existing scripts working.
-fn env_flag_with_legacy(new: &str, legacy: &str) -> bool {
-    std::env::var_os(new).is_some() || std::env::var_os(legacy).is_some()
-}
-
+/// Semantic attention with caller-owned history and explicit rounding boundaries.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FusedSdpa {
     /// Softmax scale as f32 bits (f32 lacks Eq/Hash).
@@ -59,6 +32,114 @@ pub struct FusedSdpa {
 }
 
 impl FusedSdpa {
+    /// Build the portable tensor computation without mutable device cache state.
+    pub fn expanded_model(&self, facts: &[&TypedFact]) -> TractResult<TypedModel> {
+        self.output_facts(facts)?;
+        let mut model = TypedModel::default();
+        let inputs = facts
+            .iter()
+            .enumerate()
+            .map(|(i, fact)| model.add_source(format!("input_{i}"), fact.without_value()))
+            .collect::<TractResult<TVec<_>>>()?;
+        let dt = facts[0].datum_type;
+        let q_shape = facts[0].shape.to_tvec();
+        let hq = q_shape[1].clone();
+        let hkv = facts[1].shape[1].clone();
+        let group = hq.clone() / hkv.to_usize()?;
+        let k = model.wire_node("keys", TypedConcat { axis: 2 }, &[inputs[3], inputs[1]])?[0];
+        let v = model.wire_node("values", TypedConcat { axis: 2 }, &[inputs[4], inputs[2]])?[0];
+        let total = model.outlet_fact(k)?.shape[2].clone();
+        let mut expanded = tvec![];
+        for (name, wire) in [("keys", k), ("values", v)] {
+            let wire = model.wire_node(format!("{name}.group"), AxisOp::Add(2), &[wire])?[0];
+            let shape = tvec![
+                q_shape[0].clone(),
+                hkv.clone(),
+                group.clone(),
+                total.clone(),
+                q_shape[3].clone()
+            ];
+            let wire = model.wire_node(
+                format!("{name}.repeat"),
+                MultiBroadcastTo { shape: shape.into() },
+                &[wire],
+            )?[0];
+            let wire = model.wire_node(
+                format!("{name}.heads"),
+                AxisOp::Reshape(1, tvec![hkv.clone(), group.clone()], tvec![hq.clone()]),
+                &[wire],
+            )?[0];
+            expanded.push(wire);
+        }
+        let scores = model.wire_node(
+            "scores",
+            EinSum::new("bhqd,bhkd->bhqk".parse()?, DatumType::F32),
+            &[inputs[0], expanded[0]],
+        )?[0];
+        let scores = model.wire_node("scores.round", Cast { to: dt }, &[scores])?[0];
+        let scale = model.add_const(
+            "scale",
+            tensor0(self.scale()).cast_to_dt(dt)?.into_owned().broadcast_into_rank(4)?,
+        )?;
+        let scores =
+            model.wire_node("scaled", TypedBinOp(Box::new(Mul), None), &[scores, scale])?[0];
+        let scores = model.wire_node("scaled.float", Cast { to: DatumType::F32 }, &[scores])?[0];
+        let mask = model.wire_node("mask.float", Cast { to: DatumType::F32 }, &[inputs[5]])?[0];
+        let mask = model.wire_node(
+            "mask.shape",
+            AxisOp::Reshape(
+                0,
+                facts[5].shape.to_tvec(),
+                tvec![1.to_dim(), 1.to_dim(), q_shape[2].clone(), total.clone()],
+            ),
+            &[mask],
+        )?[0];
+        let mut logits = model.wire_node(
+            "masked",
+            TypedBinOp(Box::new(tract_nnef::tract_core::ops::math::Add), None),
+            &[scores, mask],
+        )?[0];
+        if self.has_sinks {
+            let sinks = model.wire_node(
+                "sinks.shape",
+                AxisOp::Reshape(
+                    0,
+                    facts[6].shape.to_tvec(),
+                    tvec![1.to_dim(), hq, 1.to_dim(), 1.to_dim()],
+                ),
+                &[inputs[6]],
+            )?[0];
+            let shape =
+                tvec![q_shape[0].clone(), q_shape[1].clone(), q_shape[2].clone(), 1.to_dim()];
+            let sinks = model.wire_node(
+                "sinks.repeat",
+                MultiBroadcastTo { shape: shape.into() },
+                &[sinks],
+            )?[0];
+            logits = model.wire_node("with-sinks", TypedConcat { axis: 3 }, &[logits, sinks])?[0];
+        }
+        let mut probs = model.wire_node(
+            "probabilities",
+            Softmax { axes: tvec![3], ..Softmax::default() },
+            &[logits],
+        )?[0];
+        if self.has_sinks {
+            probs = model.wire_node(
+                "drop-sinks",
+                Slice { axis: 3, start: 0.to_dim(), end: total },
+                &[probs],
+            )?[0];
+        }
+        let probs = model.wire_node("probabilities.round", Cast { to: dt }, &[probs])?[0];
+        let output = model.wire_node(
+            "attention",
+            EinSum::new("bhqk,bhkd->bhqd".parse()?, DatumType::F32),
+            &[probs, expanded[1]],
+        )?[0];
+        let output = model.wire_node("attention.round", Cast { to: dt }, &[output])?[0];
+        model.select_output_outlets(&[output, k, v])?;
+        Ok(model)
+    }
     pub fn scale(&self) -> f32 {
         f32::from_bits(self.scale_bits)
     }
@@ -78,14 +159,13 @@ impl Op for FusedSdpa {
 }
 
 impl EvalOp for FusedSdpa {
-    not_out_of_plan!();
-    fn state(&self, _ctx: &EvalContext) -> TractResult<Option<Box<dyn OpState>>> {
-        Ok(Some(Box::new(FusedSdpaState {
-            scale: self.scale(),
-            has_sinks: self.has_sinks,
-            k: InPlaceKvCache::new(SEQ_AXIS),
-            v: InPlaceKvCache::new(SEQ_AXIS),
-        })))
+    op_out_of_plan!();
+    fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+        let facts = inputs
+            .iter()
+            .map(|i| TypedFact::try_from(i.clone().into_arc_tensor()))
+            .collect::<TractResult<TVec<_>>>()?;
+        TypedSimplePlan::new(self.expanded_model(&facts.iter().collect::<Vec<_>>())?)?.run(inputs)
     }
 }
 
@@ -97,12 +177,28 @@ impl TypedOp for FusedSdpa {
             if self.has_sinks { ", sinks" } else { "" },
             inputs.len()
         );
-        let (q, k_new, _v_new, k_cache, v_cache) =
-            (inputs[0], inputs[1], inputs[2], inputs[3], inputs[4]);
-        ensure!(q.rank() == 4 && k_new.rank() == 4 && k_cache.rank() == 4);
-        // Attention output has Q's shape/dtype; caches grow to P+S along seq.
-        // Cache outputs carry Q's dtype too: eval casts them to `out_dt`
-        // (q's dtype) on the way out, so the declared fact must match.
+        ensure!(self.scale().is_finite(), "attention scale must be finite");
+        let (q, k_new, v_new, k_cache, v_cache, mask) =
+            (inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], inputs[5]);
+        ensure!(inputs[..5].iter().all(|f| f.rank() == 4));
+        ensure!(matches!(q.datum_type, DatumType::F16 | DatumType::F32));
+        ensure!(inputs[..5].iter().all(|f| f.datum_type == q.datum_type));
+        ensure!(k_new.shape == v_new.shape && k_cache.shape == v_cache.shape);
+        ensure!(q.shape[0] == k_new.shape[0] && q.shape[0] == k_cache.shape[0]);
+        ensure!(q.shape[2] == k_new.shape[2]);
+        ensure!(q.shape[3] == k_new.shape[3] && q.shape[3] == k_cache.shape[3]);
+        ensure!(k_new.shape[1] == k_cache.shape[1]);
+        let hkv = k_new.shape[1].to_usize()?;
+        let hq = q.shape[1].to_usize()?;
+        ensure!(hq > 0 && hkv > 0 && hq.is_multiple_of(hkv));
+        ensure!((2..=4).contains(&mask.rank()) && mask.datum_type.is_float());
+        ensure!(mask.shape[..mask.rank() - 2].iter().all(|d| d == &1.to_dim()));
+        ensure!(mask.shape[mask.rank() - 2] == q.shape[2]);
+        ensure!(mask.shape[mask.rank() - 1] == k_cache.shape[2].clone() + k_new.shape[2].clone());
+        if self.has_sinks {
+            ensure!(inputs[6].datum_type == DatumType::F32);
+            ensure!(inputs[6].shape.volume() == q.shape[1]);
+        }
         let total = k_cache.shape[SEQ_AXIS].clone() + k_new.shape[SEQ_AXIS].clone();
         let mut k_out = k_cache.without_value();
         k_out.shape.set(SEQ_AXIS, total.clone());
@@ -113,173 +209,6 @@ impl TypedOp for FusedSdpa {
         Ok(tvec!(q.without_value(), k_out, v_out))
     }
     as_op!();
-}
-
-#[derive(Clone, Debug)]
-pub struct FusedSdpaState {
-    scale: f32,
-    has_sinks: bool,
-    k: InPlaceKvCache,
-    v: InPlaceKvCache,
-}
-
-impl OpState for FusedSdpaState {
-    fn eval(
-        &mut self,
-        _ctx: &EvalContext,
-        _op: &dyn Op,
-        inputs: TVec<TValue>,
-    ) -> TractResult<TVec<TValue>> {
-        ensure!(inputs.len() == 6 + self.has_sinks as usize);
-        let (q_in, k_new, v_new, k_cache, v_cache, mask) =
-            (&inputs[0], &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5]);
-        let sinks_in = self.has_sinks.then(|| &inputs[6]);
-        let out_dt = q_in.datum_type();
-        let past = k_cache.shape()[SEQ_AXIS];
-
-        // Continuation fast-path vs rebuild (fresh run / truncation / retry).
-        if past != self.k.len() {
-            self.k = InPlaceKvCache::new(SEQ_AXIS);
-            self.v = InPlaceKvCache::new(SEQ_AXIS);
-            if past > 0 {
-                self.k.push(&to_f32(k_cache)?)?;
-                self.v.push(&to_f32(v_cache)?)?;
-            }
-        }
-        self.k.push(&to_f32(k_new)?)?;
-        self.v.push(&to_f32(v_new)?)?;
-
-        if env_flag_with_legacy("TRACT_DEBUG_FUSED_SDPA", "TRACT_DEBUG_GPT_OSS_SDPA") {
-            let stats = |t: &TValue, tag: &str| -> TractResult<()> {
-                let h = t.cast_to::<f32>()?.into_owned();
-                let v = h.try_as_plain_ram()?.as_slice::<f32>()?;
-                let mx = v.iter().cloned().fold(f32::MIN, f32::max);
-                let mn = v.iter().cloned().fold(f32::MAX, f32::min);
-                let sum: f32 = v.iter().sum();
-                eprintln!(
-                    "fused-sdpa-cpu-dbg {tag}: shape={:?} min={mn:.4} max={mx:.4} mean={:.6}",
-                    t.shape(),
-                    sum / v.len() as f32
-                );
-                Ok(())
-            };
-            stats(q_in, "q")?;
-            stats(k_new, "k_new")?;
-            stats(mask, "mask")?;
-        }
-        let q = to_f32(q_in)?;
-        let q = q.to_plain_array_view::<f32>()?.into_dimensionality::<Ix4>()?;
-        let mask_t = to_f32(mask)?;
-        let mask_rank = mask_t.rank();
-        ensure!(mask_rank >= 2);
-        ensure!(
-            mask_t.shape()[..mask_rank - 2].iter().all(|&d| d == 1),
-            "mask leading dims must be broadcast (1), got {:?}",
-            mask_t.shape()
-        );
-        let mask_2d: TVec<usize> = mask_t.shape()[mask_rank - 2..].into();
-        let mask_t = mask_t.into_shape(&mask_2d)?;
-        let mask = mask_t
-            .to_plain_array_view::<f32>()?
-            .into_dimensionality::<tract_nnef::tract_ndarray::Ix2>()?;
-        let sinks_t = match sinks_in {
-            Some(sinks) => {
-                let mut t = to_f32(sinks)?;
-                let n = t.len();
-                t = t.into_shape(&[n])?;
-                Some(t)
-            }
-            None => None,
-        };
-        let sinks = match sinks_t.as_ref() {
-            Some(t) => Some(t.to_plain_array_view::<f32>()?.into_dimensionality::<Ix1>()?),
-            None => None,
-        };
-        let k = self.k.valid_view::<f32>()?.into_dimensionality::<Ix4>()?;
-        let v = self.v.valid_view::<f32>()?.into_dimensionality::<Ix4>()?;
-
-        let (b_sz, hq, s_len, d) = q.dim();
-        let hkv = k.dim().1;
-        ensure!(hq % hkv == 0, "q heads {hq} not a multiple of kv heads {hkv}");
-        let group = hq / hkv;
-        let kv_len = k.dim().2;
-        ensure!(kv_len == past + k_new.shape()[SEQ_AXIS]);
-        ensure!(mask.dim().1 == kv_len, "mask keys {} != cache len {kv_len}", mask.dim().1);
-        ensure!(mask.dim().0 == s_len, "mask rows {} != query seq len {s_len}", mask.dim().0);
-        if let Some(sinks) = &sinks {
-            ensure!(sinks.len() == hq);
-        }
-
-        let mut out = Tensor::zero::<f32>(&[b_sz, hq, s_len, d])?;
-        {
-            let mut ov = out.to_plain_array_view_mut::<f32>()?.into_dimensionality::<Ix4>()?;
-            for b in 0..b_sz {
-                for h in 0..hq {
-                    // Without sinks the -inf sink contributes exp(-inf) = 0
-                    // to the denominator: exactly the plain masked softmax.
-                    let sink = sinks.as_ref().map_or(f32::NEG_INFINITY, |s| s[h]);
-                    let o = attend_one_head_with_sink(
-                        q.slice(s!(b, h, .., ..)),
-                        k.slice(s!(b, h / group, .., ..)),
-                        v.slice(s!(b, h / group, .., ..)),
-                        mask,
-                        sink,
-                        self.scale,
-                    );
-                    ov.slice_mut(s!(b, h, .., ..)).assign(&o);
-                }
-            }
-        }
-
-        // CPU path: emit contiguous copies (device paths emit views instead).
-        let k_out = self.k.valid_contiguous()?.cast_to_dt(out_dt)?.into_owned();
-        let v_out = self.v.valid_contiguous()?.cast_to_dt(out_dt)?.into_owned();
-        Ok(tvec!(
-            out.cast_to_dt(out_dt)?.into_owned().into_tvalue(),
-            k_out.into_tvalue(),
-            v_out.into_tvalue(),
-        ))
-    }
-
-    fn reset_lanes(&mut self, _lanes: &[LaneId]) -> TractResult<()> {
-        bail!("FusedSdpaState is not lane-aware: the KV caches have no lane axis")
-    }
-}
-
-/// Two-pass softmax attention for one (batch, q-head), with an optional
-/// GPT-OSS-style sink: an extra logit participating in normalization with no
-/// value row. Matches `softmax(concat([q.k*scale + mask, sink]))[..-1] @ v`
-/// exactly; `sink = -inf` degenerates to the plain masked softmax.
-fn attend_one_head_with_sink(
-    q: ArrayView2<f32>,
-    k: ArrayView2<f32>,
-    v: ArrayView2<f32>,
-    mask: ArrayView2<f32>,
-    sink: f32,
-    scale: f32,
-) -> Array2<f32> {
-    let mut logits = q.dot(&k.t());
-    logits *= scale;
-    logits += &mask;
-    let (s_len, d) = (q.dim().0, q.dim().1);
-    let mut out = Array2::<f32>::zeros((s_len, d));
-    for i in 0..s_len {
-        let row = logits.slice(s!(i, ..));
-        let m = row.iter().copied().fold(sink, f32::max);
-        let mut den = (sink - m).exp();
-        let mut weights = row.to_owned();
-        for w in weights.iter_mut() {
-            *w = (*w - m).exp();
-            den += *w;
-        }
-        weights /= den;
-        out.slice_mut(s!(i, ..)).assign(&weights.dot(&v));
-    }
-    out
-}
-
-fn to_f32(t: &TValue) -> TractResult<Tensor> {
-    Ok(t.cast_to::<f32>()?.into_owned())
 }
 
 pub fn register(registry: &mut Registry) {
@@ -340,14 +269,19 @@ fn parameters(sinks: SinksParam) -> Vec<Parameter> {
 }
 
 fn dump(ast: &mut IntoAst, node: &TypedNode, op: &FusedSdpa) -> TractResult<Option<Arc<RValue>>> {
-    // node.inputs already carries the trailing sinks tensor when has_sinks;
-    // it maps onto the fragment's optional `sinks` parameter positionally.
-    let inputs: Vec<Arc<RValue>> = node.inputs.iter().map(|i| ast.mapping[i].clone()).collect();
-    Ok(Some(invocation(
-        "tract_transformers_fused_sdpa",
-        &inputs,
-        &[("scale", numeric(op.scale())), ("window", numeric(op.window))],
-    )))
+    let facts = ast.model.node_input_facts(node.id)?;
+    let mut semantic = op.expanded_model(&facts)?;
+    semantic.symbols = ast.model.symbols.clone();
+    let (mut fragment, mut tensors) = tract_nnef::ser::to_fragment_def(ast, &semantic)?;
+    fragment.decl.id = Identifier(format!("attention_{}", ast.fragments.len()));
+    let mut arguments = node.inputs.iter().map(|i| ast.mapping[i].clone()).collect::<Vec<_>>();
+    tensors.sort_by_key(|tensor| tensor.label.clone());
+    for tensor in tensors {
+        arguments.push(ast.konst_variable(&tensor.label, &tensor.value)?);
+    }
+    let result = invocation(fragment.decl.id.clone(), &arguments, &[]);
+    ast.fragments.insert(fragment.decl.id.clone(), fragment);
+    Ok(Some(result))
 }
 
 fn load_common(
@@ -385,33 +319,6 @@ fn load_legacy_with_sinks(
     let sinks: OutletId = invocation.named_arg_as(builder, "sinks")?;
     load_common(builder, invocation, Some(sinks))
 }
-
-// ===================================================================================
-// Detection: fuse the exported attention subgraph on the decluttered graph.
-// Anchor = the attention Softmax. Variants of the same skeleton:
-//
-//   GPT-OSS:  Add(qk branches) -> Mul(scale) -> Cast(f32) -> Add(mask)
-//             -> Concat(sinks) -> [Reduce<Max>, Sub] -> Softmax -> Slice(drop
-//             sink) -> Cast(f16) -> Reshape([Hkv,G,S,T]) -> EinSum(@V)
-//   Qwen3.5:  Add(qk branches) -> Mul(scale) -> Cast(f32) -> Add(mask)
-//             -> Softmax -> Cast(f16) -> Reshape([Hkv,G,S,T]) -> EinSum(@V)
-//   Granite:  EinSum(f32 casts inside) -> Mul(scale) -> Add(mask) -> Softmax
-//             -> Cast(f16) -> Reshape([Hkv,G,S,T]) -> EinSum(@V)
-//   OLMoE:    EinSum -> Mul(scale) -> Cast(f32) -> Add(mask) -> Softmax
-//             -> Cast(f16) -> EinSum(@V)  (MHA: no GQA probs fold, group = 1)
-//
-// A qk branch is [Reshape](EinSum([Cast][Reshape](q_part), k_side)); the outer
-// reshape, the q-side f32 cast and the q-side layout reshape are each optional.
-// k_side is `Slice(expand(KConcat))` covering one head_dim range (the rope
-// split), or directly `expand(KConcat)` (single-branch models, start = 0; the
-// expand chain may be empty on MHA exports). Rope-split exports sum two such
-// branches. q parts may be laid out [1,Hq,S,d] or [1,S,Hq,d]. The f32 cast
-// between Mul(scale) and Add(mask) exists only when the QK einsum ran in f16.
-// The AV einsum output is [Hkv,G,S,D], [1,Hkv,G,S,D], or, on MHA exports
-// without the probs fold, [Hq,S,D] or [S,Hq,D]. K/V concats are
-// `concat([in_cache, new], axis=2)` and must be model outputs (their slots get
-// the op's views).
-// ===================================================================================
 
 use tract_nnef::tract_core::ops::array::{MultiBroadcastTo, Slice, TypedConcat};
 use tract_nnef::tract_core::ops::binary::TypedBinOp;
@@ -504,85 +411,6 @@ fn qk_branch(model: &TypedModel, branch_root: &TypedNode) -> Option<(OutletId, u
     Some((q_part, kconcat, start))
 }
 
-/// Walk the mask-building subgraph upstream of `mask_outlet` looking for the
-/// sliding-window size. The exported causal mask is built from ranges and
-/// 0/1/huge-negative constants only; the sliding variant additionally embeds
-/// the window as a small integer constant in its band comparison. Returns 0
-/// (full attention) when no such constant exists, which is always safe: the
-/// mask stays the semantic source of truth.
-fn extract_sliding_window(model: &TypedModel, mask_outlet: OutletId) -> u32 {
-    let debug = env_flag_with_legacy("TRACT_DEBUG_FUSED_SDPA_WINDOW", "TRACT_DEBUG_GPT_OSS_WINDOW");
-    let mut seen = std::collections::HashSet::new();
-    let mut stack = vec![mask_outlet.node];
-    let mut candidates: Vec<u32> = vec![];
-    while let Some(id) = stack.pop() {
-        if !seen.insert(id) || seen.len() > 256 {
-            continue;
-        }
-        let n = model.node(id);
-        if debug {
-            let k = n.op_as::<Const>().map(|k| format!(" = {:?}", k.val())).unwrap_or_default();
-            eprintln!("mask-subgraph[{}]: {} {}{k}", mask_outlet.node, n.name, n.op.name());
-        }
-        if let Some(k) = n.op_as::<Const>() {
-            let v = k.val();
-            // A window constant necessarily parameterizes a positional
-            // comparison: require the constant to reach a comparison op
-            // within two successor hops (window masks are built as
-            // `cmp(i - j, w)` or `cmp(j, i - w)`), so unrelated scalar
-            // constants in the mask cone (position bases, reshape dims)
-            // cannot masquerade as a window.
-            if v.len() == 1
-                && (v.datum_type().is_integer() || v.datum_type() == DatumType::TDim)
-                && feeds_comparison_within(model, id, 2)
-                && let Ok(x) = v.cast_to::<i64>()
-                && let Ok(x) = x.try_as_plain_ram()
-                && let Ok(x) = x.as_slice::<i64>()
-            {
-                let w = x[0].unsigned_abs();
-                if (2..=1_000_000).contains(&w) {
-                    candidates.push(w as u32);
-                }
-            }
-        }
-        for input in &n.inputs {
-            stack.push(input.node);
-        }
-    }
-    if debug {
-        eprintln!(
-            "fused-sdpa fuse: window candidates {candidates:?} for mask node {}",
-            mask_outlet.node
-        );
-    }
-    match candidates.as_slice() {
-        [w] => *w,
-        [] => 0,
-        many => {
-            // Ambiguous: refuse to clamp rather than risk wrong semantics.
-            eprintln!(
-                "fused-sdpa fuse: mask subgraph has several window-like constants {many:?}; not clamping"
-            );
-            0
-        }
-    }
-}
-
-/// True when `node`'s output reaches a comparison op (LT/GT/LTE/GTE/Eq/NE)
-/// within `depth` successor hops. Window masks compare shifted positions
-/// against the window constant, possibly through one arithmetic hop.
-fn feeds_comparison_within(model: &TypedModel, node: usize, depth: usize) -> bool {
-    let successors: Vec<usize> =
-        model.node(node).outputs.iter().flat_map(|o| o.successors.iter().map(|s| s.node)).collect();
-    successors.iter().any(|succ| {
-        model
-            .node(*succ)
-            .op_as::<TypedBinOp>()
-            .is_some_and(|b| matches!(b.0.name(), "LT" | "GT" | "LTE" | "GTE" | "Eq" | "NE"))
-            || (depth > 1 && feeds_comparison_within(model, *succ, depth - 1))
-    })
-}
-
 pub fn fuse_sdpa_rule(
     _ctx: &(),
     model: &TypedModel,
@@ -590,7 +418,10 @@ pub fn fuse_sdpa_rule(
     node_name: &str,
     _softmax: &Softmax,
 ) -> TractResult<Option<TypedModelPatch>> {
-    // ---- variant detection at the softmax input ----
+    let rank = model.outlet_fact(node.inputs[0])?.rank();
+    rule_if!(rank > 0);
+    rule_if!(_softmax.kind == tract_nnef::tract_core::ops::nn::SoftmaxKind::Softmax);
+    rule_if!(_softmax.axes == tvec![rank - 1]);
     // GPT-OSS: Softmax(Sub(Concat([logits, sinks]), Reduce<Max>(same Concat)))
     // Plain:   Softmax(Add(logits, mask))
     let sm_in = prev(model, node, 0);
@@ -601,7 +432,9 @@ pub fn fuse_sdpa_rule(
         if cat.inputs.len() != 2 || concat.axis != cat.outputs[0].fact.rank() - 1 {
             return Ok(None);
         }
-        if !mx.op_as::<Reduce>().is_some_and(|r| r.reducer == Reducer::Max)
+        if !mx
+            .op_as::<Reduce>()
+            .is_some_and(|r| r.reducer == Reducer::Max && r.axes == tvec![rank - 1])
             || mx.inputs[0] != sm_in.inputs[0]
         {
             return Ok(None);
@@ -621,9 +454,6 @@ pub fn fuse_sdpa_rule(
     };
     let has_sinks = sinks_tensor.is_some();
 
-    // ---- shared upstream: Add(mask) <- [Cast(f32)] <- Mul(scale) <- QK ----
-    // The cast exists when the QK einsum ran in f16 (GPT-OSS, Qwen3.5, OLMoE);
-    // einsum-in-f32 exports (Granite) go Mul -> Add directly.
     if !is_bin(mask_add, "Add") {
         return Ok(None);
     }
@@ -645,15 +475,9 @@ pub fn fuse_sdpa_rule(
     let scale_k = prev(model, scale_mul, scale_slot).op_as::<Const>().unwrap();
     let scale = scale_k.val().cast_to::<f32>()?.try_as_plain_ram()?.as_slice::<f32>()?[0];
 
-    // ---- QK branches: rope-split exports sum two dim-range einsums ----
     let qk_root = prev(model, scale_mul, 1 - scale_slot);
-    // Exports that upcast q/k to f32 for the QK matmul (Granite: q max ~73,
-    // k max ~214, dots way past f16 max 65504) rely on f32 logits; device
-    // runtimes compute scores in f16 and NaN out on them. Detected here so
-    // the patch can fold the softmax scale into q up front: post-scale
-    // logits are softmax-sized, so f16 scores are safe again. f16-QK
-    // exports are left untouched (bit-faithful to their own graph).
     let qk_f32 = model.outlet_fact(scale_mul.inputs[1 - scale_slot])?.datum_type == DatumType::F32;
+    rule_if!(!qk_f32);
     let mut branches: Vec<(OutletId, usize, i64)> = vec![];
     if is_bin(qk_root, "Add") {
         for slot in 0..2 {
@@ -687,19 +511,16 @@ pub fn fuse_sdpa_rule(
     let Ok(hkv) = k_fact.shape[1].to_usize() else { return Ok(None) };
     let Ok(d) = k_fact.shape[3].to_usize() else { return Ok(None) };
 
-    // ---- downstream: [drop sink slice], cast, probs reshape, AV einsum ----
     let mut cursor = node;
     if has_sinks {
         let Some(drop_sink) = single_consumer(model, cursor) else { return Ok(None) };
-        if drop_sink.op_as::<Slice>().is_none() {
-            return Ok(None);
-        }
+        rule_if_some!(slice = drop_sink.op_as::<Slice>());
+        rule_if!(slice.axis == rank - 1 && slice.start == 0.to_dim());
+        rule_if!(slice.end == model.outlet_fact(mask_outlet)?.shape[rank - 1]);
         cursor = drop_sink;
     }
     let Some(cast_f16) = single_consumer(model, cursor) else { return Ok(None) };
-    if cast_f16.op_as::<Cast>().is_none() {
-        return Ok(None);
-    }
+    rule_if!(cast_f16.op_as::<Cast>().is_some_and(|cast| cast.to == DatumType::F16));
     let Some(after_cast) = single_consumer(model, cast_f16) else { return Ok(None) };
     let (group, av) = if after_cast.op_is::<AxisOp>() {
         // GQA: probs fold to [Hkv, G, S, T], the head split pins hkv/group.
@@ -726,6 +547,7 @@ pub fn fuse_sdpa_rule(
         (1, after_cast)
     };
     let hq = hkv * group;
+    rule_if!(branches.len() == 1);
     if av.op_as::<EinSum>().is_none() || av.inputs.len() != 2 {
         return Ok(None);
     }
@@ -749,9 +571,6 @@ pub fn fuse_sdpa_rule(
         return Ok(None);
     }
 
-    // ---- q parts: normalize each to [1, Hq, S, d_part] and check coverage ----
-    // Parts appear either head-major [1,Hq,S,d] or seq-major [1,S,Hq,d]; S is
-    // symbolic at fuse time so matching Hq against a concrete dim is safe.
     enum Layout {
         HeadMajor,
         SeqMajor,
@@ -825,7 +644,6 @@ pub fn fuse_sdpa_rule(
     };
     let Some(av_layout) = av_layout else { return Ok(None) };
 
-    // ---- build the patch ----
     let mut patch = TypedModelPatch::new(format!("fuse-sdpa-inplace-kv @ {node_name}"));
     let mut q_parts: Vec<OutletId> = vec![];
     for (i, (outlet, layout, _)) in parts.iter().enumerate() {
@@ -845,32 +663,13 @@ pub fn fuse_sdpa_rule(
     } else {
         patch.wire_node(format!("{node_name}.q"), TypedConcat { axis: 3 }, &q_parts)?[0]
     };
-    // f32-QK exports: fold the softmax scale into q (see `qk_f32` above) so
-    // f16 device scores stay in range; the op then runs with scale 1. In q's
-    // dtype the fold is exact for power-of-two scales (Granite: 2^-6); any
-    // residual rounding is at f16 epsilon, far below the f16 QK rounding the
-    // other exports already live with.
-    let (q, op_scale) = if qk_f32 {
-        let q_dt = patch.outlet_fact(q)?.datum_type;
-        let scale_t = tensor0(scale).cast_to_dt(q_dt)?.into_owned().broadcast_into_rank(4)?;
-        let scale_c =
-            patch.add_const(format!("{node_name}.q_prescale"), scale_t.into_arc_tensor())?;
-        let scaled = patch.wire_node(
-            format!("{node_name}.q_prescaled"),
-            TypedBinOp(Box::new(Mul), None),
-            &[q, scale_c],
-        )?[0];
-        (scaled, 1f32)
-    } else {
-        (q, scale)
-    };
 
     let k_new_t = patch.tap_model(model, k_new)?;
     let v_new_t = patch.tap_model(model, v_new)?;
     let k_cache_t = patch.tap_model(model, k_cache)?;
     let v_cache_t = patch.tap_model(model, v_cache)?;
     let mask_t = patch.tap_model(model, mask_outlet)?;
-    let window = extract_sliding_window(model, mask_outlet);
+    let window = 0;
     let mut op_inputs = tvec!(q, k_new_t, v_new_t, k_cache_t, v_cache_t, mask_t);
     if let Some(sinks) = sinks_tensor {
         op_inputs.push(patch.add_const(format!("{node_name}.sinks"), sinks)?);
@@ -878,7 +677,7 @@ pub fn fuse_sdpa_rule(
 
     let fused = patch.wire_node(
         format!("{node_name}.fused_sdpa"),
-        FusedSdpa { scale_bits: op_scale.to_bits(), window, has_sinks },
+        FusedSdpa { scale_bits: scale.to_bits(), window, has_sinks },
         &op_inputs,
     )?;
 
@@ -916,320 +715,4 @@ pub fn fuse_sdpa_rule(
     patch.shunt_outside(model, k_out_outlet, fused[1])?;
     patch.shunt_outside(model, v_out_outlet, fused[2])?;
     Ok(Some(patch))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tract_nnef::tract_ndarray::Array4;
-
-    fn rng_tensor(shape: &[usize], seed: &mut u64) -> Tensor {
-        let n: usize = shape.iter().product();
-        let data: Vec<f32> = (0..n)
-            .map(|_| {
-                *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-                ((*seed >> 33) as f32 / (1u64 << 31) as f32) - 1.0
-            })
-            .collect();
-        Tensor::from_shape(shape, &data).unwrap()
-    }
-
-    /// Reference: literally the exported subgraph math.
-    /// softmax(concat([QK*scale + mask, sinks?]))[..,:kv] @ V, with GQA expand.
-    fn reference(
-        q: &Tensor,
-        k_all: &Tensor,
-        v_all: &Tensor,
-        mask: &Tensor,
-        sinks: Option<&[f32]>,
-        scale: f32,
-    ) -> Tensor {
-        let q = q.to_plain_array_view::<f32>().unwrap().into_dimensionality::<Ix4>().unwrap();
-        let k = k_all.to_plain_array_view::<f32>().unwrap().into_dimensionality::<Ix4>().unwrap();
-        let v = v_all.to_plain_array_view::<f32>().unwrap().into_dimensionality::<Ix4>().unwrap();
-        let mask = mask.to_plain_array_view::<f32>().unwrap().into_dimensionality::<Ix4>().unwrap();
-        let (b_sz, hq, s_len, d) = q.dim();
-        let group = hq / k.dim().1;
-        let kv_len = k.dim().2;
-        let mut out = Array4::<f32>::zeros((b_sz, hq, s_len, d));
-        for b in 0..b_sz {
-            for h in 0..hq {
-                for i in 0..s_len {
-                    let mut logits: Vec<f32> = (0..kv_len)
-                        .map(|j| {
-                            let mut acc = 0f32;
-                            for x in 0..d {
-                                acc += q[(b, h, i, x)] * k[(b, h / group, j, x)];
-                            }
-                            acc * scale + mask[(0, 0, i, j)]
-                        })
-                        .collect();
-                    if let Some(sinks) = sinks {
-                        logits.push(sinks[h]);
-                    }
-                    let m = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                    let exps: Vec<f32> = logits.iter().map(|l| (l - m).exp()).collect();
-                    let den: f32 = exps.iter().sum();
-                    for x in 0..d {
-                        let mut acc = 0f32;
-                        for j in 0..kv_len {
-                            acc += exps[j] / den * v[(b, h / group, j, x)];
-                        }
-                        out[(b, h, i, x)] = acc;
-                    }
-                }
-            }
-        }
-        out.into_tensor()
-    }
-
-    fn causal_mask(s_len: usize, kv_len: usize) -> Tensor {
-        let past = kv_len - s_len;
-        let mut m = Array4::<f32>::zeros((1, 1, s_len, kv_len));
-        for i in 0..s_len {
-            for j in 0..kv_len {
-                if j > past + i {
-                    m[(0, 0, i, j)] = f32::MIN;
-                }
-            }
-        }
-        m.into_tensor()
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn run_state(
-        state: &mut FusedSdpaState,
-        op: &FusedSdpa,
-        q: &Tensor,
-        k_new: &Tensor,
-        v_new: &Tensor,
-        k_cache: &Tensor,
-        v_cache: &Tensor,
-        mask: &Tensor,
-        sinks: Option<&Tensor>,
-    ) -> TVec<TValue> {
-        let ctx = EvalContext::out_of_plan();
-        let mut inputs = tvec!(
-            q.clone().into_tvalue(),
-            k_new.clone().into_tvalue(),
-            v_new.clone().into_tvalue(),
-            k_cache.clone().into_tvalue(),
-            v_cache.clone().into_tvalue(),
-            mask.clone().into_tvalue(),
-        );
-        if let Some(sinks) = sinks {
-            inputs.push(sinks.clone().into_tvalue());
-        }
-        state.eval(&ctx, op, inputs).unwrap()
-    }
-
-    fn state_for(op: &FusedSdpa) -> FusedSdpaState {
-        FusedSdpaState {
-            scale: op.scale(),
-            has_sinks: op.has_sinks,
-            k: InPlaceKvCache::new(SEQ_AXIS),
-            v: InPlaceKvCache::new(SEQ_AXIS),
-        }
-    }
-
-    fn run_reference_check(hq: usize, hkv: usize, d: usize, with_sinks: bool) -> TractResult<()> {
-        let scale = (d as f32).sqrt().recip();
-        let op = FusedSdpa { scale_bits: scale.to_bits(), window: 0, has_sinks: with_sinks };
-        let mut state = state_for(&op);
-        let mut seed = 42u64;
-        let sinks_t = with_sinks.then(|| rng_tensor(&[hq], &mut seed));
-        let sinks: Option<Vec<f32>> = sinks_t
-            .as_ref()
-            .map(|t| t.try_as_plain_ram().unwrap().as_slice::<f32>().unwrap().to_vec());
-
-        // Accumulated "external" cache, grown the reference way.
-        let mut k_all = Tensor::zero::<f32>(&[1, hkv, 0, d])?;
-        let mut v_all = Tensor::zero::<f32>(&[1, hkv, 0, d])?;
-
-        for step_len in [5usize, 1, 1, 3, 1] {
-            let past = k_all.shape()[SEQ_AXIS];
-            let q = rng_tensor(&[1, hq, step_len, d], &mut seed);
-            let k_new = rng_tensor(&[1, hkv, step_len, d], &mut seed);
-            let v_new = rng_tensor(&[1, hkv, step_len, d], &mut seed);
-            let mask = causal_mask(step_len, past + step_len);
-
-            let outputs = run_state(
-                &mut state,
-                &op,
-                &q,
-                &k_new,
-                &v_new,
-                &k_all,
-                &v_all,
-                &mask,
-                sinks_t.as_ref(),
-            );
-
-            // Reference over the full concatenated cache.
-            let k_ref = Tensor::stack_tensors(SEQ_AXIS, &[&k_all, &k_new])?;
-            let v_ref = Tensor::stack_tensors(SEQ_AXIS, &[&v_all, &v_new])?;
-            let want = reference(&q, &k_ref, &v_ref, &mask, sinks.as_deref(), scale);
-            outputs[0].clone().into_tensor().close_enough(&want, Approximation::Approximate)?;
-            outputs[1].clone().into_tensor().close_enough(&k_ref, Approximation::Exact)?;
-            outputs[2].clone().into_tensor().close_enough(&v_ref, Approximation::Exact)?;
-            k_all = k_ref;
-            v_all = v_ref;
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn matches_reference_over_prefill_and_decode_with_sinks() -> TractResult<()> {
-        run_reference_check(4, 2, 8, true)
-    }
-
-    #[test]
-    fn matches_reference_no_sinks() -> TractResult<()> {
-        run_reference_check(4, 2, 8, false)
-    }
-
-    /// Qwen3.5-35B full-attention geometry: head_dim 256, GQA 16q/2kv, no
-    /// sinks, no window.
-    #[test]
-    fn matches_reference_qwen35_geometry() -> TractResult<()> {
-        run_reference_check(16, 2, 256, false)
-    }
-
-    /// Granite 3.0 MoE geometry: head_dim 64, GQA 16q/8kv, no sinks.
-    #[test]
-    fn matches_reference_granite_geometry() -> TractResult<()> {
-        run_reference_check(16, 8, 64, false)
-    }
-
-    /// OLMoE geometry: MHA 16q/16kv (group 1), head_dim 128, no sinks.
-    #[test]
-    fn matches_reference_olmoe_geometry() -> TractResult<()> {
-        run_reference_check(16, 16, 128, false)
-    }
-
-    #[test]
-    fn rebuilds_state_on_cache_mismatch() -> TractResult<()> {
-        let (hq, hkv, d) = (2, 1, 4);
-        let scale = 0.5f32;
-        let op = FusedSdpa { scale_bits: scale.to_bits(), window: 0, has_sinks: true };
-        let mut state = state_for(&op);
-        let mut seed = 7u64;
-        let sinks_t = rng_tensor(&[hq], &mut seed);
-        let sinks: Vec<f32> = sinks_t.try_as_plain_ram()?.as_slice::<f32>()?.to_vec();
-
-        // Prime the state with a 4-token pass.
-        let q0 = rng_tensor(&[1, hq, 4, d], &mut seed);
-        let k0 = rng_tensor(&[1, hkv, 4, d], &mut seed);
-        let v0 = rng_tensor(&[1, hkv, 4, d], &mut seed);
-        let empty_k = Tensor::zero::<f32>(&[1, hkv, 0, d])?;
-        let empty_v = Tensor::zero::<f32>(&[1, hkv, 0, d])?;
-        run_state(
-            &mut state,
-            &op,
-            &q0,
-            &k0,
-            &v0,
-            &empty_k,
-            &empty_v,
-            &causal_mask(4, 4),
-            Some(&sinks_t),
-        );
-
-        // Now pretend the caller truncated to 2 tokens (retry): the provided
-        // cache disagrees with state len 4 and must win.
-        let k_trunc = k0.slice(SEQ_AXIS, 0, 2)?;
-        let v_trunc = v0.slice(SEQ_AXIS, 0, 2)?;
-        let q1 = rng_tensor(&[1, hq, 1, d], &mut seed);
-        let k1 = rng_tensor(&[1, hkv, 1, d], &mut seed);
-        let v1 = rng_tensor(&[1, hkv, 1, d], &mut seed);
-        let mask = causal_mask(1, 3);
-        let outputs =
-            run_state(&mut state, &op, &q1, &k1, &v1, &k_trunc, &v_trunc, &mask, Some(&sinks_t));
-
-        let k_ref = Tensor::stack_tensors(SEQ_AXIS, &[&k_trunc, &k1])?;
-        let v_ref = Tensor::stack_tensors(SEQ_AXIS, &[&v_trunc, &v1])?;
-        let want = reference(&q1, &k_ref, &v_ref, &mask, Some(&sinks), scale);
-        outputs[0].clone().into_tensor().close_enough(&want, Approximation::Approximate)?;
-        outputs[1].clone().into_tensor().close_enough(&k_ref, Approximation::Exact)?;
-        Ok(())
-    }
-
-    /// NNEF ser/de round-trip, both variants: the dump must carry the generic
-    /// primitive name (never the legacy GPT-OSS one) and reload to the same op.
-    #[test]
-    fn nnef_round_trip_emits_generic_name() -> TractResult<()> {
-        use crate::WithTractTransformers;
-        for has_sinks in [false, true] {
-            let (hq, hkv, d) = (4usize, 2usize, 8usize);
-            let mut model = TypedModel::default();
-            let s = model.sym("S");
-            let p = model.sym("P");
-            let q_f: TVec<TDim> = tvec![1.to_dim(), hq.to_dim(), s.clone().into(), d.to_dim()];
-            let new_f: TVec<TDim> = tvec![1.to_dim(), hkv.to_dim(), s.clone().into(), d.to_dim()];
-            let cache_f: TVec<TDim> = tvec![1.to_dim(), hkv.to_dim(), p.clone().into(), d.to_dim()];
-            let mask_f: TVec<TDim> = tvec![
-                1.to_dim(),
-                1.to_dim(),
-                s.clone().into(),
-                TDim::from(s.clone()) + TDim::from(p.clone())
-            ];
-            let q = model.add_source("q", f32::fact(&q_f))?;
-            let k_new = model.add_source("k_new", f32::fact(&new_f))?;
-            let v_new = model.add_source("v_new", f32::fact(&new_f))?;
-            let k_cache = model.add_source("k_cache", f32::fact(&cache_f))?;
-            let v_cache = model.add_source("v_cache", f32::fact(&cache_f))?;
-            let mask = model.add_source("mask", f32::fact(&mask_f))?;
-            let mut inputs = tvec!(q, k_new, v_new, k_cache, v_cache, mask);
-            if has_sinks {
-                inputs.push(model.add_const("sinks", Tensor::zero::<f32>(&[hq])?)?);
-            }
-            let op = FusedSdpa { scale_bits: 0.125f32.to_bits(), window: 128, has_sinks };
-            let out = model.wire_node("sdpa", op.clone(), &inputs)?;
-            model.select_output_outlets(&out)?;
-
-            let nnef = tract_nnef::nnef().with_tract_transformers();
-            let mut buffer = vec![];
-            nnef.write_to_tar(&model, &mut buffer)?;
-            let text = String::from_utf8_lossy(&buffer);
-            assert!(
-                text.contains("tract_transformers_fused_sdpa"),
-                "dump (has_sinks={has_sinks}) must use the generic primitive name"
-            );
-            assert!(
-                !text.contains("tract_transformers_gpt_oss_sdpa"),
-                "dump (has_sinks={has_sinks}) must not use the legacy primitive name"
-            );
-
-            let reloaded = nnef.model_for_read(&mut &*buffer)?;
-            let n = reloaded
-                .nodes()
-                .iter()
-                .find(|n| n.op_is::<FusedSdpa>())
-                .context("FusedSdpa survived the round-trip")?;
-            assert_eq!(n.op_as::<FusedSdpa>().unwrap(), &op);
-
-            // The legacy name still loads (existing GPT-OSS dumps): rewrite
-            // the graph text on disk and reload through the alias.
-            if has_sinks {
-                use tract_nnef::tract_core::framework::Framework;
-                let dir = std::env::temp_dir()
-                    .join(format!("tract_fused_sdpa_legacy_alias_{}", std::process::id()));
-                let _ = std::fs::remove_dir_all(&dir);
-                nnef.write_to_dir(&model, &dir)?;
-                let graph = dir.join("graph.nnef");
-                let legacy = std::fs::read_to_string(&graph)?
-                    .replace("tract_transformers_fused_sdpa", "tract_transformers_gpt_oss_sdpa");
-                std::fs::write(&graph, legacy)?;
-                let reloaded = nnef.model_for_path(&dir)?;
-                std::fs::remove_dir_all(&dir)?;
-                let n = reloaded
-                    .nodes()
-                    .iter()
-                    .find(|n| n.op_is::<FusedSdpa>())
-                    .context("FusedSdpa loaded through the legacy alias")?;
-                assert_eq!(n.op_as::<FusedSdpa>().unwrap(), &op);
-            }
-        }
-        Ok(())
-    }
 }

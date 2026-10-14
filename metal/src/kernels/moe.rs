@@ -284,7 +284,8 @@ pub fn dispatch_routed_bias_add_f32(
     });
     Ok(())
 }
-pub fn dispatch_kv_quantize_q8_0(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_kv_quantize_q8_0(
     stream: &MetalStream,
     src: &DeviceTensor,
     dst: &DeviceTensor,
@@ -349,7 +350,7 @@ pub fn dispatch_sum_chunks_f16(
         encoder.set_slice(2, &[heads as u32]);
         encoder.set_slice(3, &[chunks as u32]);
         encoder.set_slice(4, &[plane as u32]);
-        let group_width = (total as u64).min(256).max(1);
+        let group_width = (total as u64).clamp(1, 256);
         let grid = MTLSize { width: (total as u64).div_ceil(group_width), height: 1, depth: 1 };
         let group = MTLSize { width: group_width, height: 1, depth: 1 };
         encoder.dispatch_thread_groups(grid, group);
@@ -383,7 +384,8 @@ pub fn flash_attn_scratch_len(hq: usize, s_len: usize, t_len: usize, d: usize) -
 
 const FLASH_SG: usize = 8;
 
-pub fn dispatch_fused_sdpa_flash_attn_f16(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_fused_sdpa_flash_attn_f16(
     stream: &MetalStream,
     q: &DeviceTensor,
     k: &DeviceTensor,
@@ -503,7 +505,8 @@ pub struct FlashAttnDims {
     pub v_seq_stride: usize,
 }
 
-pub fn dispatch_sinks_softmax_f16(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_sinks_softmax_f16(
     stream: &MetalStream,
     scores: &DeviceTensor,
     mask: &DeviceTensor,
@@ -532,11 +535,11 @@ pub fn dispatch_sinks_softmax_f16(
     ensure!(mask_off + t_len <= mask_stride || s_len == 1 && mask_off + t_len <= mask.len());
     let rows = scores.len() / row_stride;
     ensure!(probs.len() == scores.len());
-    ensure!(rows % s_len == 0, "rows {rows} not a multiple of s_len {s_len}");
+    ensure!(rows.is_multiple_of(s_len), "rows {rows} not a multiple of s_len {s_len}");
     ensure!(mask.len() >= s_len * t_len, "mask too small");
 
     let pipeline = stream.load_pipeline(LibraryName::MoeOps, "sinks_softmax_f16")?;
-    let group_width = (pipeline.max_total_threads_per_threadgroup() as u64).min(256);
+    let group_width = pipeline.max_total_threads_per_threadgroup().min(256);
     let command_buffer = stream.command_buffer();
     command_buffer.encode(|encoder| {
         encoder.set_compute_pipeline_state(&pipeline);
@@ -589,7 +592,7 @@ pub fn dispatch_sdpa_prefill_block_softmax_f16(
     ensure!(mask.len() >= (s_len - 1) * mask_stride + mask_off + bt, "mask too small");
 
     let pipeline = stream.load_pipeline(LibraryName::MoeOps, "sdpa_prefill_block_softmax_f16")?;
-    let group_width = (pipeline.max_total_threads_per_threadgroup() as u64).min(256);
+    let group_width = pipeline.max_total_threads_per_threadgroup().min(256);
     let command_buffer = stream.command_buffer();
     command_buffer.encode(|encoder| {
         encoder.set_compute_pipeline_state(&pipeline);

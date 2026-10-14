@@ -66,11 +66,6 @@ pub(crate) fn profile_kernels() -> bool {
     *V.get_or_init(|| std::env::var_os("TRACT_METAL_PROFILE_KERNELS").is_some())
 }
 
-pub(crate) fn log_gpu_time() -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var_os("TRACT_METAL_LOG_GPU_TIME").is_some())
-}
-
 /// Record kernel names per command buffer WITHOUT the per-kernel buffer
 /// split TRACT_METAL_PROFILE_KERNELS forces: gpu-time segment lines then
 /// show each real buffer's kernel composition (who requested the boundary).
@@ -634,27 +629,13 @@ impl MetalStream {
             .to_owned()
     }
 
-    fn log_gpu_time(buffer: &TCommandBuffer, tag: &str) {
-        Self::log_gpu_time_named(buffer, tag, &[]);
+    fn log_final_command(buffer: &TCommandBuffer, tag: &str) {
+        Self::log_completed_kernels(buffer, tag, &[]);
     }
 
-    #[allow(unexpected_cfgs)]
-    fn log_gpu_time_named(buffer: &TCommandBuffer, tag: &str, names: &[String]) {
-        if log_gpu_time() || profile_kernels() || log_buffer_kernels() {
-            // metal-rs does not wrap GPUStartTime/GPUEndTime; go through objc.
-            use objc::{msg_send, sel, sel_impl};
-            let raw: &metal::CommandBufferRef = buffer;
-            let start: f64 = unsafe { msg_send![raw, GPUStartTime] };
-            let end: f64 = unsafe { msg_send![raw, GPUEndTime] };
-            let ksched: f64 = unsafe { msg_send![raw, kernelStartTime] };
-            let kend: f64 = unsafe { msg_send![raw, kernelEndTime] };
-            let label =
-                if names.is_empty() { String::new() } else { format!(" [{}]", names.join("+")) };
-            eprintln!(
-                "gpu-time {tag}{label}: {:.3} ms (sched {:.3} ms, gpu_start {start:.6}, gpu_end {end:.6})",
-                (end - start) * 1e3,
-                (kend - ksched) * 1e3
-            );
+    fn log_completed_kernels(_buffer: &TCommandBuffer, tag: &str, names: &[String]) {
+        if profile_kernels() || log_buffer_kernels() {
+            log::debug!("completed Metal command buffer {tag}: {names:?}");
         }
     }
 
@@ -711,7 +692,7 @@ impl MetalStream {
             }
             let oldest = committed.pop_front().unwrap();
             oldest.buffer.wait_until_completed();
-            Self::log_gpu_time_named(&oldest.buffer, "segment", &oldest.kernel_names);
+            Self::log_completed_kernels(&oldest.buffer, "segment", &oldest.kernel_names);
             for (host, buffer) in oldest.recycle {
                 self.context.pool_put(host, buffer);
             }
@@ -750,7 +731,7 @@ impl MetalStream {
                 newest.buffer.wait_until_completed();
             }
             for entry in &drained {
-                Self::log_gpu_time_named(&entry.buffer, "segment-tail", &entry.kernel_names);
+                Self::log_completed_kernels(&entry.buffer, "segment-tail", &entry.kernel_names);
             }
             for entry in drained {
                 for (host, buffer) in entry.recycle {
@@ -777,7 +758,7 @@ impl MetalStream {
         command_buffer.commit();
         log::trace!("Command buffer {:?} commit", command_buffer_id);
         command_buffer.wait_until_completed();
-        Self::log_gpu_time(&command_buffer, "final");
+        Self::log_final_command(&command_buffer, "final");
         log::trace!("Command buffer {:?} has completed (Blocking call)", command_buffer_id);
 
         // The queue is FIFO: the buffer above completing implies every buffer

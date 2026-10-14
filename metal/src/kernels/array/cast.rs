@@ -80,9 +80,8 @@ impl Cast {
         if total == 0 {
             return Ok(());
         }
-        let mut group_width =
-            (pipeline.max_total_threads_per_threadgroup() as u64).min(256).min(total);
-        while total % group_width != 0 {
+        let mut group_width = pipeline.max_total_threads_per_threadgroup().min(256).min(total);
+        while !total.is_multiple_of(group_width) {
             group_width -= 1;
         }
         let grid_width = total / group_width;

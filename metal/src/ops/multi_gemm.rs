@@ -119,7 +119,7 @@ impl EvalOp for MetalMultiGemm {
         let rank = x.rank();
         ensure!(rank >= 2);
         let k = x.shape()[rank - 1];
-        let rows = if k == 0 { 0 } else { x.len() / k };
+        let rows = x.len().checked_div(k).unwrap_or(0);
         let dt = x.datum_type();
         let w_dt = w.datum_type();
         let q40 = get_quant_fact(w, &Q4_0).is_some();

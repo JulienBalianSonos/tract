@@ -7,8 +7,7 @@
 //! time (the same candidate sets as the offline `tune_decode` sweep), and
 //! adopts winners in memory for the process. Opt in with
 //! `TRACT_METAL_AUTOTUNE=1` or [`crate::tuning::set_autotune`]`(true)`;
-//! opted out, nothing here runs and the profile freezes at its first read,
-//! exactly the historical behavior.
+//! opted out, nothing here runs and the profile freezes at its first read.
 //!
 //! The probe is budget-capped (`TRACT_METAL_AUTOTUNE_BUDGET_MS`, default
 //! 10 s) and self-limits to fit: it sizes the per-candidate iteration count
@@ -35,9 +34,7 @@
 //! (non-copy dtypes, exotic facts, dims that do not resolve), the probe is
 //! skipped with a single warning; it never guesses into a crash.
 //!
-//! Winners live and die with the process: the probe never reads or writes
-//! any file (some target systems have read-only disks), and at ~1-2 s on a
-//! 35B-class model there is nothing worth persisting.
+//! Winners remain in memory for the lifetime of the process.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -243,18 +240,6 @@ fn probe(plan: &Arc<TypedSimplePlan>, resolved: MetalTuning) -> TractResult<Meta
     // the guard cannot attribute a mismatch to a knob and stands down (the
     // scheduling knobs are still safe to tune on timings alone).
     //
-    // HISTORY (2026-08-12, qwen3.5-35B on M4 Pro): this pre-check caught a
-    // real race: transient (host, MTLBuffer) pairs were recycled into the
-    // buffer pool at host-drop time, while a committed-but-incomplete
-    // command buffer could still reference them (retention could be filed
-    // one buffer early when a cadence commit fired inside `command_buffer()`
-    // between a kernel's retains and its encode). At in-flight depth 2 that
-    // recycled buffers under in-flight GPU work: 5/20 identical runs dirty
-    // (logits included); depth 8 masked it. Fixed by deferring pool
-    // recycling to command-buffer completion (see `BufferPoolGuard`); both
-    // depths then measure 0/60 dirty. The pre-check stays as the regression
-    // tripwire; TRACT_METAL_DETERMINISM_PAIRS=N loops it for rate
-    // measurements.
     let reference = match host_bytes(&run_once(&mut state, &inputs)?) {
         None => {
             log::warn!(

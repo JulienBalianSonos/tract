@@ -47,15 +47,15 @@ fn neon_mmv_f32(suitable: &[Suitable], query: &Query) -> Option<&'static str> {
             Some(m) if m < 32 => {
                 cortex_a7_mmv_linear::linear_model().preferred(suitable, Some(m), query.k, Some(1))
             }
-            _ => Some(&armv7neon::armv7neon_mmm_f32_32x1_cortexa7.name.as_str()),
+            _ => Some(armv7neon::armv7neon_mmm_f32_32x1_cortexa7.name.as_str()),
         },
         0xc09 => match query.m {
             Some(m) if m < 32 => {
                 cortex_a9_mmv_linear::linear_model().preferred(suitable, Some(m), query.k, Some(1))
             }
-            _ => Some(&armv7neon::armv7neon_mmm_f32_32x1_cortexa9.name.as_str()),
+            _ => Some(armv7neon::armv7neon_mmm_f32_32x1_cortexa9.name.as_str()),
         },
-        _ => Some(&armv7neon::armv7neon_mmm_f32_32x1_generic.name.as_str()),
+        _ => Some(armv7neon::armv7neon_mmm_f32_32x1_generic.name.as_str()),
     }
 }
 
@@ -80,8 +80,8 @@ fn preferred(
     match (dt, query.n) {
         (DatumType::F32, Some(1)) => neon_mmv_f32(suitable, query),
         (DatumType::F32, _) => neon_mmm_f32(suitable, query),
-        (DatumType::I32, Some(1)) => Some(&armv7neon::armv7neon_mmm_i32_32x1.name.as_str()),
-        (DatumType::I32, _) => Some(&armv7neon::armv7neon_mmm_i32_8x4.name.as_str()),
+        (DatumType::I32, Some(1)) => Some(armv7neon::armv7neon_mmm_i32_32x1.name.as_str()),
+        (DatumType::I32, _) => Some(armv7neon::armv7neon_mmm_i32_8x4.name.as_str()),
         _ => None,
     }
 }

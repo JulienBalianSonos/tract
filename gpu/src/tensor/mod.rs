@@ -304,16 +304,16 @@ impl DeviceTensor {
                 if v.exotic_fact.is_some() {
                     return Ok(None);
                 }
+                let offset =
+                    v.offset_bytes.checked_add(offset_bytes).context("view offset overflow")?;
                 Ok(Some(
-                    DeviceView {
-                        buffer: Arc::clone(&v.buffer),
+                    DeviceView::from_owned(
+                        Arc::clone(&v.buffer),
                         dt,
-                        len: shape.iter().product(),
-                        shape: shape.into(),
-                        strides: natural,
-                        offset_bytes: v.offset_bytes + offset_bytes,
-                        exotic_fact: None,
-                    }
+                        shape.into(),
+                        natural,
+                        offset,
+                    )?
                     .into(),
                 ))
             }

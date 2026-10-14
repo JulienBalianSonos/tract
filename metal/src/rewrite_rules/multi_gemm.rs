@@ -129,7 +129,7 @@ fn candidate(
         WeightClass::Q40 => {
             !weight_first
                 && matches!(x_dt, DatumType::F16 | DatumType::F32)
-                && k % Q4_0.block_len() == 0
+                && k.is_multiple_of(Q4_0.block_len())
         }
         WeightClass::Plain(w_dt) => {
             if weight_first {
@@ -315,7 +315,7 @@ mod tests {
     fn add_q40_const(model: &mut TypedModel, name: &str, tensor: Tensor) -> TractResult<OutletId> {
         let shape = tensor.shape().to_vec();
         let k = *shape.last().context("Q40 tensor has no last axis")?;
-        ensure!(k % Q4_0.block_len() == 0);
+        ensure!(k.is_multiple_of(Q4_0.block_len()));
         let m: usize = shape[..shape.len() - 1].iter().product();
         let quant = Q4_0.quant_f32(tensor.try_as_plain_ram()?.as_slice::<f32>()?)?;
         let storage = BlockQuantStorage::new(Box::new(Q4_0), m, k, Arc::new(quant))?;

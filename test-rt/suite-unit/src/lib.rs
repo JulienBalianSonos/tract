@@ -18,6 +18,7 @@ pub mod conv_q;
 pub mod deconv;
 pub mod downsample;
 pub mod elmwise;
+pub mod fused_sdpa;
 pub mod gather_elements;
 pub mod gelu_approximate;
 pub mod matmul_q40;
@@ -51,6 +52,7 @@ pub fn suite() -> TractResult<TestSuite> {
     suite.add("apply_rope", apply_rope::suite()?);
     suite.add("gelu_approximate", gelu_approximate::suite()?);
     suite.add("scaled_masked_softmax", scaled_masked_softmax::suite()?);
+    suite.add("fused_sdpa", fused_sdpa::suite()?);
     suite.add("sdpa", sdpa::suite()?);
     suite.add("silu", silu::suite()?);
     suite.add("slice", slice::suite()?);

@@ -296,8 +296,7 @@ pub fn fuse_scaled_rms_norm_in_cast(
     rule_if!(matches!(cast_src_dt, DatumType::F16 | DatumType::F32));
     // Only fold WIDENING casts (f16 -> f32): those are exact, so removing
     // the cast node cannot change semantics. Folding a narrowing cast would
-    // delete a rounding step the source model may rely on (same invariant
-    // as bypass_device_downcast_roundtrip's synthetic gate).
+    // delete a rounding step required by the source model.
     let cast_to = cast_in.op_as::<Cast>().unwrap().to;
     rule_if!(cast_to.size_of() > cast_src_dt.size_of());
     let out_dt = op.out_dt.unwrap_or(node.outputs[0].fact.datum_type);

@@ -11,11 +11,6 @@ pub struct GpuCast {
     pub backend_name: &'static str,
     pub dispatch: DispatchCastFn,
     pub is_supported_dt: fn(DatumType) -> bool,
-    /// True for casts inserted by our own device lowering, false for casts
-    /// converted from the source graph. Only synthetic casts may be removed
-    /// by precision-roundtrip rewrites: a source-graph downcast's rounding
-    /// is model semantics.
-    pub synthetic: bool,
 }
 
 impl GpuCast {
@@ -25,19 +20,7 @@ impl GpuCast {
         dispatch: DispatchCastFn,
         is_supported_dt: fn(DatumType) -> bool,
     ) -> Option<Self> {
-        is_supported_dt(to).then_some(Self {
-            to,
-            backend_name,
-            dispatch,
-            is_supported_dt,
-            synthetic: false,
-        })
-    }
-
-    /// Mark this cast as inserted by the device lowering itself.
-    pub fn into_synthetic(mut self) -> Self {
-        self.synthetic = true;
-        self
+        is_supported_dt(to).then_some(Self { to, backend_name, dispatch, is_supported_dt })
     }
 
     pub fn is_supported_dt(&self, dt: DatumType) -> bool {
@@ -53,9 +36,7 @@ impl std::fmt::Debug for GpuCast {
 
 impl PartialEq for GpuCast {
     fn eq(&self, other: &Self) -> bool {
-        self.backend_name == other.backend_name
-            && self.to == other.to
-            && self.synthetic == other.synthetic
+        self.backend_name == other.backend_name && self.to == other.to
     }
 }
 
@@ -65,7 +46,6 @@ impl std::hash::Hash for GpuCast {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.backend_name.hash(state);
         self.to.hash(state);
-        self.synthetic.hash(state);
     }
 }
 

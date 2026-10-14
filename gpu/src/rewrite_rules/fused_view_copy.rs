@@ -10,7 +10,7 @@ fn view_step(node: &TypedNode) -> Option<ViewStep> {
         return Some(ViewStep::Slice(op.inner.clone()));
     }
     if let Some(op) = node.op_as::<GpuAxisOp>() {
-        return Some(ViewStep::Axis(op.inner.clone()));
+        return Some(ViewStep::Axis(Box::new(op.inner.clone())));
     }
     None
 }
@@ -59,9 +59,10 @@ pub fn fuse_view_copy_chain_at(
     // A chain of pure Add/Rm/Reshape is free once folded into a
     // single-output consumer; only take it when it contains a real copy
     // (slice or move) or when no consumer can fold it.
-    let has_real_copy = steps
-        .iter()
-        .any(|s| matches!(s, ViewStep::Slice(_)) || matches!(s, ViewStep::Axis(AxisOp::Move(..))));
+    let has_real_copy = steps.iter().any(|s| {
+        matches!(s, ViewStep::Slice(_))
+            || matches!(s, ViewStep::Axis(op) if matches!(op.as_ref(), AxisOp::Move(..)))
+    });
     if !has_real_copy {
         let outlet = OutletId::new(node.id, 0);
         let succs = model.outlet_successors(outlet);

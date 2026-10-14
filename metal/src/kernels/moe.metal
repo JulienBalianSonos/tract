@@ -379,7 +379,7 @@ constant bool FC_FUSE_MERGE [[function_constant(2)]];
                     sc += dot(float4(krow4[dim4]), q4[dim4]);
                 }
             }
-            sc = live ? sc * scale + mj : -INFINITY;
+            sc = live ? float(half(float(half(sc)) * scale)) + mj : -INFINITY;
             const float m_new = max(m[g], simd_max(sc));
             const float corr = exp(m[g] - m_new);
             const float p = live ? exp(sc - m_new) : 0.0f;
@@ -550,7 +550,7 @@ constant bool FC_FUSE_MERGE [[function_constant(2)]];
     // Pass 1: max of logits (sink included).
     float m = sink;
     for (uint j = lane; j < t_len; j += tptg) {
-        m = max(m, (float)srow[j] * scale + mrow_p[j]);
+        m = max(m, float(half(float(srow[j]) * scale)) + mrow_p[j]);
     }
     m = simd_max(m);
     if (simd_lane == 0) partials[simd_ix] = m;
@@ -566,7 +566,7 @@ constant bool FC_FUSE_MERGE [[function_constant(2)]];
     // Pass 2: denominator (sink seeds it).
     float den = 0.0f;
     for (uint j = lane; j < t_len; j += tptg) {
-        den += exp((float)srow[j] * scale + mrow_p[j] - m);
+        den += exp(float(half(float(srow[j]) * scale)) + mrow_p[j] - m);
     }
     den = simd_sum(den);
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -584,7 +584,7 @@ constant bool FC_FUSE_MERGE [[function_constant(2)]];
     // padding columns (row_stride > t_len, q8 block alignment) are zeroed so
     // padded-length consumers read exact zeros.
     for (uint j = lane; j < t_len; j += tptg) {
-        prow[j] = (half)(exp((float)srow[j] * scale + mrow_p[j] - m) / den);
+        prow[j] = (half)(exp(float(half(float(srow[j]) * scale)) + mrow_p[j] - m) / den);
     }
     for (uint j = t_len + lane; j < row_stride; j += tptg) {
         prow[j] = (half)0.0f;
@@ -642,7 +642,7 @@ constant bool FC_FUSE_MERGE [[function_constant(2)]];
     // Pass 1: block row max.
     float mb = -INFINITY;
     for (uint j = lane; j < bt; j += tptg) {
-        mb = max(mb, (float)srow[j] * scale + mrow_p[j]);
+        mb = max(mb, float(half(float(srow[j]) * scale)) + mrow_p[j]);
     }
     mb = simd_max(mb);
     if (simd_lane == 0) partials[simd_ix] = mb;
@@ -674,7 +674,7 @@ constant bool FC_FUSE_MERGE [[function_constant(2)]];
     // Pass 2: block denominator + probs relative to m_new.
     float den = 0.0f;
     for (uint j = lane; j < bt; j += tptg) {
-        const float p = exp((float)srow[j] * scale + mrow_p[j] - m_new);
+        const float p = exp(float(half(float(srow[j]) * scale)) + mrow_p[j] - m_new);
         prow[j] = (half)p;
         den += p;
     }

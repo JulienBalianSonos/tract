@@ -1,22 +1,10 @@
-//! Metal lowering of the generic fused attention (`FusedSdpa`): parametric
-//! head_dim and GQA ratio, optional sinks, optional sliding window.
+//! Metal attention with append-only, geometrically grown f16 K/V storage.
 //!
-//! The op-state owns device-resident K/V capacity buffers ([1, Hkv, cap, D]
-//! f16, geometric growth). Each step appends only the new rows (49 KB/token
-//! for gpt-oss-20b instead of the O(T) concat copy) and emits the caches as
-//! zero-copy strided views of the capacity buffer: appends only ever write
-//! past `len`, so views held by the caller stay valid; growth reallocates and
-//! the old buffer stays alive through the views' Arc.
-//!
-//! Sinks-less models (e.g. Qwen3.5 full-attention layers) reuse the sinks
-//! softmax/flash kernels with a per-head sink of -inf: `exp(-inf - m) = 0`
-//! contributes nothing to the denominator, which is exactly the plain masked
-//! softmax.
-//!
-//! Attention runs per kv-head on contiguous sub-views (each head's region of
-//! the capacity buffer is contiguous), so the standard GGML gemm kernels
-//! apply unchanged: QK gemm, the fused scale+mask+sinks softmax kernel, AV
-//! gemm.
+//! Batch size must be one, masks and sinks must be f32, and Q/K/V must be f16.
+//! History is skipped only when shape, strides, offset and buffer identity match
+//! the state's valid prefix. Replacements rebuild from caller-supplied tensors;
+//! cloned states own independent mutable storage. Output views retain storage
+//! and continuation writes only beyond their prefix. Q8 shadows are opt-in.
 
 use std::sync::Arc;
 
@@ -154,14 +142,12 @@ impl Op for MetalFusedSdpa {
 impl TypedOp for MetalFusedSdpa {
     fn output_facts(&self, inputs: &[&TypedFact]) -> TractResult<TVec<TypedFact>> {
         facts_to_device_facts(inputs, |facts| {
-            let (q, k_new, _v_new, k_cache, v_cache) =
-                (facts[0], facts[1], facts[2], facts[3], facts[4]);
-            let total = k_cache.shape[SEQ_AXIS].clone() + k_new.shape[SEQ_AXIS].clone();
-            let mut k_out = k_cache.without_value();
-            k_out.shape.set(SEQ_AXIS, total.clone());
-            let mut v_out = v_cache.without_value();
-            v_out.shape.set(SEQ_AXIS, total);
-            Ok(tvec!(q.without_value(), k_out, v_out))
+            FusedSdpa {
+                scale_bits: self.scale_bits,
+                window: self.window,
+                has_sinks: self.has_sinks,
+            }
+            .output_facts(facts)
         })
     }
     as_op!();
@@ -359,6 +345,16 @@ impl DeviceKvBuffer {
         Ok(())
     }
 
+    fn matches_prefix(&self, input: &DeviceTensor) -> bool {
+        self.buf.as_ref().is_some_and(|buffer| {
+            input.datum_type() == f16::datum_type()
+                && input.shape() == [1, self.hkv, self.len, self.d]
+                && input.strides() == self.logical_strides(self.cap).as_slice()
+                && input.buffer_offset::<usize>() == 0
+                && input.device_buffer_ptr() == buffer.device_buffer().ptr()
+        })
+    }
+
     fn reset(&mut self) {
         *self = if self.transposed { Self::transposed() } else { Self::default() };
     }
@@ -384,7 +380,7 @@ impl DeviceKvBuffer {
     /// (Re)quantize rows [from..len) of the f16 buffer into the shadow,
     /// (re)allocating it when missing or when `cap` changed underneath it.
     fn q8_update(&mut self, from: usize) -> TractResult<()> {
-        ensure!(self.d % Q8_BLOCK == 0 && self.cap % Q8_BLOCK == 0);
+        ensure!(self.d.is_multiple_of(Q8_BLOCK) && self.cap.is_multiple_of(Q8_BLOCK));
         let blocks = self.hkv * self.cap * self.d / Q8_BLOCK;
         let needed_bytes = blocks * Q8_BLOCK_BYTES;
         let mut from = from;
@@ -512,8 +508,9 @@ impl OpState for MetalFusedSdpaState {
         crate::with_metal_stream(|stream| stream.commit_current())?;
 
         // Continuation vs rebuild (fresh session / truncation / retry).
-        let prev_len = if past != self.k.len { 0 } else { self.k.len };
-        if past != self.k.len {
+        let continuation = self.k.matches_prefix(k_cache) && self.v.matches_prefix(v_cache);
+        let prev_len = if continuation { self.k.len } else { 0 };
+        if !continuation {
             if env_flag_with_legacy("TRACT_DEBUG_FUSED_SDPA_REBUILD", "TRACT_DEBUG_GPT_OSS_REBUILD")
             {
                 eprintln!("fused-sdpa-rebuild: past={past} k.len={} s_len={s_len}", self.k.len);
@@ -987,7 +984,6 @@ impl OpState for MetalFusedSdpaState {
                 window: self.window,
                 has_sinks: self.has_sinks,
             };
-            let mut cpu_state = tract_core::ops::EvalOp::state(&cpu_op, _ctx)?.unwrap();
             let host = |t: &DeviceTensor| -> TractResult<TValue> {
                 Ok(t.to_host()?.into_tensor().into_tvalue())
             };
@@ -1002,7 +998,7 @@ impl OpState for MetalFusedSdpaState {
             if self.has_sinks {
                 cpu_inputs.push(host(inputs[6].to_device_tensor()?)?);
             }
-            let cpu_out = cpu_state.eval(_ctx, &cpu_op, cpu_inputs)?;
+            let cpu_out = cpu_op.eval(_ctx, cpu_inputs)?;
             let metal_out = DeviceTensor::View(DeviceView::from_owned(
                 out.clone(),
                 f16::datum_type(),
@@ -1424,7 +1420,6 @@ mod tests {
         let cpu_op = CpuOp { scale_bits: scale.to_bits(), window: 0, has_sinks: true };
         let ctx = EvalContext::out_of_plan();
         let mut metal_state = op.state(&ctx)?.unwrap();
-        let mut cpu_state = EvalOp::state(&cpu_op, &ctx)?.unwrap();
 
         let mut seed = 43u64;
         let sinks = rng_tensor(&[hq], &mut seed);
@@ -1462,9 +1457,8 @@ mod tests {
                 rng_tensor(&[1, hkv, step_len, d], &mut seed).cast_to::<f16>()?.into_owned();
             let mask = window_mask(step_len, past + step_len, usize::MAX);
 
-            let cpu_out = cpu_state.eval(
+            let cpu_out = cpu_op.eval(
                 &ctx,
-                &cpu_op,
                 tvec!(
                     q.clone().into_tvalue(),
                     k_new.clone().into_tvalue(),
@@ -1547,7 +1541,6 @@ mod tests {
         let cpu_op = CpuOp { scale_bits: scale.to_bits(), window: 0, has_sinks: with_sinks };
         let ctx = EvalContext::out_of_plan();
         let mut metal_state = op.state(&ctx)?.unwrap();
-        let mut cpu_state = EvalOp::state(&cpu_op, &ctx)?.unwrap();
 
         let mut seed = 42u64;
         let sinks = with_sinks.then(|| rng_tensor(&[hq], &mut seed));
@@ -1583,7 +1576,7 @@ mod tests {
                 cpu_inputs.push(sinks.clone().into_tvalue());
                 metal_inputs.push(sinks.clone().into_device()?.into_tensor().into_tvalue());
             }
-            let cpu_out = cpu_state.eval(&ctx, &cpu_op, cpu_inputs)?;
+            let cpu_out = cpu_op.eval(&ctx, cpu_inputs)?;
             let metal_out = metal_state.eval(&ctx, &op, metal_inputs)?;
             crate::with_metal_stream(|stream| stream.wait_until_completed())?;
 

@@ -8,7 +8,7 @@ use crate::utils::facts_to_device_facts;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ViewStep {
     Slice(Slice),
-    Axis(AxisOp),
+    Axis(Box<AxisOp>),
 }
 
 /// A chain of layout ops (`GpuSlice` / `GpuAxisOp`) collapsed into a single
@@ -47,7 +47,7 @@ fn try_reshape_strides(
     old_strides: &[isize],
     new_shape: &[usize],
 ) -> Option<TVec<isize>> {
-    if old_shape.iter().any(|&d| d == 0) || new_shape.iter().any(|&d| d == 0) {
+    if old_shape.contains(&0) || new_shape.contains(&0) {
         return None;
     }
     let mut new_strides = vec![0isize; new_shape.len()];
@@ -108,9 +108,9 @@ struct View {
 }
 
 impl View {
-    fn contiguous(base: DeviceTensor) -> Self {
+    fn from_device(base: DeviceTensor) -> Self {
         let shape: TVec<usize> = base.shape().into();
-        let strides = Tensor::natural_strides(&shape);
+        let strides = base.strides().into();
         View { base, shape, strides, offset: 0 }
     }
 
@@ -150,7 +150,7 @@ impl EvalOp for GpuFusedViewCopy {
         let input_value = args_1!(inputs);
         let input = input_value.to_device_tensor()?;
         let dt = input.datum_type();
-        let mut view = View::contiguous(input.clone());
+        let mut view = View::from_device(input.clone());
 
         for step in &self.steps {
             match step {
@@ -166,43 +166,46 @@ impl EvalOp for GpuFusedViewCopy {
                     view.offset += start * view.strides[axis] as usize;
                     view.shape[axis] = end - start;
                 }
-                ViewStep::Axis(AxisOp::Move(from, to)) => {
-                    let d = view.shape.remove(*from);
-                    view.shape.insert(*to, d);
-                    let s = view.strides.remove(*from);
-                    view.strides.insert(*to, s);
-                }
-                ViewStep::Axis(AxisOp::Add(axis)) => {
-                    view.shape.insert(*axis, 1);
-                    view.strides.insert(*axis, 0);
-                }
-                ViewStep::Axis(AxisOp::Rm(axis)) => {
-                    ensure!(view.shape[*axis] == 1);
-                    view.shape.remove(*axis);
-                    view.strides.remove(*axis);
-                }
-                ViewStep::Axis(op @ AxisOp::Reshape(..)) => {
-                    let AxisOp::Reshape(skip, from, to) = op else { unreachable!() };
-                    let from: TVec<TDim> = from.iter().map(|d| d.eval(ctx.symbols)).collect();
-                    let to: TVec<TDim> = to.iter().map(|d| d.eval(ctx.symbols)).collect();
-                    let mut new_shape = view.shape.clone();
-                    AxisOp::Reshape(*skip, from, to).change_shape_array(&mut new_shape, false)?;
-                    match try_reshape_strides(&view.shape, &view.strides, &new_shape) {
-                        Some(strides) => {
-                            view.shape = new_shape;
-                            view.strides = strides;
-                        }
-                        None => {
-                            // The view cannot express this reshape: pay one
-                            // intermediate contiguous copy and continue.
-                            let tmp = DeviceTensor::uninitialized_dt(dt, &view.shape)?;
-                            view.materialize(&tmp)?;
-                            view = View::contiguous(tmp);
-                            view.shape = new_shape.clone();
-                            view.strides = Tensor::natural_strides(&new_shape);
+                ViewStep::Axis(op) => match op.as_ref() {
+                    AxisOp::Move(from, to) => {
+                        let d = view.shape.remove(*from);
+                        view.shape.insert(*to, d);
+                        let s = view.strides.remove(*from);
+                        view.strides.insert(*to, s);
+                    }
+                    AxisOp::Add(axis) => {
+                        view.shape.insert(*axis, 1);
+                        view.strides.insert(*axis, 0);
+                    }
+                    AxisOp::Rm(axis) => {
+                        ensure!(view.shape[*axis] == 1);
+                        view.shape.remove(*axis);
+                        view.strides.remove(*axis);
+                    }
+                    op @ AxisOp::Reshape(..) => {
+                        let AxisOp::Reshape(skip, from, to) = op else { unreachable!() };
+                        let from: TVec<TDim> = from.iter().map(|d| d.eval(ctx.symbols)).collect();
+                        let to: TVec<TDim> = to.iter().map(|d| d.eval(ctx.symbols)).collect();
+                        let mut new_shape = view.shape.clone();
+                        AxisOp::Reshape(*skip, from, to)
+                            .change_shape_array(&mut new_shape, false)?;
+                        match try_reshape_strides(&view.shape, &view.strides, &new_shape) {
+                            Some(strides) => {
+                                view.shape = new_shape;
+                                view.strides = strides;
+                            }
+                            None => {
+                                // The view cannot express this reshape: pay one
+                                // intermediate contiguous copy and continue.
+                                let tmp = DeviceTensor::uninitialized_dt(dt, &view.shape)?;
+                                view.materialize(&tmp)?;
+                                view = View::from_device(tmp);
+                                view.shape = new_shape.clone();
+                                view.strides = Tensor::natural_strides(&new_shape);
+                            }
                         }
                     }
-                }
+                },
             }
         }
 

@@ -65,7 +65,7 @@ impl EvalOp for DeviceSync {
                 // Already-device tensors (e.g. cache views fed back by the
                 // caller) pass through untouched: uploading them would read
                 // opaque storage as host bytes and panic.
-                if input.to_device_tensor().is_ok() {
+                if input.as_device_tensor().is_some() {
                     return Ok(tvec![input]);
                 }
                 // A tensor that came back from a previous run still on device

@@ -16,8 +16,7 @@ pub struct GpuTuning {
     /// schema sizing hint (typically the sequence/context length). It only
     /// drives the arena partition packing order, never correctness: an
     /// unrepresentative value yields a valid but less optimally packed
-    /// schema. Default 1024, in use unchanged since the device memory arena
-    /// landed (2026-08 campaign, M4 Pro 48GB). Env:
+    /// schema. Env:
     /// `TRACT_GPU_MEM_HINT_DEFAULT`.
     pub mem_hint_default_dim: i64,
 }
