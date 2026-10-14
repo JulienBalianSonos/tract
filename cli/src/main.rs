@@ -59,7 +59,48 @@ use tract_linalg::WeightType;
 use tract_linalg::block_quant::Q4_0;
 use tract_linalg::mmm::MatMatMul;
 
-readings_probe::instrumented_allocator!();
+// Darwin's allocator does not have the glibc mmap/munmap-per-eval pathology this works
+// around, and jemalloc measured slower there, so apple targets keep the system allocator.
+#[cfg(all(
+    feature = "jemalloc",
+    not(any(target_family = "wasm", target_os = "windows", target_vendor = "apple"))
+))]
+mod allocator {
+    readings_probe::wrap_global_allocator!(tikv_jemallocator::Jemalloc);
+
+    // jemalloc keeps purged extents mapped and dirty under its default `retain`, and some
+    // kernels never take those pages back: the resident set then reports the process peak
+    // rather than what the model holds.
+    #[unsafe(export_name = "_rjem_malloc_conf")]
+    #[allow(non_upper_case_globals)]
+    pub static malloc_conf: &[u8] = b"retain:false\0";
+
+    /// Return the pages jemalloc holds dirty for reuse to the OS, so a resident-set
+    /// reading taken right after reports what the process holds live rather than what
+    /// it freed within the last decay period.
+    pub fn purge() {
+        // SAFETY: `arena.<MALLCTL_ARENAS_ALL>.purge` takes and returns no value.
+        unsafe {
+            tikv_jemalloc_sys::mallctl(
+                c"arena.4096.purge".as_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            );
+        }
+    }
+}
+
+#[cfg(not(all(
+    feature = "jemalloc",
+    not(any(target_family = "wasm", target_os = "windows", target_vendor = "apple"))
+)))]
+mod allocator {
+    readings_probe::instrumented_allocator!();
+
+    pub fn purge() {}
+}
 
 fn info_usage(stage: &str, probe: Option<&Probe>) {
     if let Some(mon) = probe {
