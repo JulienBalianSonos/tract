@@ -1,5 +1,3 @@
-extern crate tract_gpu;
-
 #[cfg(all(target_vendor = "apple", feature = "metal"))]
 extern crate tract_metal;
 

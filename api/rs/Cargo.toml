@@ -28,7 +28,6 @@ tract-pulse = { workspace = true, optional = true }
 tract-pulse-opl.workspace = true
 tract-libcli = { workspace = true, optional = true }
 tract-transformers = { workspace = true, optional = true }
-tract-gpu.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(any(target_vendor = "apple"))'.dependencies]

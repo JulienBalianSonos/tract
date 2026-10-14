@@ -120,6 +120,7 @@ fn split_k_chunk() -> usize {
     2048
 }
 
+/// F16 attention with owned outputs and independent cache snapshots for lazy feedback.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct MetalFusedSdpa {
     pub scale_bits: u32,
@@ -243,6 +244,22 @@ impl DeviceKvBuffer {
             self.logical_strides(self.cap),
             0,
         )?))
+    }
+
+    /// An independent device copy of the live cache, safe across subsequent evaluations.
+    fn snapshot(&self) -> TractResult<DeviceTensor> {
+        let view = self.valid_view()?;
+        let output = DeviceTensor::uninitialized_dt(view.datum_type(), view.shape())?;
+        get_context()?.copy_nd(
+            &view,
+            0,
+            view.strides(),
+            &output,
+            0,
+            view.shape(),
+            output.strides(),
+        )?;
+        Ok(output)
     }
 
     /// Batched GEMM view starting at sequence position `j0`.
@@ -1068,17 +1085,12 @@ impl OpState for MetalFusedSdpaState {
                 &sv.try_as_plain_ram()?.as_slice::<f32>()?[..6.min(hq)]
             );
         }
-        let out_t = DeviceTensor::View(DeviceView::from_owned(
-            out,
-            f16::datum_type(),
-            tvec![1, hq, s_len, d],
-            natural_strides(&[1, hq, s_len, d]),
-            0,
-        )?);
+        let out_t = DeviceTensor::Owned(tract_core::dyn_clone::clone_box(&**out))
+            .reshaped(tvec![1, hq, s_len, d])?;
         Ok(tvec!(
             out_t.into_tensor().into_tvalue(),
-            self.k.valid_view()?.into_tensor().into_tvalue(),
-            self.v.valid_view()?.into_tensor().into_tvalue(),
+            self.k.snapshot()?.into_tensor().into_tvalue(),
+            self.v.snapshot()?.into_tensor().into_tvalue(),
         ))
     }
 
@@ -1439,9 +1451,6 @@ mod tests {
                 // Keep the long snapshot to check it survives the overwrite.
                 snapshot = Some((metal_k.clone(), k_all.clone()));
                 let slice_dev = |t: &TValue| -> TractResult<TValue> {
-                    let DeviceTensor::View(_) = t.to_device_tensor()? else {
-                        bail!("expected an arena view cache output")
-                    };
                     Ok(t.to_device_tensor()?.prefix_window(2, cols)?.into_tensor().into_tvalue())
                 };
                 metal_k = slice_dev(&metal_k)?;
@@ -1578,6 +1587,9 @@ mod tests {
             }
             let cpu_out = cpu_op.eval(&ctx, cpu_inputs)?;
             let metal_out = metal_state.eval(&ctx, &op, metal_inputs)?;
+            for output in &metal_out {
+                ensure!(matches!(output.to_device_tensor()?, DeviceTensor::Owned(_)));
+            }
             crate::with_metal_stream(|stream| stream.wait_until_completed())?;
 
             for (i, tol) in [(0usize, Approximation::SuperApproximate)].into_iter() {

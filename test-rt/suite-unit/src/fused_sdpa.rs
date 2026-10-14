@@ -104,7 +104,12 @@ impl Test for SinksCase {
         let model = Self::model(&inputs)?;
         let values = inputs.into_iter().map(Tensor::into_tvalue).collect::<TVec<_>>();
         let runnable = runtime.prepare(model)?;
-        let output = runnable.run(values)?;
+        let mut state = runnable.spawn()?;
+        let output = state.run(values.clone())?;
+        let mut next_values = values;
+        next_values[2] = Tensor::zero::<f16>(&[1, 1, 1, 2])?.into_tvalue();
+        let next_output = state.run(next_values)?;
+        ensure!(next_output.len() == expected.len());
         ensure!(output.len() == expected.len());
         for (actual, expected) in output.into_iter().zip(expected) {
             actual.into_tensor().close_enough(&expected, approx)?;
