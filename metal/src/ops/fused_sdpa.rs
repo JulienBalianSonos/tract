@@ -157,7 +157,7 @@ impl EvalOp for MetalFusedSdpa {
     not_out_of_plan!();
     fn state(&self, _ctx: &EvalContext) -> TractResult<Option<Box<dyn OpState>>> {
         Ok(Some(Box::new(MetalFusedSdpaState {
-            scale: f32::from_bits(self.scale_bits),
+            scale: f16::from_f32(f32::from_bits(self.scale_bits)).to_f32(),
             window: self.window,
             has_sinks: self.has_sinks,
             k: DeviceKvBuffer::default(),

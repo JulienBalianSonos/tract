@@ -1110,109 +1110,100 @@ fn q40_moe_facts_supported(op: &MoeFfn, facts: &[&TypedFact], layout: ExpertLayo
         && w2_bias_ok
 }
 
-/// Pre-translation repack: canonical-layout Q40 MoE experts (w1/w3 [E,D,H],
-/// w2 [E,H,D]) are transposed once, per projection tensor, into the linear
-/// layout ([E,H,D] / [E,D,H]) required by the Metal routed-Q40 kernels, and
-/// the op is flipped to `ExpertLayout::Linear`. This makes canonical-layout
-/// exports eligible for the fast MoE path without re-exporting. Linear-layout
-/// models are untouched, as is any canonical op the lowering gate would
-/// decline anyway (so its numerics stay exactly as today on the fallback
-/// path; the transpose requantizes and is not bit-lossless).
-///
-/// Consts are rebuilt in place, one projection tensor at a time, so peak
-/// memory stays at roughly one extra projection tensor.
+/// Requantize exclusive canonical Q40 expert constants into linear layout.
+/// Callers must opt into the precision loss and temporary projection storage.
 fn repack_canonical_q40_moe_experts(model: &mut TypedModel) -> TractResult<()> {
     if env_flag("TRACT_METAL_DISABLE_Q40_MOE") || env_flag("TRACT_METAL_DISABLE_Q40_MOE_REPACK") {
         return Ok(());
     }
-    let log_lowering = env_flag("TRACT_METAL_LOG_Q40_MOE");
-    'nodes: for node_id in 0..model.nodes().len() {
-        let Some(op) = model.node(node_id).op_as::<MoeFfn>() else { continue };
-        if op.expert_layout != ExpertLayout::Canonical
-            || !q40_moe_activation_supported(op)
-            || (op.act_limit_bits.is_some() && !op.has_w3)
-        {
-            continue;
-        }
-        let op = op.clone();
-        let facts = model.node_input_facts(node_id)?;
-        if !q40_moe_facts_supported(&op, &facts, ExpertLayout::Canonical) {
-            continue;
-        }
-        // Canonical expert shapes must be concrete and mutually consistent:
-        // w1/w3 [E,D,H], w2 [E,H,D]. Both D and H must be quantizable along
-        // the new innermost axis after the transpose.
-        let indexes = moe_input_indexes(&op);
-        let w1_shape = facts[2].shape.as_concrete().map(|s| s.to_vec());
-        let w2_shape = facts[3].shape.as_concrete().map(|s| s.to_vec());
-        let w3_shape = indexes.w3.map(|ix| facts[ix].shape.as_concrete().map(|s| s.to_vec()));
-        let (Some(w1_shape), Some(w2_shape)) = (w1_shape, w2_shape) else { continue };
-        let (e, d_model, d_hidden) = (w1_shape[0], w1_shape[1], w1_shape[2]);
-        if w2_shape != [e, d_hidden, d_model]
-            || w3_shape.is_some_and(|s| s.as_deref() != Some(&w1_shape[..]))
-            || d_model % Q4_0.block_len() != 0
-            || d_hidden % Q4_0.block_len() != 0
-        {
-            continue;
-        }
-        // `facts` borrows the model (and TVec's Drop keeps the borrow alive);
-        // release it before the in-place const mutations below.
-        drop(facts);
-        // Every expert projection must be an exclusive block-quant Const.
-        let node = model.node(node_id);
-        let mut expert_slots = tvec![2usize, 3];
-        expert_slots.extend(indexes.w3);
-        let mut const_ids: TVec<usize> = tvec![];
-        for &slot in &expert_slots {
-            let outlet = node.inputs[slot];
-            let knode = model.node(outlet.node);
-            let exclusive_bq_const = outlet.slot == 0
-                && knode
-                    .op_as::<Const>()
-                    .is_some_and(|k| k.val().storage_as::<BlockQuantStorage>().is_some())
-                && knode.outputs[0].successors.len() == 1
-                && !model.outputs.contains(&outlet);
-            if !exclusive_bq_const {
-                if log_lowering {
-                    eprintln!(
-                        "Metal Q40 MoE canonical repack skip {}: input {slot} is not an exclusive block-quant const",
-                        node.name
-                    );
-                }
-                continue 'nodes;
-            }
-            const_ids.push(outlet.node);
-        }
+    Rewriter::default()
+        .with_rule_for("repack-canonical-q40-moe", repack_canonical_q40_moe_rule)
+        .rewrite(&(), model)
+}
 
-        if log_lowering {
-            eprintln!(
-                "Metal Q40 MoE canonical repack {}: transposing {} expert tensors to linear layout",
-                node.name,
-                const_ids.len()
-            );
-        }
-        for cid in const_ids {
-            let old = model
-                .node(cid)
-                .op_as::<Const>()
-                .context("expert weight node is not a Const")?
-                .val()
-                .clone();
-            let repacked = transpose_block_quant_experts(&old)?;
-            drop(old);
-            let exotic_fact =
-                repacked.exotic_fact()?.context("repacked expert tensor has no exotic fact")?;
-            let konst = Const::new_with_exotic_fact(Arc::new(repacked), exotic_fact)?;
-            let fact = konst.output_facts(&[])?.remove(0);
-            let const_node = model.node_mut(cid);
-            const_node.op = Box::new(konst);
-            const_node.outputs[0].fact = fact;
-        }
-        let mut linear_op = op;
-        linear_op.expert_layout = ExpertLayout::Linear;
-        model.node_mut(node_id).op = Box::new(linear_op);
+fn repack_canonical_q40_moe_rule(
+    _: &(),
+    model: &TypedModel,
+    node: &TypedNode,
+    name: &str,
+    op: &MoeFfn,
+) -> TractResult<Option<TypedModelPatch>> {
+    let log_lowering = env_flag("TRACT_METAL_LOG_Q40_MOE");
+    if op.expert_layout != ExpertLayout::Canonical
+        || !q40_moe_activation_supported(op)
+        || (op.act_limit_bits.is_some() && !op.has_w3)
+    {
+        return Ok(None);
     }
-    Ok(())
+
+    let facts = model.node_input_facts(node.id)?;
+    if !q40_moe_facts_supported(op, &facts, ExpertLayout::Canonical) {
+        return Ok(None);
+    }
+    // Canonical expert shapes must be concrete and mutually consistent:
+    // w1/w3 [E,D,H], w2 [E,H,D]. Both D and H must be quantizable along
+    // the new innermost axis after the transpose.
+    let indexes = moe_input_indexes(op);
+    let w1_shape = facts[2].shape.as_concrete().map(|s| s.to_vec());
+    let w2_shape = facts[3].shape.as_concrete().map(|s| s.to_vec());
+    let w3_shape = indexes.w3.map(|ix| facts[ix].shape.as_concrete().map(|s| s.to_vec()));
+    let (Some(w1_shape), Some(w2_shape)) = (w1_shape, w2_shape) else { return Ok(None) };
+    let (e, d_model, d_hidden) = (w1_shape[0], w1_shape[1], w1_shape[2]);
+    if w2_shape != [e, d_hidden, d_model]
+        || w3_shape.is_some_and(|s| s.as_deref() != Some(&w1_shape[..]))
+        || d_model % Q4_0.block_len() != 0
+        || d_hidden % Q4_0.block_len() != 0
+    {
+        return Ok(None);
+    }
+    // Every expert projection must be an exclusive block-quant Const.
+    let mut expert_slots = tvec![2usize, 3];
+    expert_slots.extend(indexes.w3);
+    let mut const_ids: TVec<usize> = tvec![];
+    for &slot in &expert_slots {
+        let outlet = node.inputs[slot];
+        let knode = model.node(outlet.node);
+        let exclusive_bq_const = outlet.slot == 0
+            && knode
+                .op_as::<Const>()
+                .is_some_and(|k| k.val().storage_as::<BlockQuantStorage>().is_some())
+            && knode.outputs[0].successors.len() == 1
+            && !model.outputs.contains(&outlet);
+        if !exclusive_bq_const {
+            if log_lowering {
+                eprintln!(
+                    "Metal Q40 MoE canonical repack skip {}: input {slot} is not an exclusive block-quant const",
+                    node.name
+                );
+            }
+            return Ok(None);
+        }
+        const_ids.push(outlet.node);
+    }
+
+    if log_lowering {
+        eprintln!(
+            "Metal Q40 MoE canonical repack {}: transposing {} expert tensors to linear layout",
+            node.name,
+            const_ids.len()
+        );
+    }
+    let mut patch = TypedModelPatch::default();
+    let mut inputs = patch.taps(model, &node.inputs)?;
+    for (slot, cid) in expert_slots.into_iter().zip(const_ids) {
+        let old = model.node(cid).op_as::<Const>().context("expected expert constant")?.val();
+        let repacked = transpose_block_quant_experts(old)?;
+        let exotic_fact = repacked.exotic_fact()?.context("missing repacked expert fact")?;
+        let konst = Const::new_with_exotic_fact(Arc::new(repacked), exotic_fact)?;
+        inputs[slot] = patch.wire_node(format!("{name}.linear.{slot}"), konst, &[])?[0];
+    }
+    let mut linear_op = op.clone();
+    linear_op.expert_layout = ExpertLayout::Linear;
+    let outputs = patch.wire_node(format!("{name}.linear"), linear_op, &inputs)?;
+    for (slot, output) in outputs.into_iter().enumerate() {
+        patch.shunt_outside(model, OutletId::new(node.id, slot), output)?;
+    }
+    Ok(Some(patch))
 }
 
 /// Construct a device cast preserving the requested dtype and rounding.
@@ -1538,6 +1529,34 @@ mod q40_moe_lowering_tests {
             .and_then(|n| n.op_as::<Const>())
             .map(|k| k.val().clone())
             .expect("w1 const")
+    }
+
+    #[test]
+    fn canonical_repack_preserves_graph_contract() -> TractResult<()> {
+        let (mut model, _) = build_qwen_moe(ExpertLayout::Canonical, "silu", 4)?;
+        let outputs = model.output_fact(0)?.clone();
+        let nodes = model.nodes().len();
+        repack_canonical_q40_moe_experts(&mut model)?;
+        ensure!(moe_ffn_layout(&model) == Some(ExpertLayout::Linear));
+        ensure!(model.nodes().len() == nodes);
+        ensure!(!model.nodes().iter().any(|node| &*node.name == "w1"));
+        ensure!(model.output_fact(0)?.clone() == outputs);
+        let before = model
+            .nodes()
+            .iter()
+            .filter_map(|node| node.op_as::<Const>())
+            .map(|op| op.val().clone())
+            .collect::<Vec<_>>();
+        repack_canonical_q40_moe_experts(&mut model)?;
+        let after = model
+            .nodes()
+            .iter()
+            .filter_map(|node| node.op_as::<Const>())
+            .map(|op| op.val().clone())
+            .collect::<Vec<_>>();
+        ensure!(before.len() == after.len());
+        ensure!(before.iter().zip(&after).all(|(a, b)| Arc::ptr_eq(a, b)));
+        Ok(())
     }
 
     /// The repack pass must not touch linear-layout models: same consts (by

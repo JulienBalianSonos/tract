@@ -5,8 +5,6 @@
 //! transform time (Q4_0 rows concatenate bytewise), so the fused mat-vec
 //! reads one weight tensor and the shared activation exactly once.
 
-use std::collections::HashMap;
-
 use crate::kernels::matmul::GgmlGemm;
 use crate::ops::{MetalGemm, MetalMultiGemm};
 use tract_core::internal::*;
@@ -34,22 +32,12 @@ fn log_enabled() -> bool {
     std::env::var_os("TRACT_METAL_LOG_MULTI_GEMM").is_some()
 }
 
+/// Fuse compatible sibling matmuls sharing one activation through model patches.
 pub fn fuse_sibling_gemms(model: &mut TypedModel) -> TractResult<()> {
     if std::env::var_os("TRACT_METAL_DISABLE_MULTI_GEMM").is_some() {
         return Ok(());
     }
-    let mut changed = false;
-    loop {
-        let Some(patch) = find_sibling_group(model)? else { break };
-        patch.apply(model)?;
-        changed = true;
-    }
-    if changed {
-        // Drop the now-dead per-sibling weight consts so their device
-        // buffers are released instead of doubling resident weight memory.
-        model.compact()?;
-    }
-    Ok(())
+    Rewriter::default().with_rule_for("fuse-sibling-gemms", fuse_sibling_group).rewrite(&(), model)
 }
 
 fn outlet_is_const(model: &TypedModel, outlet: OutletId) -> bool {
@@ -61,42 +49,40 @@ fn inner_fact(fact: &TypedFact) -> &TypedFact {
     fact.as_device_fact().map(|df| &**df).unwrap_or(fact)
 }
 
-fn find_sibling_group(model: &TypedModel) -> TractResult<Option<TypedModelPatch>> {
-    let mut groups: HashMap<(OutletId, bool), Vec<usize>> = HashMap::new();
-    let mut order: Vec<(OutletId, bool)> = vec![];
-    for node in model.nodes() {
-        let Some(gemm) = node.op_as::<MetalGemm<GgmlGemm>>() else { continue };
-        if gemm.kernel.transpose_a || !gemm.kernel.transpose_b {
-            continue;
-        }
-        if node.inputs.len() != 2 || node.outputs.len() != 1 {
-            continue;
-        }
-        let (a, b) = (node.inputs[0], node.inputs[1]);
-        let (x, weight_first) = match (outlet_is_const(model, a), outlet_is_const(model, b)) {
-            (false, true) => (a, false),
-            (true, false) => (b, true),
-            _ => continue,
-        };
-        let key = (x, weight_first);
-        groups
-            .entry(key)
-            .or_insert_with(|| {
-                order.push(key);
-                vec![]
-            })
-            .push(node.id);
-    }
-    for key in order {
-        let nodes = &groups[&key];
-        if nodes.len() < 2 {
-            continue;
-        }
-        if let Some(patch) = try_build_group_patch(model, key.0, key.1, nodes)? {
-            return Ok(Some(patch));
-        }
-    }
-    Ok(None)
+fn fuse_sibling_group(
+    _: &(),
+    model: &TypedModel,
+    node: &TypedNode,
+    _: &str,
+    gemm: &MetalGemm<GgmlGemm>,
+) -> TractResult<Option<TypedModelPatch>> {
+    rule_if!(!gemm.kernel.transpose_a && gemm.kernel.transpose_b);
+    rule_if!(node.inputs.len() == 2 && node.outputs.len() == 1);
+    let (a, b) = (node.inputs[0], node.inputs[1]);
+    let (x, weight_first) = match (outlet_is_const(model, a), outlet_is_const(model, b)) {
+        (false, true) => (a, false),
+        (true, false) => (b, true),
+        _ => return Ok(None),
+    };
+    let mut nodes = model
+        .outlet_successors(x)
+        .iter()
+        .filter_map(|successor| {
+            let sibling = model.node(successor.node);
+            let gemm = sibling.op_as::<MetalGemm<GgmlGemm>>()?;
+            (!gemm.kernel.transpose_a
+                && gemm.kernel.transpose_b
+                && sibling.inputs.len() == 2
+                && sibling.outputs.len() == 1
+                && sibling.inputs[usize::from(weight_first)] == x
+                && outlet_is_const(model, sibling.inputs[usize::from(!weight_first)]))
+            .then_some(sibling.id)
+        })
+        .collect::<Vec<_>>();
+    nodes.sort_unstable();
+    nodes.dedup();
+    rule_if!(nodes.len() >= 2 && nodes[0] == node.id);
+    try_build_group_patch(model, x, weight_first, &nodes)
 }
 
 /// Validates one candidate node of a group; None when it cannot join.

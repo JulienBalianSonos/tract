@@ -11,6 +11,8 @@
 
 use tract_nnef::internal::*;
 
+mod layout;
+
 /// Sequence axis of `[B, H, S, D]`.
 const SEQ_AXIS: usize = 2;
 
@@ -69,20 +71,29 @@ impl FusedSdpa {
                 AxisOp::Reshape(1, tvec![hkv.clone(), group.clone()], tvec![hq.clone()]),
                 &[wire],
             )?[0];
+            let wire =
+                model.wire_node(format!("{name}.float"), Cast { to: DatumType::F32 }, &[wire])?[0];
             expanded.push(wire);
         }
+        let query = model.wire_node("query.float", Cast { to: DatumType::F32 }, &[inputs[0]])?[0];
         let scores = model.wire_node(
             "scores",
             EinSum::new("bhqd,bhkd->bhqk".parse()?, DatumType::F32),
-            &[inputs[0], expanded[0]],
+            &[query, expanded[0]],
         )?[0];
         let scores = model.wire_node("scores.round", Cast { to: dt }, &[scores])?[0];
         let scale = model.add_const(
             "scale",
-            tensor0(self.scale()).cast_to_dt(dt)?.into_owned().broadcast_into_rank(4)?,
+            tensor0(self.scale())
+                .cast_to_dt(dt)?
+                .cast_to::<f32>()?
+                .into_owned()
+                .broadcast_into_rank(4)?,
         )?;
+        let scores = model.wire_node("scores.float", Cast { to: DatumType::F32 }, &[scores])?[0];
         let scores =
             model.wire_node("scaled", TypedBinOp(Box::new(Mul), None), &[scores, scale])?[0];
+        let scores = model.wire_node("scaled.round", Cast { to: dt }, &[scores])?[0];
         let scores = model.wire_node("scaled.float", Cast { to: DatumType::F32 }, &[scores])?[0];
         let mask = model.wire_node("mask.float", Cast { to: DatumType::F32 }, &[inputs[5]])?[0];
         let mask = model.wire_node(
@@ -131,6 +142,8 @@ impl FusedSdpa {
             )?[0];
         }
         let probs = model.wire_node("probabilities.round", Cast { to: dt }, &[probs])?[0];
+        let probs =
+            model.wire_node("probabilities.float", Cast { to: DatumType::F32 }, &[probs])?[0];
         let output = model.wire_node(
             "attention",
             EinSum::new("bhqk,bhkd->bhqd".parse()?, DatumType::F32),
@@ -422,6 +435,7 @@ pub fn fuse_sdpa_rule(
     rule_if!(rank > 0);
     rule_if!(_softmax.kind == tract_nnef::tract_core::ops::nn::SoftmaxKind::Softmax);
     rule_if!(_softmax.axes == tvec![rank - 1]);
+    rule_if!(_softmax.quant_output_dt.is_none());
     // GPT-OSS: Softmax(Sub(Concat([logits, sinks]), Reduce<Max>(same Concat)))
     // Plain:   Softmax(Add(logits, mask))
     let sm_in = prev(model, node, 0);
@@ -457,6 +471,8 @@ pub fn fuse_sdpa_rule(
     if !is_bin(mask_add, "Add") {
         return Ok(None);
     }
+    rule_if!(mask_add.outputs[0].fact.datum_type == DatumType::F32);
+    rule_if!(model.outlet_fact(mask_add.inputs[0])?.datum_type == DatumType::F32);
     let mask_outlet = mask_add.inputs[1];
     let mut scale_mul = prev(model, mask_add, 0);
     if scale_mul.op_as::<Cast>().is_some() {
@@ -473,6 +489,7 @@ pub fn fuse_sdpa_rule(
         return Ok(None);
     };
     let scale_k = prev(model, scale_mul, scale_slot).op_as::<Const>().unwrap();
+    rule_if!(scale_k.val().datum_type() == DatumType::F16);
     let scale = scale_k.val().cast_to::<f32>()?.try_as_plain_ram()?.as_slice::<f32>()?[0];
 
     let qk_root = prev(model, scale_mul, 1 - scale_slot);
@@ -644,6 +661,70 @@ pub fn fuse_sdpa_rule(
     };
     let Some(av_layout) = av_layout else { return Ok(None) };
 
+    let q_fact = model.outlet_fact(parts[0].0)?;
+    let seq = match parts[0].1 {
+        Layout::HeadMajor => q_fact.shape[2].clone(),
+        Layout::SeqMajor => q_fact.shape[1].clone(),
+    };
+    let coordinates = layout::Coordinates {
+        dims: [hkv.to_dim(), group.to_dim(), seq.clone(), k_fact.shape[2].clone(), d.to_dim()],
+    };
+    let kv_layout = coordinates.layout(&[&[], &[0], &[3], &[4]]);
+    let mut recognized = None;
+    for (query_layout, query_axes) in [
+        (Layout::HeadMajor, coordinates.layout(&[&[], &[0, 1], &[2], &[4]])),
+        (Layout::SeqMajor, coordinates.layout(&[&[], &[2], &[0, 1], &[4]])),
+    ] {
+        let Some(scores) = coordinates.trace(
+            model,
+            qk_root.id.into(),
+            &[(parts[0].0, query_axes), (k_out_outlet, kv_layout.clone())],
+            4,
+            0,
+        ) else {
+            continue;
+        };
+        let expected = coordinates.layout(&[&[0, 1, 2, 3]]).remove(0);
+        if scores.iter().flatten().copied().collect::<TVec<_>>() != expected
+            || scores.last() != Some(&coordinates.layout(&[&[3]]).remove(0))
+        {
+            continue;
+        }
+        let Some(output) = coordinates.trace(
+            model,
+            av.id.into(),
+            &[(cast_f16.id.into(), scores), (v_out_outlet, kv_layout.clone())],
+            3,
+            0,
+        ) else {
+            continue;
+        };
+        let expected = match av_layout {
+            AvLayout::Fold4 => coordinates.layout(&[&[0], &[1], &[2], &[4]]),
+            AvLayout::Fold5 => coordinates.layout(&[&[], &[0], &[1], &[2], &[4]]),
+            AvLayout::HeadMajor3 => coordinates.layout(&[&[0, 1], &[2], &[4]]),
+            AvLayout::SeqMajor3 => coordinates.layout(&[&[2], &[0, 1], &[4]]),
+        };
+        if output == expected {
+            recognized = Some(query_layout);
+            break;
+        }
+    }
+    let Some(query_layout) = recognized else { return Ok(None) };
+    parts[0].1 = query_layout;
+    let mask_fact = model.outlet_fact(mask_outlet)?;
+    rule_if!(mask_fact.datum_type == DatumType::F32 && (2..=4).contains(&mask_fact.rank()));
+    rule_if!(mask_fact.shape[..mask_fact.rank() - 2].iter().all(|d| *d == 1.to_dim()));
+    rule_if!(mask_fact.shape[mask_fact.rank() - 2] == seq);
+    rule_if!(mask_fact.shape[mask_fact.rank() - 1] == k_fact.shape[2]);
+    rule_if!(node.outputs[0].fact.datum_type == DatumType::F32);
+    rule_if!(model.outlet_fact(scale_mul.id.into())?.datum_type == DatumType::F16);
+    if let Some(sinks) = &sinks_tensor {
+        rule_if!(sinks.datum_type() == DatumType::F32 && sinks.rank() == rank);
+        rule_if!(sinks.shape()[rank - 2..] == [1, 1]);
+        rule_if!(sinks.len() == hq);
+    }
+
     let mut patch = TypedModelPatch::new(format!("fuse-sdpa-inplace-kv @ {node_name}"));
     let mut q_parts: Vec<OutletId> = vec![];
     for (i, (outlet, layout, _)) in parts.iter().enumerate() {
@@ -675,11 +756,14 @@ pub fn fuse_sdpa_rule(
         op_inputs.push(patch.add_const(format!("{node_name}.sinks"), sinks)?);
     }
 
-    let fused = patch.wire_node(
-        format!("{node_name}.fused_sdpa"),
-        FusedSdpa { scale_bits: scale.to_bits(), window, has_sinks },
-        &op_inputs,
-    )?;
+    let op = FusedSdpa { scale_bits: scale.to_bits(), window, has_sinks };
+    let facts = op_inputs
+        .iter()
+        .map(|&input| patch.outlet_fact(input))
+        .collect::<TractResult<TVec<_>>>()?;
+    rule_if!(op.output_facts(&facts).is_ok());
+    drop(facts);
+    let fused = patch.wire_node(format!("{node_name}.fused_sdpa"), op, &op_inputs)?;
 
     // Attention out [1, Hq, S, D] -> the AV einsum's output layout.
     let attn = match av_layout {
