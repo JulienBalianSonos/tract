@@ -92,6 +92,9 @@ impl CudaTransform {
     ) -> TractResult<()> {
         // Init CUDA Context if not done previously
         cuda_context();
+        tract_gpu::memory::register_may_alias_check(
+            crate::ops::fused_axis_op::fused_axis_op_may_alias,
+        );
 
         rewire_sdpa_cuda(model)?;
         rewrite_einsum_to_prefix_matmul(model, false)?;
