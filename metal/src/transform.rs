@@ -277,6 +277,7 @@ impl MetalTransform {
 
         // After elementwise fusion: only residual adds that stayed standalone
         // dispatches are worth absorbing into their norm consumer.
+        rewrite_rules::fuse_sibling_gemms(model)?;
         Rewriter::default()
             .with_rule_for("fuse_elementwise_chain_ew", rewrite_rules::fuse_elementwise_chain_ew)
             .with_rule_for("fuse_elementwise_chain_bin", rewrite_rules::fuse_elementwise_chain_bin)
@@ -651,7 +652,7 @@ fn convert_matmul_to_metal(
     Ok(matmul_output)
 }
 
-fn convert_const(op: &Const) -> TractResult<Const> {
+pub(crate) fn convert_const(op: &Const) -> TractResult<Const> {
     let typed_fact: TypedFact = Arc::clone(op.val()).try_into()?;
     let metal_fact = if let Some(of) = op.exotic_fact() {
         DeviceFact::from_host(typed_fact.with_exotic_fact(clone_box(of)))?
