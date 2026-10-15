@@ -4,9 +4,9 @@
 //! storage, but incoming history remains authoritative. Serialization expands to
 //! portable tensor operations instead of introducing a device cache primitive.
 //!
-//! Recognition requires a single f16 QK product and scale multiply, f32 mask and
-//! softmax, f16 probabilities and an AV product. Split or f32 score expressions
-//! retain their original operations and precision boundaries. The mask defines
+//! Recognition preserves f16 QK products, an optional rounded sum of two
+//! products, and a scale multiply before f32 mask and softmax operations.
+//! F32 score expressions retain their original operations. The mask defines
 //! visible keys; unsupported graphs keep the standard backend fallback.
 
 use tract_nnef::internal::*;
@@ -21,6 +21,8 @@ const SEQ_AXIS: usize = 2;
 pub struct FusedSdpa {
     /// Softmax scale as f32 bits (f32 lacks Eq/Hash).
     pub scale_bits: u32,
+    /// Head-dimension boundary between two separately rounded QK products, if present.
+    pub qk_split: Option<usize>,
     /// Sliding-attention window in keys (0 = full attention). Extracted by
     /// the fuse rule from the mask-building subgraph; runtimes may clamp
     /// their attention reads to the last `window + S - 1` keys, since the
@@ -76,12 +78,37 @@ impl FusedSdpa {
             expanded.push(wire);
         }
         let query = model.wire_node("query.float", Cast { to: DatumType::F32 }, &[inputs[0]])?[0];
-        let scores = model.wire_node(
-            "scores",
-            EinSum::new("bhqd,bhkd->bhqk".parse()?, DatumType::F32),
-            &[query, expanded[0]],
-        )?[0];
-        let scores = model.wire_node("scores.round", Cast { to: dt }, &[scores])?[0];
+        let bounds = if let Some(split) = self.qk_split {
+            vec![(0.to_dim(), split.to_dim()), (split.to_dim(), q_shape[3].clone())]
+        } else {
+            vec![(0.to_dim(), q_shape[3].clone())]
+        };
+        let mut products = tvec![];
+        for (ix, (start, end)) in bounds.into_iter().enumerate() {
+            let mut operands = tvec![];
+            for (name, wire) in [("query", query), ("key", expanded[0])] {
+                operands.push(
+                    model.wire_node(
+                        format!("scores.{ix}.{name}"),
+                        Slice { axis: 3, start: start.clone(), end: end.clone() },
+                        &[wire],
+                    )?[0],
+                );
+            }
+            let product = model.wire_node(
+                format!("scores.{ix}"),
+                EinSum::new("bhqd,bhkd->bhqk".parse()?, DatumType::F32),
+                &operands,
+            )?[0];
+            products.push(
+                model.wire_node(format!("scores.{ix}.round"), Cast { to: dt }, &[product])?[0],
+            );
+        }
+        let scores = if products.len() == 2 {
+            model.wire_node("scores.sum", TypedBinOp(Box::new(Add), None), &products)?[0]
+        } else {
+            products[0]
+        };
         let scale = model.add_const(
             "scale",
             tensor0(self.scale())
@@ -201,6 +228,9 @@ impl TypedOp for FusedSdpa {
         ensure!(q.shape[2] == k_new.shape[2]);
         ensure!(q.shape[3] == k_new.shape[3] && q.shape[3] == k_cache.shape[3]);
         ensure!(k_new.shape[1] == k_cache.shape[1]);
+        if let Some(split) = self.qk_split {
+            ensure!(split > 0 && split < q.shape[3].to_usize()?, "invalid QK split");
+        }
         let hkv = k_new.shape[1].to_usize()?;
         let hq = q.shape[1].to_usize()?;
         ensure!(hq > 0 && hkv > 0 && hq.is_multiple_of(hkv));
@@ -316,8 +346,10 @@ fn load_common(
     }
     let scale: f32 = invocation.named_arg_as(builder, "scale")?;
     let window: i64 = invocation.named_arg_as(builder, "window")?;
-    builder
-        .wire(FusedSdpa { scale_bits: scale.to_bits(), window: window as u32, has_sinks }, &inputs)
+    builder.wire(
+        FusedSdpa { scale_bits: scale.to_bits(), qk_split: None, window: window as u32, has_sinks },
+        &inputs,
+    )
 }
 
 fn load(builder: &mut ModelBuilder, invocation: &ResolvedInvocation) -> TractResult<Value> {
@@ -338,7 +370,7 @@ use tract_nnef::tract_core::ops::binary::TypedBinOp;
 use tract_nnef::tract_core::ops::cast::Cast;
 use tract_nnef::tract_core::ops::einsum::EinSum;
 use tract_nnef::tract_core::ops::konst::Const;
-use tract_nnef::tract_core::ops::math::Mul;
+use tract_nnef::tract_core::ops::math::{Add, Mul};
 use tract_nnef::tract_core::ops::nn::{Reduce, Reducer, Softmax};
 use tract_nnef::tract_core::ops::source::TypedSource;
 use tract_nnef::tract_core::transform::ModelTransform;
@@ -564,7 +596,7 @@ pub fn fuse_sdpa_rule(
         (1, after_cast)
     };
     let hq = hkv * group;
-    rule_if!(branches.len() == 1);
+    rule_if!(branches.len() <= 2);
     if av.op_as::<EinSum>().is_none() || av.inputs.len() != 2 {
         return Ok(None);
     }
@@ -615,6 +647,7 @@ pub fn fuse_sdpa_rule(
         covered += d_part;
         parts.push((*q_part, layout, d_part));
     }
+    let qk_split = (branches.len() == 2).then(|| parts[0].2);
     if covered != d {
         return Ok(None);
     }
@@ -675,15 +708,72 @@ pub fn fuse_sdpa_rule(
         (Layout::HeadMajor, coordinates.layout(&[&[], &[0, 1], &[2], &[4]])),
         (Layout::SeqMajor, coordinates.layout(&[&[], &[2], &[0, 1], &[4]])),
     ] {
-        let Some(scores) = coordinates.trace(
-            model,
-            qk_root.id.into(),
-            &[(parts[0].0, query_axes), (k_out_outlet, kv_layout.clone())],
-            4,
-            0,
-        ) else {
+        let mut score_layouts = vec![];
+        for (part, (_, _, start)) in parts.iter().zip(&branches) {
+            let root = if is_bin(qk_root, "Add") {
+                qk_root
+                    .inputs
+                    .iter()
+                    .map(|o| model.node(o.node))
+                    .find(|root| qk_branch(model, root).is_some_and(|(q, _, _)| q == part.0))
+            } else {
+                Some(qk_root)
+            };
+            let Some(root) = root else { break };
+            let einsum = if root.op_is::<AxisOp>() { prev(model, root, 0) } else { root };
+            let key_side = prev(model, einsum, 1);
+            let mut part_coordinates = layout::Coordinates { dims: coordinates.dims.clone() };
+            part_coordinates.dims[4] = part.2.to_dim();
+            let key_anchor = if let Some(slice) = key_side.op_as::<Slice>() {
+                let Some(key_axes) = coordinates.trace(
+                    model,
+                    key_side.inputs[0],
+                    &[(k_out_outlet, kv_layout.clone())],
+                    4,
+                    0,
+                ) else {
+                    break;
+                };
+                if key_axes.get(slice.axis) != Some(&tvec![4])
+                    || slice.start != start.to_dim()
+                    || slice.end != (*start + part.2 as i64).to_dim()
+                {
+                    break;
+                }
+                let mut axes = key_axes;
+                if part.2 == 1 {
+                    axes[slice.axis].clear();
+                }
+                (key_side.id.into(), axes)
+            } else {
+                if parts.len() != 1 {
+                    break;
+                }
+                (k_out_outlet, kv_layout.clone())
+            };
+            let mut part_query_axes = query_axes.clone();
+            if part.2 == 1 {
+                for axis in &mut part_query_axes {
+                    axis.retain(|r| *r != 4);
+                }
+            }
+            let Some(scores) = part_coordinates.trace(
+                model,
+                root.id.into(),
+                &[(part.0, part_query_axes), key_anchor],
+                4,
+                0,
+            ) else {
+                break;
+            };
+            score_layouts.push(scores);
+        }
+        if score_layouts.len() != parts.len()
+            || score_layouts.iter().any(|l| *l != score_layouts[0])
+        {
             continue;
-        };
+        }
+        let scores = score_layouts.remove(0);
         let expected = coordinates.layout(&[&[0, 1, 2, 3]]).remove(0);
         if scores.iter().flatten().copied().collect::<TVec<_>>() != expected
             || scores.last() != Some(&coordinates.layout(&[&[3]]).remove(0))
@@ -711,7 +801,12 @@ pub fn fuse_sdpa_rule(
         }
     }
     let Some(query_layout) = recognized else { return Ok(None) };
-    parts[0].1 = query_layout;
+    for part in &mut parts {
+        part.1 = match query_layout {
+            Layout::HeadMajor => Layout::HeadMajor,
+            Layout::SeqMajor => Layout::SeqMajor,
+        };
+    }
     let mask_fact = model.outlet_fact(mask_outlet)?;
     rule_if!(mask_fact.datum_type == DatumType::F32 && (2..=4).contains(&mask_fact.rank()));
     rule_if!(mask_fact.shape[..mask_fact.rank() - 2].iter().all(|d| *d == 1.to_dim()));
@@ -756,7 +851,7 @@ pub fn fuse_sdpa_rule(
         op_inputs.push(patch.add_const(format!("{node_name}.sinks"), sinks)?);
     }
 
-    let op = FusedSdpa { scale_bits: scale.to_bits(), window, has_sinks };
+    let op = FusedSdpa { scale_bits: scale.to_bits(), qk_split, window, has_sinks };
     let facts = op_inputs
         .iter()
         .map(|&input| patch.outlet_fact(input))

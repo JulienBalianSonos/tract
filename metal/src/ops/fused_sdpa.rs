@@ -124,6 +124,8 @@ fn split_k_chunk() -> usize {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct MetalFusedSdpa {
     pub scale_bits: u32,
+    /// Boundary between separately rounded QK products.
+    pub qk_split: Option<usize>,
     /// Sliding-attention window (0 = full): keys older than the window are
     /// -inf in the mask, so attention reads clamp to the last
     /// `window + S - 1` keys. The cache itself keeps full history.
@@ -145,6 +147,7 @@ impl TypedOp for MetalFusedSdpa {
         facts_to_device_facts(inputs, |facts| {
             FusedSdpa {
                 scale_bits: self.scale_bits,
+                qk_split: self.qk_split,
                 window: self.window,
                 has_sinks: self.has_sinks,
             }
@@ -159,6 +162,7 @@ impl EvalOp for MetalFusedSdpa {
     fn state(&self, _ctx: &EvalContext) -> TractResult<Option<Box<dyn OpState>>> {
         Ok(Some(Box::new(MetalFusedSdpaState {
             scale: f16::from_f32(f32::from_bits(self.scale_bits)).to_f32(),
+            qk_split: self.qk_split,
             window: self.window,
             has_sinks: self.has_sinks,
             k: DeviceKvBuffer::default(),
@@ -181,6 +185,7 @@ impl EvalOp for MetalFusedSdpa {
 #[derive(Clone, Default)]
 struct DeviceKvBuffer {
     buf: Option<Arc<Box<dyn OwnedDeviceTensor>>>,
+    snapshot: Option<DeviceTensor>,
     hkv: usize,
     d: usize,
     cap: usize,
@@ -247,7 +252,7 @@ impl DeviceKvBuffer {
     }
 
     /// An independent device copy of the live cache, safe across subsequent evaluations.
-    fn snapshot(&self) -> TractResult<DeviceTensor> {
+    fn snapshot(&mut self) -> TractResult<DeviceTensor> {
         let view = self.valid_view()?;
         let output = DeviceTensor::uninitialized_dt(view.datum_type(), view.shape())?;
         get_context()?.copy_nd(
@@ -259,6 +264,7 @@ impl DeviceKvBuffer {
             view.shape(),
             output.strides(),
         )?;
+        self.snapshot = Some(output.clone());
         Ok(output)
     }
 
@@ -363,6 +369,16 @@ impl DeviceKvBuffer {
     }
 
     fn matches_prefix(&self, input: &DeviceTensor) -> bool {
+        if self.snapshot.as_ref().is_some_and(|snapshot| {
+            input.datum_type() == snapshot.datum_type()
+                && input.shape() == [1, self.hkv, self.len, self.d]
+                && input.shape() == snapshot.shape()
+                && input.strides() == snapshot.strides()
+                && input.buffer_offset::<usize>() == snapshot.buffer_offset::<usize>()
+                && input.device_buffer_ptr() == snapshot.device_buffer_ptr()
+        }) {
+            return true;
+        }
         self.buf.as_ref().is_some_and(|buffer| {
             input.datum_type() == f16::datum_type()
                 && input.shape() == [1, self.hkv, self.len, self.d]
@@ -460,6 +476,7 @@ impl DeviceKvBuffer {
 #[derive(Debug)]
 pub struct MetalFusedSdpaState {
     scale: f32,
+    qk_split: Option<usize>,
     window: u32,
     has_sinks: bool,
     k: DeviceKvBuffer,
@@ -487,6 +504,7 @@ impl Clone for MetalFusedSdpaState {
         };
         Self {
             scale: self.scale,
+            qk_split: self.qk_split,
             window: self.window,
             has_sinks: self.has_sinks,
             k,
@@ -601,7 +619,7 @@ impl OpState for MetalFusedSdpaState {
         // online f32 softmax, no materialized scores); prefill-sized steps
         // keep the batched-gemm pipeline, whose tiled mm kernels win when S
         // is large.
-        let use_flash = s_len <= FLASH_MAX_S
+        let use_flash = self.qk_split.is_none() && s_len <= FLASH_MAX_S
             && t_len >= flash_min_t()
             && d <= 64
             // The kernel's QK dot is half4-vectorized with no scalar tail.
@@ -611,7 +629,7 @@ impl OpState for MetalFusedSdpaState {
                 "TRACT_METAL_DISABLE_FLASH_SDPA",
                 "TRACT_METAL_DISABLE_GPT_OSS_FLASH",
             );
-        let use_q8 = kv_q8_enabled() && d % Q8_BLOCK == 0;
+        let use_q8 = self.qk_split.is_none() && kv_q8_enabled() && d % Q8_BLOCK == 0;
         let use_q8_decode = use_q8 && !use_flash && s_len <= FLASH_MAX_S;
         let f16dt = f16::datum_type();
         let gemm = GgmlGemm;
@@ -783,7 +801,7 @@ impl OpState for MetalFusedSdpaState {
                         stream.retain_tensor(t);
                     }
                     // QK gemm of the block: scores [Hkv, m, bt].
-                    gemm.dispatch_eval(
+                    dispatch_qk(
                         stream,
                         GemmDispatchParams {
                             dts: [f16dt, f16dt, f16dt],
@@ -801,9 +819,10 @@ impl OpState for MetalFusedSdpaState {
                             a_strides: tvec![(m * d) as isize, d as isize, 1],
                             b_strides: tvec![(self.k.cap * d) as isize, d as isize, 1],
                         },
-                        get_metal_buffer(&q_a),
-                        get_metal_buffer(&k_bj),
-                        get_metal_buffer(&scores_b),
+                        &q_a,
+                        &k_bj,
+                        &scores_b,
+                        self.qk_split,
                     )?;
                     dispatch_sdpa_prefill_block_softmax_f16(
                         stream, &scores_b, &mask_2d, &probs_b, &m_state, &l_state, &rescale, rows,
@@ -900,7 +919,7 @@ impl OpState for MetalFusedSdpaState {
             // K^T [Hkv, T, D] -> scores [Hkv, group*S, T(row-padded)]. In
             // split-k mode the pad columns compute garbage from the zeroed
             // cache tail; the softmax overwrites them with zeros.
-            gemm.dispatch_eval(
+            dispatch_qk(
                 stream,
                 GemmDispatchParams {
                     dts: [f16dt, f16dt, f16dt],
@@ -918,9 +937,10 @@ impl OpState for MetalFusedSdpaState {
                     a_strides: tvec![(m * d) as isize, d as isize, 1],
                     b_strides: tvec![(self.k.cap * d) as isize, d as isize, 1],
                 },
-                get_metal_buffer(&q_a),
-                get_metal_buffer(&k_b),
-                get_metal_buffer(&scores_all),
+                &q_a,
+                &k_b,
+                &scores_all,
+                self.qk_split,
             )?;
             // Fused scale+mask+sinks softmax over all rows at once.
             dispatch_sinks_softmax_f16(
@@ -998,6 +1018,7 @@ impl OpState for MetalFusedSdpaState {
             use tract_transformers::ops::fused_sdpa::FusedSdpa as CpuOp;
             let cpu_op = CpuOp {
                 scale_bits: self.scale.to_bits(),
+                qk_split: self.qk_split,
                 window: self.window,
                 has_sinks: self.has_sinks,
             };
@@ -1152,6 +1173,57 @@ impl DeviceKvBuffer {
     }
 }
 
+/// Compute QK with optional per-part f16 rounding before the f16 sum.
+fn dispatch_qk(
+    stream: &crate::MetalStream,
+    params: GemmDispatchParams,
+    q: &DeviceTensor,
+    k: &DeviceTensor,
+    output: &DeviceTensor,
+    split: Option<usize>,
+) -> TractResult<()> {
+    let Some(split) = split else {
+        return GgmlGemm.dispatch_eval(
+            stream,
+            params,
+            get_metal_buffer(q),
+            get_metal_buffer(k),
+            get_metal_buffer(output),
+        );
+    };
+    ensure!(split > 0 && split < params.k);
+    let partial = DeviceTensor::uninitialized_dt(f16::datum_type(), output.shape())?;
+    stream.retain_tensor(&partial);
+    let mut first = params.clone();
+    first.k = split;
+    GgmlGemm.dispatch_eval(
+        stream,
+        first,
+        get_metal_buffer(q),
+        get_metal_buffer(k),
+        get_metal_buffer(output),
+    )?;
+    let mut second = params;
+    second.k -= split;
+    second.a_offset += split * 2;
+    second.b_offset += split * 2;
+    second.c_offset = 0;
+    GgmlGemm.dispatch_eval(
+        stream,
+        second,
+        get_metal_buffer(q),
+        get_metal_buffer(k),
+        get_metal_buffer(&partial),
+    )?;
+    crate::kernels::bin_ops::dispatch_eval(
+        stream,
+        &tract_core::ops::math::Add,
+        output,
+        &partial,
+        output,
+    )
+}
+
 crate::register_metal_op!(FusedSdpa, |source, node, op| {
     if env_flag_with_legacy("TRACT_METAL_DISABLE_FUSED_SDPA", "TRACT_METAL_DISABLE_GPT_OSS_SDPA") {
         return Ok(None);
@@ -1163,6 +1235,7 @@ crate::register_metal_op!(FusedSdpa, |source, node, op| {
     rule_if!(!op.has_sinks || facts[6].datum_type == DatumType::F32);
     Ok(Some(Box::new(MetalFusedSdpa {
         scale_bits: op.scale_bits,
+        qk_split: op.qk_split,
         window: op.window,
         has_sinks: op.has_sinks,
     })))
@@ -1339,7 +1412,12 @@ mod tests {
         let mask = model.add_const("mask", Tensor::zero::<f32>(&[1, 1, 1, 1])?)?;
         let out = model.wire_node(
             "attention",
-            FusedSdpa { scale_bits: 0.125f32.to_bits(), window: 0, has_sinks: false },
+            FusedSdpa {
+                scale_bits: 0.125f32.to_bits(),
+                qk_split: None,
+                window: 0,
+                has_sinks: false,
+            },
             &[q, k, v, empty, empty, mask],
         )?;
         model.select_output_outlets(&out)?;
@@ -1370,6 +1448,7 @@ mod tests {
         let init = rng_tensor(&[1, hkv, 3, d], &mut seed).cast_to::<f16>()?.into_owned();
         let mut base = MetalFusedSdpaState {
             scale: 1.0,
+            qk_split: None,
             window: 0,
             has_sinks: false,
             k: DeviceKvBuffer::default(),
@@ -1382,7 +1461,12 @@ mod tests {
             stream.wait_until_completed()
         })?;
 
+        let snapshot = base.k.snapshot()?;
+        ensure!(base.k.matches_prefix(&snapshot));
+        let independent = init.clone().into_device()?;
+        ensure!(!base.k.matches_prefix(&independent));
         let mut continued = base.clone();
+        ensure!(continued.k.matches_prefix(&snapshot));
         let mut branched = base.clone();
 
         let chunk_a = rng_tensor(&[1, hkv, 1, d], &mut seed).cast_to::<f16>()?.into_owned();
@@ -1428,8 +1512,14 @@ mod tests {
         crate::context::metal_context();
         let (hq, hkv, d) = (4usize, 2usize, 64usize);
         let scale = (d as f32).sqrt().recip();
-        let op = MetalFusedSdpa { scale_bits: scale.to_bits(), window: 0, has_sinks: true };
-        let cpu_op = CpuOp { scale_bits: scale.to_bits(), window: 0, has_sinks: true };
+        let op = MetalFusedSdpa {
+            scale_bits: scale.to_bits(),
+            qk_split: None,
+            window: 0,
+            has_sinks: true,
+        };
+        let cpu_op =
+            CpuOp { scale_bits: scale.to_bits(), qk_split: None, window: 0, has_sinks: true };
         let ctx = EvalContext::out_of_plan();
         let mut metal_state = op.state(&ctx)?.unwrap();
 
@@ -1544,10 +1634,12 @@ mod tests {
         let op_window = if window == usize::MAX { 0 } else { window as u32 };
         let op = MetalFusedSdpa {
             scale_bits: scale.to_bits(),
+            qk_split: None,
             window: op_window,
             has_sinks: with_sinks,
         };
-        let cpu_op = CpuOp { scale_bits: scale.to_bits(), window: 0, has_sinks: with_sinks };
+        let cpu_op =
+            CpuOp { scale_bits: scale.to_bits(), qk_split: None, window: 0, has_sinks: with_sinks };
         let ctx = EvalContext::out_of_plan();
         let mut metal_state = op.state(&ctx)?.unwrap();
 
