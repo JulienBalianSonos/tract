@@ -18,3 +18,5 @@ pub use routed_bias_add::MetalRoutedBiasAdd;
 pub use routed_combine::MetalRoutedCombine;
 pub use routed_q40_matmul::MetalRoutedQ40MatMul;
 pub use routed_q40_swiglu::MetalRoutedQ40SwiGlu;
+
+pub mod fused_sdpa;
