@@ -829,19 +829,14 @@ fn dequant(
     let k_axis = op.k_axis();
 
     let mut taps = patch.taps(model, &node.inputs)?;
-    for ab in [0, 1] {
-        let scale_input = 4 + ab * 2;
-        if !patch.outlet_fact(taps[scale_input])?.shape.volume().is_one() {
-            let q_axis_in_output = op.axes.axis((InOut::In(scale_input), 0))?.outputs[0][0];
-            let output_rank = node.outputs[0].fact.rank();
-            for i in 1..(output_rank - q_axis_in_output) {
-                taps[scale_input] = patch.wire_node(
-                    format!("{name}.scale_input{ab}_axis_fix_{i}"),
-                    AxisOp::Add(i),
-                    &[taps[scale_input]],
-                )?[0];
-            }
-        }
+    for (slot, tap) in taps.iter_mut().enumerate().skip(3) {
+        *tap = wire_axes_fix(
+            &mut patch,
+            name,
+            &format!("quant_param{slot}"),
+            &op.axes.extract_sub_mapping(&[slot], &[0])?,
+            tvec!(*tap),
+        )?[0];
     }
 
     let [mut a, mut b, bias, mut a0, a_scale, mut b0, b_scale, c0, c_scale] = *taps else {
@@ -918,6 +913,17 @@ fn optimized_mat_mul(
     let taps = patch.taps(model, &node.inputs)?;
     let name = &node.name;
 
+    // NCHW 1x1 activations are already K-major with a contiguous mn axis. The
+    // 32x32 SME kernel can load that row in place. Const A, a non-SME kernel,
+    // and an extractor stay on the copy. The 3x3 gather is a different node.
+    let strided_a = impls.len() == 1
+        && impls[0].2.is_none()
+        && matches!(impls[0].1, 0 | 1)
+        && input_facts[0].konst.is_none()
+        && input_facts[0].exotic_fact.is_none()
+        && input_facts[0].datum_type == DatumType::F32
+        && impls[0].0.name() == "sme_mmm_f32_32x32";
+
     let pack_a: Box<dyn TypedOp> = if input_facts[0].konst.is_some() {
         if let Some(packed_format) = left_pack.downcast_ref::<PackedBlockQuantFormat>().cloned() {
             Box::new(OptSimpleMatMulPack {
@@ -935,6 +941,13 @@ fn optimized_mat_mul(
                 mn_axis: op.a_m(),
             })
         }
+    } else if strided_a {
+        Box::new(OptMatMulPack {
+            packers: vec![Box::new(tract_linalg::strided_panel::StridedKMajor::new(32))],
+            mode_picker: mode_picker.clone(),
+            k_axis: op.a_k(),
+            mn_axis: op.a_m(),
+        })
     } else {
         Box::new(OptMatMulPack {
             packers: impls
@@ -991,10 +1004,13 @@ fn optimized_mat_mul(
         c_to_a_axis_mapping: MapOutputAxisToInput(c_to_a_axis_mapping),
         c_to_b_axis_mapping: MapOutputAxisToInput(c_to_b_axis_mapping),
     };
-    let (mmms, packings, extractor): (Vec<_>, Vec<_>, Vec<_>) = multiunzip(impls);
+    let (mmms, mut packings, extractor): (Vec<_>, Vec<_>, Vec<_>) = multiunzip(impls);
+    if strided_a {
+        packings[0] = 1;
+    }
     let outputs = mmms.iter().map(|mmm| unsafe { mmm.c_view(op.c_m(), op.c_n()) }).collect();
     let trivial_packing = mmms.len() == 1
-        && packings[0] == 0
+        && (packings[0] == 0 || strided_a)
         && extractor[0].is_none()
         && input_facts[0].exotic_fact.is_none();
     let opt = OptMatMul::new(

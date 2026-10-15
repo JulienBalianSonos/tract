@@ -424,7 +424,7 @@ fn avx2_preferred(
 ) -> Option<&'static str> {
     match (dt, query.n) {
         (DatumType::I32, Some(1)) => None,
-        (DatumType::I32, _) => Some(mmm::avx2_mmm_i32_8x8.name.as_str()),
+        (DatumType::I32, _) => Some(&mmm::avx2_mmm_i32_8x8.name.as_str()),
         _ => None,
     }
 }

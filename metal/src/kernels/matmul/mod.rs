@@ -472,6 +472,7 @@ mod tests {
     //   cargo test -p tract-metal bench_skinny_gemm -- --ignored --nocapture
     #[test]
     #[ignore]
+    // The objc msg_send!/sel! macros expand to a cargo-clippy cfg check.
     #[allow(unexpected_cfgs)]
     fn bench_skinny_gemm() -> TractResult<()> {
         use std::time::Instant;
@@ -528,11 +529,11 @@ mod tests {
                                         dt,
                                         (m, n, k),
                                         &cfg,
-                                        &get_metal_buffer(&a),
+                                        get_metal_buffer(&a),
                                         a.buffer_offset(),
-                                        &get_metal_buffer(&b),
+                                        get_metal_buffer(&b),
                                         b.buffer_offset(),
-                                        &get_metal_buffer(&c),
+                                        get_metal_buffer(&c),
                                         c.buffer_offset(),
                                     )
                                 })

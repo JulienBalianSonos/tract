@@ -456,10 +456,10 @@ mod tests {
             let next = next.to_host()?.into_tensor();
             output
                 .cast_to::<f32>()?
-                .close_enough(&cpu[0].cast_to::<f32>()?.into_owned(), Approximation::Approximate)?;
+                .close_enough(&*cpu[0].cast_to::<f32>()?, Approximation::Approximate)?;
             next.cast_to::<f32>()?
                 .into_owned()
-                .close_enough(&cpu[1].cast_to::<f32>()?.into_owned(), Approximation::Approximate)?;
+                .close_enough(&*cpu[1].cast_to::<f32>()?, Approximation::Approximate)?;
             Ok(())
         })
     }

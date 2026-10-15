@@ -213,10 +213,6 @@ fn convert_const(op: &Const) -> TractResult<Const> {
 
 /// Construct a device cast preserving the requested dtype and rounding.
 pub(crate) fn cuda_cast_new(to: DatumType) -> Option<tract_gpu::ops::cast::GpuCast> {
-    cuda_source_cast_new(to)
-}
-
-pub(crate) fn cuda_source_cast_new(to: DatumType) -> Option<tract_gpu::ops::cast::GpuCast> {
     tract_gpu::ops::cast::GpuCast::new(
         to,
         "Cuda",

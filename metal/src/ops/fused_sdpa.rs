@@ -1507,7 +1507,6 @@ mod tests {
     /// bytes untouched (other sessions may still hold views of it).
     #[test]
     fn metal_truncation_matches_cpu() -> TractResult<()> {
-        use tract_gpu::tensor::DeviceTensor;
         force_flash_for_tests();
         crate::context::metal_context();
         let (hq, hkv, d) = (4usize, 2usize, 64usize);

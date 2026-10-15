@@ -40,12 +40,7 @@ fn ser_apply_rope(
     Ok(Some(invocation("tract_transformers_apply_rope", &[input, cos, sin], &[])))
 }
 
-/// Some exported graphs (e.g. torch_to_nnef partial-rotary attention) express
-/// the rotary slices as dyn_slice ops whose bounds are computed from shape_of
-/// chains. Those chains are constant once prop_consts has run, but the rope
-/// patterns below only match static Slice ops, so fold DynSlice into Slice
-/// whenever both bounds have resolved to constants. Bounds are kept as TDim,
-/// so symbolic-but-constant expressions fold too.
+/// Applies core's constant-bound slice simplification before RoPE detection.
 pub fn fold_const_dyn_slice_rule(
     _ctx: &(),
     model: &TypedModel,
@@ -53,22 +48,7 @@ pub fn fold_const_dyn_slice_rule(
     _node_name: &str,
     op: &DynSlice,
 ) -> TractResult<Option<TypedModelPatch>> {
-    let inputs = model.node_input_facts(node.id)?;
-    rule_if_some!(start = &inputs[1].konst);
-    rule_if_some!(end = &inputs[2].konst);
-    let (Ok(start), Ok(end)) = (as_scalar_tdim(start), as_scalar_tdim(end)) else {
-        return Ok(None);
-    };
-    Ok(Some(TypedModelPatch::replace_single_op(
-        model,
-        node,
-        &[node.inputs[0]],
-        Slice { axis: op.axis, start, end },
-    )?))
-}
-
-fn as_scalar_tdim(t: &Tensor) -> TractResult<TDim> {
-    Ok(t.cast_to::<TDim>()?.try_as_plain_ram()?.to_scalar::<TDim>()?.clone())
+    op.declutter(model, node)
 }
 
 /// Exporters may wrap binary-op operands in no-op casts (cast to the dtype
@@ -83,10 +63,7 @@ pub fn fold_identity_cast_rule(
     op: &tract_nnef::tract_core::ops::cast::Cast,
 ) -> TractResult<Option<TypedModelPatch>> {
     rule_if!(model.node_input_facts(node.id)?[0].datum_type == op.to);
-    let mut patch = TypedModelPatch::default();
-    let input = patch.tap_model(model, node.inputs[0])?;
-    patch.shunt_outside(model, node.id.into(), input)?;
-    Ok(Some(patch))
+    TypedModelPatch::shunt_one_op(model, node)
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
