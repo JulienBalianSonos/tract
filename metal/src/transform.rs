@@ -227,6 +227,9 @@ impl MetalTransform {
     ) -> TractResult<()> {
         // Init Metal Context if not done previously
         metal_context();
+        tract_gpu::memory::register_may_alias_check(
+            crate::ops::fused_axis_op::fused_axis_op_may_alias,
+        );
 
         rewire_sdpa_metal(model)?;
         rewrite_einsum_to_prefix_matmul(model, false)?;
@@ -270,6 +273,16 @@ impl MetalTransform {
         // dispatches are worth absorbing into their norm consumer.
         Rewriter::default()
             .with_rule_for("fuse_rms_norm_residual", fuse_rms_norm_residual)
+            .rewrite(&(), model)?;
+        Rewriter::default()
+            .with_rule_for(
+                "fuse_view_copy_slice",
+                tract_gpu::rewrite_rules::fused_view_copy::fuse_view_copy_slice,
+            )
+            .with_rule_for(
+                "fuse_view_copy_axis",
+                tract_gpu::rewrite_rules::fused_view_copy::fuse_view_copy_axis,
+            )
             .rewrite(&(), model)?;
         Rewriter::default()
             .with_rule_for("fuse_move_axis", rewrite_rules::fuse_move_axis)

@@ -55,6 +55,14 @@ impl EvalOp for GpuSlice {
 
         let offset = (start * input_strides[axis] as usize) * input_dt.size_of();
 
+        // A slice that stays packed in memory (e.g. leading-axis slices, or
+        // any slice once the outer dims are 1) needs no copy at all.
+        if o_shape.iter().all(|&d| d != 0)
+            && let Some(view) = input.try_dense_alias(&o_shape, input_strides, offset)?
+        {
+            return Ok(tvec![view.into_tensor().into_tvalue()]);
+        }
+
         let output = crate::turn_handler::make_tensor_for_node(ctx, input.datum_type(), &o_shape)?;
 
         if o_shape[axis] != 0 {
