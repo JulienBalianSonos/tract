@@ -13,3 +13,5 @@ macro_rules! rule_ensure {
 }
 
 pub mod fused_view_copy;
+
+pub mod concat;

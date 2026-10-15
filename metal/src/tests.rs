@@ -1226,4 +1226,112 @@ mod tests {
             .close_enough(&metal_out[0].clone().into_tensor(), Approximation::Exact)?;
         Ok(())
     }
+    /// The fused elementwise chain rewrite must collapse a
+    /// cast/add/exp/mul/silu tree into one MetalFusedElementwise dispatch and
+    /// stay numerically on top of the CPU reference.
+    #[test]
+    fn norm_cast_scale_fuses_without_removing_rounding() -> TractResult<()> {
+        use tract_core::ops::binary::TypedBinOp;
+        use tract_core::ops::cast::Cast;
+        use tract_core::ops::math::Mul;
+        use tract_transformers::ops::rms_norm::RmsNorm;
+        let mut model = TypedModel::default();
+        let input = model.add_source("x", f32::fact([2, 8]))?;
+        let norm = model.wire_node(
+            "norm",
+            RmsNorm { axis: 1, eps: tensor0(1e-4f32).into_arc_tensor() },
+            &[input],
+        )?;
+        let cast = model.wire_node("round", Cast { to: DatumType::F16 }, &norm)?;
+        let gamma = model.add_const(
+            "gamma",
+            Tensor::from_shape(&[1, 8], &[0.13f32, 0.7, 1.9, 2.3, 0.9, 0.31, 4.7, 0.17])?
+                .cast_to::<f16>()?
+                .into_owned(),
+        )?;
+        let out = model.wire_node("scale", TypedBinOp(Box::new(Mul), None), &[cast[0], gamma])?;
+        model.select_output_outlets(&out)?;
+        let x = Tensor::from_shape(
+            &[2, 8],
+            &(0..16).map(|i| i as f32 / 3.7 - 1.8).collect::<Vec<_>>(),
+        )?;
+        let expected =
+            DefaultRuntime.prepare(model.clone())?.run(tvec![x.clone().into_tvalue()])?;
+        let mut transformed = model.clone();
+        MetalTransform::default().transform(&mut transformed)?;
+        ensure!(transformed.nodes().iter().any(|n| {
+            n.op_as::<tract_gpu::ops::rms_norm::GpuRmsNorm>()
+                .is_some_and(|op| op.has_scale && op.round_scale_f16)
+        }));
+        let actual = crate::MetalRuntime.prepare(model)?.run(tvec![x.into_tvalue()])?;
+        actual[0].close_enough(&expected[0], Approximation::SuperApproximate)
+    }
+
+    #[test]
+    fn fused_elementwise_chain_matches_cpu() -> TractResult<()> {
+        use tract_core::ops::cast::cast;
+        use tract_core::ops::math::exp;
+        use tract_core::ops::nn::Silu;
+
+        let mut model = TypedModel::default();
+        let x = model.add_source("x", f16::fact([2, 3, 32]))?;
+        let y = model.add_source("y", f32::fact([2, 3, 32]))?;
+        let bias = model.add_const(
+            "bias",
+            Tensor::from_shape(
+                &[1, 1, 32],
+                &(0..32).map(|i| (i as f32) * 0.01 - 0.15).collect::<Vec<_>>(),
+            )?,
+        )?;
+        let x32 = model.wire_node("up", cast(f32::datum_type()), &[x])?[0];
+        let biased = model.wire_node("add", add(), &[x32, bias])?[0];
+        let e = model.wire_node("exp", exp(), &[biased])?[0];
+        let sil = model.wire_node(
+            "silu",
+            tract_core::ops::element_wise::ElementWiseOp(Box::new(Silu {}), None),
+            &[y],
+        )?[0];
+        let m = model.wire_node("mul", mul(), &[e, sil])?[0];
+        let out = model.wire_node("down", cast(f16::datum_type()), &[m])?;
+        model.select_output_outlets(&out)?;
+
+        let mk_x = || -> TractResult<TValue> {
+            let data: Vec<f16> =
+                (0..2 * 3 * 32).map(|i| f16::from_f32(((i % 17) as f32) * 0.05 - 0.4)).collect();
+            Ok(Tensor::from_shape(&[2, 3, 32], &data)?.into_tvalue())
+        };
+        let mk_y = || -> TractResult<TValue> {
+            let data: Vec<f32> = (0..2 * 3 * 32).map(|i| ((i % 13) as f32) * 0.1 - 0.6).collect();
+            Ok(Tensor::from_shape(&[2, 3, 32], &data)?.into_tvalue())
+        };
+
+        let cpu_out = model.clone().into_runnable()?.run(tvec![mk_x()?, mk_y()?])?;
+
+        let metal = MetalTransform::default().transform_into(model)?;
+        ensure!(
+            metal
+                .nodes()
+                .iter()
+                .any(|n| n.op_is::<crate::ops::fused_elementwise::MetalFusedElementwise>()),
+            "no MetalFusedElementwise node after transform"
+        );
+        // The whole 6-op tree must have collapsed into a single dispatch.
+        let leftover = metal
+            .nodes()
+            .iter()
+            .filter(|n| {
+                n.op_is::<tract_gpu::ops::element_wise::GpuElementWise>()
+                    || n.op_is::<tract_gpu::ops::binary::GpuBinOp>()
+                    || n.op_is::<tract_gpu::ops::cast::GpuCast>()
+            })
+            .count();
+        ensure!(leftover == 0, "{leftover} unfused elementwise device ops remain");
+        let metal_out = metal.into_runnable()?.run(tvec![mk_x()?, mk_y()?])?;
+
+        cpu_out[0]
+            .clone()
+            .into_tensor()
+            .close_enough(&metal_out[0].clone().into_tensor(), Approximation::Approximate)?;
+        Ok(())
+    }
 }

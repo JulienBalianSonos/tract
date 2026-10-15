@@ -25,8 +25,9 @@ use tract_core::transform::ModelTransform;
 use tract_gpu::fact::{DeviceFact, DeviceTypedFactExt};
 use tract_gpu::rewrite_rules::rewire_syncs::rewire_syncs;
 use tract_gpu::rewrite_rules::rms_norm::{
-    fuse_rms_norm_residual, fuse_rms_norm_scale, fuse_rms_norm_split_scale,
-    fuse_scaled_rms_norm_in_cast, fuse_scaled_rms_norm_out_cast, remove_rms_norm_cast,
+    fuse_rms_norm_residual, fuse_rms_norm_scale, fuse_rms_norm_scale_after_cast,
+    fuse_rms_norm_split_scale, fuse_scaled_rms_norm_in_cast, fuse_scaled_rms_norm_out_cast,
+    remove_rms_norm_cast,
 };
 use tract_gpu::rewrite_rules::scaled_masked_softmax::drop_unit_axes_of_scaled_masked_softmax;
 use tract_gpu::sync::{
@@ -251,6 +252,11 @@ impl MetalTransform {
                 drop_unit_axes_of_scaled_masked_softmax,
             )
             .with_rule_for("fuse_rms_norm_scale", fuse_rms_norm_scale)
+            .with_rule_for("fuse_rms_norm_scale_after_cast", fuse_rms_norm_scale_after_cast)
+            .with_rule_for(
+                "collapse_adjacent_slice_concat",
+                tract_gpu::rewrite_rules::concat::collapse_adjacent_slice_concat,
+            )
             .with_rule_for("fuse_rms_norm_split_scale", fuse_rms_norm_split_scale)
             .with_rule_for("remove_rms_norm_cast", remove_rms_norm_cast)
             .with_rule_for("fuse_scaled_rms_norm_in_cast", fuse_scaled_rms_norm_in_cast)
@@ -272,6 +278,14 @@ impl MetalTransform {
 
         // After elementwise fusion: only residual adds that stayed standalone
         // dispatches are worth absorbing into their norm consumer.
+        Rewriter::default()
+            .with_rule_for("fuse_elementwise_chain_ew", rewrite_rules::fuse_elementwise_chain_ew)
+            .with_rule_for("fuse_elementwise_chain_bin", rewrite_rules::fuse_elementwise_chain_bin)
+            .with_rule_for(
+                "fuse_elementwise_chain_cast",
+                rewrite_rules::fuse_elementwise_chain_cast,
+            )
+            .rewrite(&(), model)?;
         Rewriter::default()
             .with_rule_for("fuse_rms_norm_residual", fuse_rms_norm_residual)
             .rewrite(&(), model)?;
