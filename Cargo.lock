@@ -5453,6 +5453,7 @@ dependencies = [
  "minijinja",
  "nom 8.0.0",
  "nom-language",
+ "rustix 1.1.5",
  "safetensors",
  "serde",
  "serde_json",

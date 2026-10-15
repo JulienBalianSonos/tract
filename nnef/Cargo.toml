@@ -30,6 +30,9 @@ erased-serde.workspace = true
 serde.workspace = true
 tract-core.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
 [dev-dependencies]
 temp-dir = "0.2.0"
 serde_json.workspace = true

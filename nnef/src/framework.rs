@@ -30,6 +30,23 @@ pub fn stdlib() -> Vec<FragmentDef> {
     crate::ast::parse::parse_fragments(include_str!("../stdlib.nnef")).unwrap()
 }
 
+/// Opens a model resource, optionally bypassing the macOS file cache when
+/// `TRACT_NNEF_NOCACHE=1`. Other platforms reject that opt-in policy.
+fn open_model_file(path: &Path) -> TractResult<std::fs::File> {
+    let file = std::fs::File::open(path)?;
+    if std::env::var_os("TRACT_NNEF_NOCACHE").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        #[cfg(target_os = "macos")]
+        {
+            rustix::fs::fcntl_nocache(&file, true)
+                .context("Could not disable model-file caching")?;
+            log::info!("NNEF uncached file read: {}", path.display());
+        }
+        #[cfg(not(target_os = "macos"))]
+        bail!("TRACT_NNEF_NOCACHE requires macOS");
+    }
+    Ok(file)
+}
+
 pub struct Nnef {
     pub stdlib: Vec<FragmentDef>,
     pub registries: Vec<Registry>,
@@ -298,7 +315,7 @@ impl tract_core::prelude::Framework<ProtoModel, TypedModel> for Nnef {
     fn proto_model_for_path(&self, path: impl AsRef<Path>) -> TractResult<ProtoModel> {
         let path = path.as_ref();
         if path.is_file() {
-            let mut f = std::fs::File::open(path)?;
+            let mut f = open_model_file(path)?;
             return self.proto_model_for_read(&mut f);
         }
 
@@ -318,7 +335,7 @@ impl tract_core::prelude::Framework<ProtoModel, TypedModel> for Nnef {
                 .components()
                 .skip(path.components().count())
                 .collect::<std::path::PathBuf>();
-            let mut stream = std::fs::File::open(entry.path())?;
+            let mut stream = open_model_file(&entry.path())?;
             read_stream(&subpath, &mut stream, &mut resources, self)?;
         }
         proto_model_from_resources(resources)
@@ -524,6 +541,33 @@ mod tests {
             assert!(format!("{e:?}").contains("Invalid label"), "{e:?}");
         }
         assert!(!dir.path().parent().unwrap().join("evil.dat").exists());
+        Ok(())
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod uncached_tests {
+    use super::*;
+
+    #[test]
+    fn uncached_archive_matches_cached_output() -> TractResult<()> {
+        let dir = temp_dir::TempDir::new()?;
+        let path = dir.path().join("model.nnef.tar");
+        let framework = nnef();
+        let mut model = TypedModel::default();
+        let expected = tensor1(&[1f32; 16]);
+        let output = model.add_const("values", expected.clone())?;
+        model.select_output_outlets(&[output])?;
+        framework.write_to_tar(&model, std::fs::File::create(&path)?)?;
+        for uncached in [false, true] {
+            let mut file = std::fs::File::open(&path)?;
+            rustix::fs::fcntl_nocache(&file, uncached)?;
+            let loaded = framework.model_for_read(&mut file)?;
+            let actual = loaded.into_runnable()?.run(tvec![])?;
+            assert_eq!(&*actual[0], &expected);
+        }
+        let actual = framework.model_for_path(&path)?.into_runnable()?.run(tvec![])?;
+        assert_eq!(&*actual[0], &expected);
         Ok(())
     }
 }
