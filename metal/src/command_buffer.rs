@@ -85,3 +85,120 @@ impl DerefMut for TCommandBuffer {
         &mut self.inner
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::MetalStream;
+    use metal::foreign_types::ForeignTypeRef;
+    use objc::rc::{WeakPtr, autoreleasepool};
+
+    fn check_command_objects_released(profile: bool) -> tract_core::internal::TractResult<()> {
+        // An outer pool makes a missing inner drain observable without leaking
+        // test objects into the worker thread's lifetime.
+        autoreleasepool(|| {
+            let stream = MetalStream::new();
+            let device = metal::Device::system_default().expect("Metal device");
+            if profile {
+                if !device
+                    .supports_counter_sampling(metal::MTLCounterSamplingPoint::AtStageBoundary)
+                {
+                    eprintln!(
+                        "Skipping profiled lifetime test: no stage-boundary counter sampling"
+                    );
+                    return Ok(());
+                }
+                stream.enable_profiling()?;
+            }
+            let library = device
+                .new_library_with_source(
+                    r#"
+                    #include <metal_stdlib>
+                    using namespace metal;
+                    kernel void lifetime_test(device const uint *input [[buffer(0)]],
+                                              device uint *output [[buffer(1)]],
+                                              uint i [[thread_position_in_grid]]) {
+                        output[i] = 2 * input[i] + 1;
+                    }
+                    "#,
+                    &metal::CompileOptions::new(),
+                )
+                .map_err(|e| tract_core::internal::anyhow!("{e}"))?;
+            let function = library
+                .get_function("lifetime_test", None)
+                .map_err(|e| tract_core::internal::anyhow!("{e}"))?;
+            for _ in 0..4 {
+                let pipeline = device
+                    .new_compute_pipeline_state_with_function(&function)
+                    .map_err(|e| tract_core::internal::anyhow!("{e}"))?;
+                let zeros = [0u32; 8];
+                let output = device.new_buffer_with_data(
+                    zeros.as_ptr().cast(),
+                    std::mem::size_of_val(&zeros) as _,
+                    metal::MTLResourceOptions::StorageModeShared,
+                );
+                let command = stream.command_buffer();
+                let weak_command = unsafe { WeakPtr::new(command.as_ptr().cast()) };
+                let encoders = RefCell::new(Vec::new());
+                for dispatch in 0..2 {
+                    let values = [1u32, 2, 3, 4];
+                    let input = device.new_buffer_with_data(
+                        values.as_ptr().cast(),
+                        std::mem::size_of_val(&values) as _,
+                        metal::MTLResourceOptions::StorageModeShared,
+                    );
+                    command.encode(|encoder| {
+                        encoders
+                            .borrow_mut()
+                            .push(unsafe { WeakPtr::new(encoder.as_ptr().cast()) });
+                        encoder.set_compute_pipeline_state(&pipeline);
+                        encoder.set_buffer(0, Some(&input), 0);
+                        encoder.set_buffer(1, Some(&output), dispatch * 16);
+                        encoder.dispatch_thread_groups(
+                            metal::MTLSize::new(4, 1, 1),
+                            metal::MTLSize::new(1, 1, 1),
+                        );
+                    });
+                }
+                // Inputs and the pipeline lose their caller-owned references
+                // before submission; the command must retain execution resources.
+                drop(pipeline);
+                // The owned command must survive its construction pool.
+                assert!(!weak_command.load().is_null());
+                stream.wait_until_completed()?;
+                assert_eq!(command.status(), metal::MTLCommandBufferStatus::Completed);
+                // Shared storage is CPU-readable after GPU completion.
+                let result =
+                    unsafe { std::slice::from_raw_parts(output.contents().cast::<u32>(), 8) };
+                assert_eq!(result, &[3, 5, 7, 9, 3, 5, 7, 9]);
+                drop(command);
+                let encoders = encoders.into_inner();
+                // GPU completion can precede the driver's final reference release.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while (!weak_command.load().is_null()
+                    || encoders.iter().any(|encoder| !encoder.load().is_null()))
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                assert!(weak_command.load().is_null(), "completed command retained by outer pool");
+                for encoder in encoders {
+                    assert!(encoder.load().is_null(), "completed encoder retained by outer pool");
+                }
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn command_objects_released_without_caller_pool_drain() -> tract_core::internal::TractResult<()>
+    {
+        check_command_objects_released(false)
+    }
+
+    #[test]
+    fn profiled_command_objects_released_without_caller_pool_drain()
+    -> tract_core::internal::TractResult<()> {
+        check_command_objects_released(true)
+    }
+}
