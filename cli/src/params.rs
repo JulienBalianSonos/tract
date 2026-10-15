@@ -211,12 +211,8 @@ impl Parameters {
         let triplet: (SomeGraphDef, Box<dyn Model>, Option<TfExt>) = match format {
             "nnef" => {
                 let nnef = super::nnef(matches);
-                let mut proto_model = if location.is_dir() {
-                    match location {
-                        Location::Fs(dir) => nnef.proto_model_for_path(dir)?,
-                        #[cfg(not(target_family = "wasm"))]
-                        _ => unreachable!(),
-                    }
+                let mut proto_model = if let Location::Fs(path) = location {
+                    nnef.proto_model_for_path(path)?
                 } else if location
                     .path()
                     .extension()
