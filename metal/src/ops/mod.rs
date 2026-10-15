@@ -23,3 +23,6 @@ pub mod fused_sdpa;
 
 pub mod fused_elementwise;
 pub use fused_elementwise::MetalFusedElementwise;
+
+pub mod multi_gemm;
+pub use multi_gemm::MetalMultiGemm;
