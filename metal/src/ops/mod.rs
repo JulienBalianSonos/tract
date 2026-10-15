@@ -20,3 +20,6 @@ pub use routed_q40_matmul::MetalRoutedQ40MatMul;
 pub use routed_q40_swiglu::MetalRoutedQ40SwiGlu;
 
 pub mod fused_sdpa;
+
+pub mod fused_elementwise;
+pub use fused_elementwise::MetalFusedElementwise;
