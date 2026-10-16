@@ -1056,3 +1056,5 @@ mod tests {
         }
     }
 }
+
+pub use ggml_gemm::{dispatch_mul_mv_f16_split_k, dispatch_mul_mv_q8_0};

@@ -30,6 +30,28 @@ pub struct DeviceView {
 }
 
 impl DeviceView {
+    /// Build a nonnegative-stride view whose addressed elements fit in its buffer.
+    pub fn from_owned(
+        buffer: Arc<Box<dyn OwnedDeviceTensor>>,
+        dt: DatumType,
+        shape: TVec<usize>,
+        strides: TVec<isize>,
+        offset_bytes: usize,
+    ) -> TractResult<Self> {
+        ensure!(shape.len() == strides.len());
+        ensure!(strides.iter().all(|&s| s >= 0), "negative strides unsupported");
+        let max_index: usize =
+            shape.iter().zip(strides.iter()).map(|(&d, &s)| d.saturating_sub(1) * s as usize).sum();
+        let needed = offset_bytes + (max_index + 1) * dt.size_of();
+        let buffer_bytes = buffer.len() * buffer.datum_type().size_of();
+        ensure!(
+            shape.iter().product::<usize>() == 0 || needed <= buffer_bytes,
+            "view out of bounds: needs {needed} bytes, buffer has {buffer_bytes}"
+        );
+        let len = shape.iter().product();
+        Ok(Self { buffer, dt, len, shape, strides, offset_bytes, exotic_fact: None })
+    }
+
     #[inline]
     pub fn shape(&self) -> &[usize] {
         self.shape.as_slice()

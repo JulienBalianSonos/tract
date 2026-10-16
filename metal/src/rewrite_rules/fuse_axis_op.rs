@@ -105,6 +105,8 @@ pub fn fuse_axis_op(
 
     rule_ensure!(!is_axis_like || is_allowed_move);
 
+    rule_ensure!(node.outputs.len() == 1);
+
     let node_name = &node.name;
 
     rule_if_some!(in_nodes = model.all_prec(node.id)?);
