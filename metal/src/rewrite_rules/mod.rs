@@ -7,3 +7,8 @@ pub use add_matmul_broadcast::add_broadcast_pre_matmul;
 pub use fold_gdn_beta_sigmoid::fold_gdn_beta_sigmoid;
 pub use fuse_axis_op::{fuse_axis_op, fuse_move_axis};
 pub use untranspose_matmul_output::untranspose_matmul_output;
+
+mod fused_elementwise;
+pub use fused_elementwise::{
+    fuse_elementwise_chain_bin, fuse_elementwise_chain_cast, fuse_elementwise_chain_ew,
+};
