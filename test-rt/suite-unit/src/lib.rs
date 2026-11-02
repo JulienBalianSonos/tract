@@ -37,6 +37,7 @@ pub mod q_helpers;
 pub mod rms_norm;
 pub mod route_topk;
 pub mod routed_combine;
+pub mod routed_q40;
 pub mod scaled_masked_softmax;
 pub mod sdpa;
 pub mod silu;
@@ -45,6 +46,7 @@ pub mod sum_pool;
 
 pub fn suite() -> TractResult<TestSuite> {
     let mut suite: TestSuite = Default::default();
+    suite.add("routed_q40", routed_q40::suite()?);
     suite.add("routed_combine", routed_combine::suite()?);
     suite.add("route_topk", route_topk::suite()?);
     suite.add("bin_einsum", bin_einsum::suite()?);
