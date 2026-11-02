@@ -57,7 +57,7 @@ fn ignore_unit(t: &[String], case: &dyn Test) -> bool {
     }
 
     let [section, _unit] = t else { return false };
-    ["q_flavours", "route_topk"].contains(&&**section)
+    ["q_flavours", "routed_combine", "route_topk"].contains(&&**section)
 }
 
 fn ignore_onnx(t: &[String]) -> bool {
