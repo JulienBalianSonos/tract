@@ -24,6 +24,7 @@ pub mod gelu_approximate;
 pub mod gelu_exact;
 pub mod group_norm;
 pub mod layer_norm;
+pub mod matmul_f16;
 pub mod matmul_q40;
 pub mod max_pool;
 pub mod moe_ffn;
