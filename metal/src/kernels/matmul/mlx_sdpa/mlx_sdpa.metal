@@ -3415,6 +3415,20 @@ template <typename T, int D, int V = D>
       for (int j = 0; j < v_per_thread; j++) {
         o[j] = o[j] * factor + exp_score * values[j];
       }
+    } else if (float_mask) {
+      U score = 0;
+      for (int j = 0; j < qk_per_thread; j++) {
+        score += q[j] * keys[j];
+      }
+      score = simd_sum(score) + static_cast<U>(fmask[0]);
+      if (isnan(score)) {
+        sum_exp_score = NAN;
+      }
+      for (int j = 0; j < v_per_thread; j++) {
+        if (!isfinite(values[j])) {
+          o[j] = NAN;
+        }
+      }
     }
 
     // Move the pointers to the next kv
@@ -3574,6 +3588,20 @@ template <typename T, int D, int V = D>
       // Update the output accumulator
       for (int i = 0; i < v_per_thread; i++) {
         o[i] = o[i] * factor + exp_score * values[i];
+      }
+    } else if (float_mask) {
+      U score = 0;
+      for (int j = 0; j < qk_per_thread; j++) {
+        score += q[j] * keys[j];
+      }
+      score = simd_sum(score) + static_cast<U>(fmask[0]);
+      if (isnan(score)) {
+        sum_exp_score = NAN;
+      }
+      for (int j = 0; j < v_per_thread; j++) {
+        if (!isfinite(values[j])) {
+          o[j] = NAN;
+        }
       }
     }
 
