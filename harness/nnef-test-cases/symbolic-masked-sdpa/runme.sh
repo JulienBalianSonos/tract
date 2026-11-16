@@ -24,3 +24,5 @@ for lengths in '1 13' '1 4096' '9 17'; do
         $TRACT_RUN "$TEMP_CASE/batched" --opl --metal run --set S="$1" --set T="$2" --allow-random-input --assert-output-bundle "$TEMP_CASE/batched.npz" --approx approximate --assert-op-count MetalMlxSdpa 1
     fi
 done
+
+TRACT_RUN="$TRACT_RUN" TEST_SYMBOLIC=1 sh ../sdpa-special-values/runme.sh
