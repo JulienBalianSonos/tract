@@ -24,11 +24,11 @@ pub fn register(registry: &mut Registry) {
             TypeName::Scalar.tensor().named("k"),
             TypeName::Scalar.tensor().named("v"),
             TypeName::Scalar.tensor().named("mask"),
-            TypeName::Scalar.tensor().named("sinks"),
             TypeName::Scalar.named("scale"),
             TypeName::String.named("datum_type"),
             TypeName::String.named("acc_datum_type"),
             TypeName::Logical.named("is_causal"),
+            TypeName::Scalar.tensor().named("sinks"),
         ],
         &[("output", TypeName::Scalar.tensor())],
         deser_spda,
@@ -45,16 +45,15 @@ fn ser_sdpa(ast: &mut IntoAst, node: &TypedNode, op: &Sdpa) -> TractResult<Optio
         inputs.push(mask);
     }
 
-    if let Some(sinks) = node.inputs.get(4) {
-        inputs.push(ast.mapping[sinks].clone());
-    }
-
     // Attributes settings
     let mut attrs = vec![
         ("is_causal", logical(op.is_causal)),
         ("datum_type", datum_type(op.datum_type)),
         ("acc_datum_type", datum_type(op.acc_datum_type)),
     ];
+    if let Some(sinks) = node.inputs.get(4) {
+        attrs.push(("sinks", (*ast.mapping[sinks]).clone()));
+    }
     if let Some(scale) = op.scale.as_ref() {
         attrs.push(("scale", numeric(scale.cast_to_scalar::<f32>()?)));
     }
