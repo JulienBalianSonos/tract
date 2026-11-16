@@ -44,3 +44,5 @@ for model in "$TEMP_CASE/batched" "$TEMP_CASE/batched-f32"; do
         fi
     done
 done
+
+TRACT_RUN="$TRACT_RUN" TEST_SINKS=1 sh ../sdpa-special-values/runme.sh
