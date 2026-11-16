@@ -1,6 +1,7 @@
 pub mod apply_rope;
 mod cast_f32;
 pub mod causal_conv1d_update;
+pub mod detect_grouped_masked_sdpa;
 pub mod detect_sdpa;
 pub mod diag_gather;
 pub mod dyn_kv_cache;

@@ -139,3 +139,28 @@ impl ModelTransform for TransformersTransform {
             .rewrite(&(), model)
     }
 }
+
+/// Opt-in grouped attention conversion using SDPA accumulation and rounding.
+#[derive(Debug, Default)]
+pub struct GroupedMaskedSdpaTransform;
+
+impl ModelTransform for GroupedMaskedSdpaTransform {
+    fn name(&self) -> StaticName {
+        "experimental_grouped_masked_sdpa".into()
+    }
+
+    fn transform(&self, model: &mut TypedModel) -> TractResult<()> {
+        Rewriter::default()
+            .with_rule_for(
+                "grouped-masked-sdpa",
+                ops::detect_grouped_masked_sdpa::detect_grouped_masked_sdpa_rule,
+            )
+            .with_rule_for(
+                "masked-mha-sdpa",
+                ops::detect_grouped_masked_sdpa::detect_masked_mha_sdpa_rule,
+            )
+            .with_rule_for("sink-sdpa", ops::detect_grouped_masked_sdpa::detect_sink_sdpa_rule)
+            .with_rule_for("split-rope", ops::apply_rope::split_apply_rope_rule)
+            .rewrite(&(), model)
+    }
+}
