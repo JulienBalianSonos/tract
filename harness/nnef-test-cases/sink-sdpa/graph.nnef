@@ -13,5 +13,5 @@ graph attention(q, k, v, mask, sinks) -> (output) {
     k16 = tract_core_cast(k, to = 'f16');
     v16 = tract_core_cast(v, to = 'f16');
     mask16 = tract_core_cast(mask, to = 'f16');
-    output = tract_transformers_sdpa(q16, k16, v16, mask16, sinks, scale = 0.125, datum_type = 'f16', acc_datum_type = 'f32', is_causal = false);
+    output = tract_transformers_sdpa(q16, k16, v16, mask16, sinks = sinks, scale = 0.125, datum_type = 'f16', acc_datum_type = 'f32', is_causal = false);
 }
