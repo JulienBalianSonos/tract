@@ -3385,7 +3385,7 @@ template <typename T, int D, int V = D>
     } else if (bool_mask) {
       use_key = bmask[0];
     } else if (float_mask) {
-      use_key = !(fmask[0] < Limits<T>::finite_min);
+      use_key = fmask[0] >= Limits<T>::finite_min;
     }
     if (use_key) {
       // Read the key
@@ -3414,20 +3414,6 @@ template <typename T, int D, int V = D>
       // Update the output accumulator
       for (int j = 0; j < v_per_thread; j++) {
         o[j] = o[j] * factor + exp_score * values[j];
-      }
-    } else if (float_mask) {
-      U score = 0;
-      for (int j = 0; j < qk_per_thread; j++) {
-        score += q[j] * keys[j];
-      }
-      score = simd_sum(score) + static_cast<U>(fmask[0]);
-      if (isnan(score)) {
-        sum_exp_score = NAN;
-      }
-      for (int j = 0; j < v_per_thread; j++) {
-        if (!isfinite(values[j])) {
-          o[j] = NAN;
-        }
       }
     }
 
@@ -3460,7 +3446,7 @@ template <typename T, int D, int V = D>
     outputs[simd_lid * BD + simd_gid] = o[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     o[i] = simd_sum(outputs[simd_gid * BD + simd_lid] * factor);
-    o[i] = sum_exp_score == 0 ? NAN : (o[i] / sum_exp_score);
+    o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 
@@ -3563,7 +3549,7 @@ template <typename T, int D, int V = D>
     } else if (bool_mask) {
       use_key = bmask[0];
     } else if (float_mask) {
-      use_key = !(fmask[0] < Limits<T>::finite_min);
+      use_key = fmask[0] >= Limits<T>::finite_min;
     }
     if (use_key) {
       // Compute the i-th score
@@ -3588,20 +3574,6 @@ template <typename T, int D, int V = D>
       // Update the output accumulator
       for (int i = 0; i < v_per_thread; i++) {
         o[i] = o[i] * factor + exp_score * values[i];
-      }
-    } else if (float_mask) {
-      U score = 0;
-      for (int j = 0; j < qk_per_thread; j++) {
-        score += q[j] * keys[j];
-      }
-      score = simd_sum(score) + static_cast<U>(fmask[0]);
-      if (isnan(score)) {
-        sum_exp_score = NAN;
-      }
-      for (int j = 0; j < v_per_thread; j++) {
-        if (!isfinite(values[j])) {
-          o[j] = NAN;
-        }
       }
     }
 
@@ -3691,7 +3663,7 @@ template <typename T, int D>
     outputs[simd_lid * BD + simd_gid] = o[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     o[i] = simd_sum(outputs[simd_gid * BD + simd_lid]);
-    o[i] = sum_exp_score == 0 ? NAN : (o[i] / sum_exp_score);
+    o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 
