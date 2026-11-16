@@ -3026,8 +3026,10 @@ template <
   if (has_sinks) {
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < kRowsPT; ++i) {
-      max_score[i] = M_LOG2E_F * static_cast<AccumType>(sinks[tidl.y]);
-      sum_score[i] = 1;
+      if (sinks[tidl.y] != -INFINITY) {
+        max_score[i] = M_LOG2E_F * static_cast<AccumType>(sinks[tidl.y]);
+        sum_score[i] = 1;
+      }
     }
   }
 
@@ -3083,7 +3085,7 @@ template <
     if (!align_K && kb == (params->NK_aligned)) {
       using stile_t = decltype(Stile);
       using selem_t = typename stile_t::elem_type;
-      constexpr auto neg_inf = Limits<selem_t>::finite_min;
+      constexpr auto neg_inf = -INFINITY;
 
       STEEL_PRAGMA_UNROLL
       for (short i = 0; i < stile_t::kTileRows; i++) {
@@ -3104,7 +3106,7 @@ template <
     if (do_causal && kb >= kb_min_causal) {
       using stile_t = decltype(Stile);
       using selem_t = typename stile_t::elem_type;
-      constexpr auto neg_inf = Limits<selem_t>::finite_min;
+      constexpr auto neg_inf = -INFINITY;
 
       STEEL_PRAGMA_UNROLL
       for (short i = 0; i < stile_t::kTileRows; i++) {
@@ -3127,7 +3129,7 @@ template <
     if (has_mask) {
       using stile_t = decltype(Stile);
       using selem_t = typename stile_t::elem_type;
-      constexpr auto neg_inf = Limits<selem_t>::finite_min;
+      constexpr auto neg_inf = -INFINITY;
 
       constexpr bool is_bool = is_same_v<MaskType, bool>;
       using melem_t = typename metal::conditional_t<is_bool, bool, selem_t>;
@@ -3383,7 +3385,7 @@ template <typename T, int D, int V = D>
     } else if (bool_mask) {
       use_key = bmask[0];
     } else if (float_mask) {
-      use_key = (fmask[0] >= Limits<T>::finite_min);
+      use_key = !(fmask[0] < Limits<T>::finite_min);
     }
     if (use_key) {
       // Read the key
@@ -3444,7 +3446,7 @@ template <typename T, int D, int V = D>
     outputs[simd_lid * BD + simd_gid] = o[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     o[i] = simd_sum(outputs[simd_gid * BD + simd_lid] * factor);
-    o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+    o[i] = sum_exp_score == 0 ? NAN : (o[i] / sum_exp_score);
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 
@@ -3547,7 +3549,7 @@ template <typename T, int D, int V = D>
     } else if (bool_mask) {
       use_key = bmask[0];
     } else if (float_mask) {
-      use_key = (fmask[0] >= Limits<T>::finite_min);
+      use_key = !(fmask[0] < Limits<T>::finite_min);
     }
     if (use_key) {
       // Compute the i-th score
@@ -3661,7 +3663,7 @@ template <typename T, int D>
     outputs[simd_lid * BD + simd_gid] = o[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     o[i] = simd_sum(outputs[simd_gid * BD + simd_lid]);
-    o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+    o[i] = sum_exp_score == 0 ? NAN : (o[i] / sum_exp_score);
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 
