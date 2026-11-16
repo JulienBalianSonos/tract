@@ -32,6 +32,7 @@ with tempfile.TemporaryDirectory() as temporary:
         (root / "graph.nnef").write_text(graph)
         for query_len, key_len in [(1, 13), (1, 4096), (9, 17), (9, 64), (9, 65)]:
             cases = ["nan_mask", "one_nan", "all_masked", "masked_prefix", "finite"]
+            cases += [f"masked_{field}_{value}" for field in ["k", "v"] for value in ["nan", "posinf", "neginf"]]
             if with_sinks:
                 cases += ["finite_sink_masked", "nan_sink", "positive_inf_sink"]
             for case in cases:
@@ -40,7 +41,7 @@ with tempfile.TemporaryDirectory() as temporary:
                     mask = [float("nan") if case == "nan_mask" else -float("inf")] * len(mask)
                 elif case == "one_nan":
                     mask[key_len - 1] = float("nan")
-                elif case == "masked_prefix":
+                elif case == "masked_prefix" or case.startswith("masked_k_") or case.startswith("masked_v_"):
                     mask = [-float("inf") if i % key_len < key_len // 2 else 0.0 for i in range(len(mask))]
                 arrays = [
                     ("q", (2, 4, query_len, 64), [0.25] * (2 * 4 * query_len * 64)),
@@ -48,6 +49,11 @@ with tempfile.TemporaryDirectory() as temporary:
                     ("v", (2, 2, key_len, 64), [0.5] * (2 * 2 * key_len * 64)),
                     ("mask", (1, 4, query_len, key_len), mask),
                 ]
+                if case.startswith("masked_k_") or case.startswith("masked_v_"):
+                    _, field, kind = case.split("_")
+                    value = {"nan": float("nan"), "posinf": float("inf"), "neginf": -float("inf")}[kind]
+                    array = arrays[1 if field == "k" else 2][2]
+                    array[(key_len // 2 - 1) * 64] = value
                 if with_sinks:
                     value = {"finite_sink_masked": 0.0, "nan_sink": float("nan"), "positive_inf_sink": float("inf")}.get(case, -float("inf"))
                     sink_values = [value, -float("inf"), 0.0, -2.0] if case in ["nan_sink", "positive_inf_sink"] else [value] * 4
